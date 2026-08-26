@@ -1,0 +1,268 @@
+// bb-plugin-todo — shared RPC contract. Both server.ts and app.tsx import
+// this file; it is the single source of truth for wire shapes. Keep it in
+// sync with docs/SPEC.md's "RPC contract" section exactly — no extra fields,
+// no extra methods.
+import { defineRpcContract } from "@get-bb/plugin-sdk";
+import { z } from "zod";
+
+/** Palette keys, in swatch order. Stored on the tag row and resolved to
+ * Tailwind classes client-side by `lib/tag-colors.ts` — a stored hex would be
+ * unreadable in one of the two themes. */
+export const TAG_COLORS = [
+  "slate",
+  "red",
+  "amber",
+  "green",
+  "teal",
+  "blue",
+  "violet",
+  "pink",
+] as const;
+export type TagColor = (typeof TAG_COLORS)[number];
+
+/** The denormalized form embedded in every TaskDto. */
+export interface TagRefDto {
+  id: string;
+  name: string;
+  color: TagColor;
+}
+
+/** The catalog form: returned by getBoard and by the tag mutations. */
+export interface TagDto extends TagRefDto {
+  sortOrder: number;
+  /** Global count across every list, not just the active one. */
+  taskCount: number;
+}
+
+export interface TaskDto {
+  id: string;
+  listId: string;
+  parentId: string | null;
+  title: string;
+  notes: string | null;
+  bucket: "backlog" | "today";
+  day: string | null;
+  sortOrder: number;
+  dueAt: number | null;
+  hasDueTime: boolean;
+  status: "open" | "done";
+  completedAt: number | null;
+  carriedCount: number;
+  createdAt: number;
+  updatedAt: number;
+  /** Present on top-level rows only; always [] on subtasks. */
+  subtasks: TaskDto[];
+  /** `done` counts done subtasks. */
+  subtaskCounts: { total: number; done: number };
+  /** Ordered by tag sortOrder. Populated on subtasks too. */
+  tags: TagRefDto[];
+}
+
+export interface ListDto {
+  id: string;
+  name: string;
+  sortOrder: number;
+  openCount: number;
+  overdueCount: number;
+}
+
+const idSchema = z.string().min(1);
+
+const tagRefDtoSchema = z
+  .object({
+    id: idSchema,
+    name: z.string(),
+    color: z.enum(TAG_COLORS),
+  })
+  .strict();
+
+const tagDtoSchema = tagRefDtoSchema
+  .extend({
+    sortOrder: z.number(),
+    taskCount: z.number().int(),
+  })
+  .strict();
+
+// Recursive schema needs an explicit type annotation — zod can't infer a
+// self-referential shape from z.lazy() alone.
+const taskDtoSchema: z.ZodType<TaskDto> = z.lazy(() =>
+  z
+    .object({
+      id: idSchema,
+      listId: idSchema,
+      parentId: idSchema.nullable(),
+      title: z.string(),
+      notes: z.string().nullable(),
+      bucket: z.enum(["backlog", "today"]),
+      day: z.string().nullable(),
+      sortOrder: z.number(),
+      dueAt: z.number().nullable(),
+      hasDueTime: z.boolean(),
+      status: z.enum(["open", "done"]),
+      completedAt: z.number().nullable(),
+      carriedCount: z.number().int(),
+      createdAt: z.number(),
+      updatedAt: z.number(),
+      subtasks: z.array(taskDtoSchema),
+      subtaskCounts: z
+        .object({ total: z.number().int(), done: z.number().int() })
+        .strict(),
+      tags: z.array(tagRefDtoSchema),
+    })
+    .strict(),
+);
+
+const listDtoSchema = z
+  .object({
+    id: idSchema,
+    name: z.string(),
+    sortOrder: z.number(),
+    openCount: z.number().int(),
+    overdueCount: z.number().int(),
+  })
+  .strict();
+
+export const rpcContract = defineRpcContract({
+  getBoard: {
+    input: z.object({ listId: idSchema.nullable() }).strict(),
+    output: z
+      .object({
+        lists: z.array(listDtoSchema),
+        activeListId: idSchema,
+        today: z
+          .object({
+            day: z.string(),
+            planned: z.number().int(),
+            completed: z.number().int(),
+            tasks: z.array(taskDtoSchema),
+          })
+          .strict(),
+        backlog: z
+          .object({
+            total: z.number().int(),
+            overdue: z.number().int(),
+            tasks: z.array(taskDtoSchema),
+          })
+          .strict(),
+        totalOverdue: z.number().int(),
+        serverNow: z.number(),
+        /** The full tag catalog with usage counts, so the picker needs no extra fetch. */
+        tags: z.array(tagDtoSchema),
+      })
+      .strict(),
+  },
+  getArchive: {
+    input: z
+      .object({
+        listId: idSchema,
+        limit: z.number().int().min(1).max(200).default(100),
+        offset: z.number().int().min(0).default(0),
+      })
+      .strict(),
+    output: z
+      .object({
+        groups: z.array(
+          z.object({ day: z.string(), tasks: z.array(taskDtoSchema) }).strict(),
+        ),
+        total: z.number().int(),
+        hasMore: z.boolean(),
+      })
+      .strict(),
+  },
+  createTask: {
+    input: z
+      .object({
+        listId: idSchema,
+        bucket: z.enum(["backlog", "today"]),
+        title: z.string(),
+        parentId: idSchema.nullable(),
+        dueAt: z.number().nullable(),
+        hasDueTime: z.boolean(),
+        position: z.enum(["top", "bottom"]),
+      })
+      .strict(),
+    output: z.object({ task: taskDtoSchema }).strict(),
+  },
+  updateTask: {
+    input: z
+      .object({
+        id: idSchema,
+        title: z.string().optional(),
+        notes: z.string().nullable().optional(),
+        dueAt: z.number().nullable().optional(),
+        hasDueTime: z.boolean().optional(),
+      })
+      .strict(),
+    output: z.object({ task: taskDtoSchema }).strict(),
+  },
+  moveTask: {
+    input: z
+      .object({
+        id: idSchema,
+        bucket: z.enum(["backlog", "today"]),
+        parentId: idSchema.nullable(),
+        beforeId: idSchema.nullable(),
+        afterId: idSchema.nullable(),
+      })
+      .strict(),
+    output: z.object({ ok: z.literal(true) }).strict(),
+  },
+  completeTask: {
+    input: z.object({ id: idSchema }).strict(),
+    output: z.object({ completedIds: z.array(idSchema) }).strict(),
+  },
+  restoreTasks: {
+    input: z.object({ ids: z.array(idSchema) }).strict(),
+    output: z.object({ ok: z.literal(true) }).strict(),
+  },
+  deleteTask: {
+    input: z.object({ id: idSchema }).strict(),
+    output: z.object({ ok: z.literal(true) }).strict(),
+  },
+  createList: {
+    input: z.object({ name: z.string() }).strict(),
+    output: z.object({ list: listDtoSchema }).strict(),
+  },
+  renameList: {
+    input: z.object({ id: idSchema, name: z.string() }).strict(),
+    output: z.object({ lists: z.array(listDtoSchema) }).strict(),
+  },
+  deleteList: {
+    input: z.object({ id: idSchema }).strict(),
+    output: z.object({ lists: z.array(listDtoSchema) }).strict(),
+  },
+  reorderLists: {
+    input: z.object({ ids: z.array(idSchema) }).strict(),
+    output: z.object({ lists: z.array(listDtoSchema) }).strict(),
+  },
+  clearArchive: {
+    input: z.object({ listId: idSchema }).strict(),
+    output: z.object({ deleted: z.number().int() }).strict(),
+  },
+  createTag: {
+    input: z.object({ name: z.string(), color: z.enum(TAG_COLORS) }).strict(),
+    output: z.object({ tag: tagDtoSchema }).strict(),
+  },
+  updateTag: {
+    input: z
+      .object({
+        id: idSchema,
+        name: z.string().optional(),
+        color: z.enum(TAG_COLORS).optional(),
+      })
+      .strict(),
+    output: z.object({ tag: tagDtoSchema }).strict(),
+  },
+  deleteTag: {
+    input: z.object({ id: idSchema }).strict(),
+    output: z.object({ ok: z.literal(true) }).strict(),
+  },
+  reorderTags: {
+    input: z.object({ ids: z.array(idSchema) }).strict(),
+    output: z.object({ tags: z.array(tagDtoSchema) }).strict(),
+  },
+  setTaskTags: {
+    input: z.object({ taskId: idSchema, tagIds: z.array(idSchema) }).strict(),
+    output: z.object({ task: taskDtoSchema }).strict(),
+  },
+});
