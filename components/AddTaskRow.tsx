@@ -9,9 +9,15 @@ import { Icon } from "@/components/ui/icon";
 export interface AddTaskRowProps {
   placeholder: string;
   onSubmit: (title: string) => void;
+  /** Focuses the input on mount. Callers that need to (re)focus an
+   * already-mounted row (e.g. ProjectHeader's "+" affordance) should pair
+   * this with a changing `key` so React remounts the input — matching the
+   * autoFocus pattern TaskRow/ProjectHeader already use for their own
+   * inline-edit inputs. */
+  autoFocus?: boolean;
 }
 
-export function AddTaskRow({ placeholder, onSubmit }: AddTaskRowProps) {
+export function AddTaskRow({ placeholder, onSubmit, autoFocus = false }: AddTaskRowProps) {
   const [value, setValue] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
 
@@ -38,6 +44,7 @@ export function AddTaskRow({ placeholder, onSubmit }: AddTaskRowProps) {
       />
       <input
         ref={inputRef}
+        autoFocus={autoFocus}
         type="text"
         value={value}
         onChange={(e) => setValue(e.target.value)}

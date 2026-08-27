@@ -157,6 +157,36 @@ export default async function plugin(bb: BbPluginApi) {
       publish(task.listId);
       return { task };
     },
+
+    createProject(input) {
+      const project = db.createProject(conn, input, new Date());
+      publish(project.listId);
+      return { project };
+    },
+
+    updateProject(input) {
+      const project = db.updateProject(conn, input, new Date());
+      publish(project.listId);
+      return { project };
+    },
+
+    deleteProject({ id }) {
+      const { listId } = db.deleteProject(conn, id);
+      publish(listId);
+      return { ok: true as const };
+    },
+
+    reorderProjects({ listId, ids }) {
+      const projects = db.reorderProjects(conn, listId, ids, new Date());
+      publish(listId);
+      return { projects };
+    },
+
+    setProjectCollapsed({ id, collapsed }) {
+      const { listId } = db.setProjectCollapsed(conn, id, collapsed);
+      publish(listId);
+      return { ok: true as const };
+    },
   });
 
   bb.background.schedule("rollover", "5 0 * * *", async () => {

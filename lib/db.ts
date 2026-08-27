@@ -2,9 +2,9 @@
 // first argument; server.ts only wires these up to RPC methods and handles
 // bb-specific concerns (kv, realtime, background scheduling).
 import type Database from "better-sqlite3";
-import type { ListDto, TagColor, TagDto, TagRefDto, TaskDto } from "../contract.js";
+import type { ListDto, ProjectDto, TagColor, TagDto, TagRefDto, TaskDto, TrailDto } from "../contract.js";
 import { localDay } from "./day.js";
-import { mintListId, mintTagId, mintTaskId } from "./ids.js";
+import { mintListId, mintProjectId, mintTagId, mintTaskId } from "./ids.js";
 import { needsRebalance, nextOrder } from "./order.js";
 
 // Ship exactly these statements, in this order. APPEND-ONLY: never edit or
@@ -63,6 +63,27 @@ export const MIGRATIONS: string[] = [
   );`,
   // 9
   `CREATE INDEX IF NOT EXISTS task_tags_tag_idx ON task_tags (tag_id);`,
+  // 10
+  `CREATE TABLE IF NOT EXISTS projects (
+    id         TEXT PRIMARY KEY,
+    list_id    TEXT NOT NULL REFERENCES lists(id) ON DELETE CASCADE,
+    name       TEXT NOT NULL,
+    color      TEXT NOT NULL,
+    collapsed  INTEGER NOT NULL DEFAULT 0,
+    sort_order REAL NOT NULL,
+    created_at INTEGER NOT NULL
+  );`,
+  // 11
+  `CREATE INDEX IF NOT EXISTS projects_list_idx ON projects (list_id, sort_order);`,
+  // 12
+  `ALTER TABLE tasks ADD COLUMN project_id TEXT REFERENCES projects(id);`,
+  // 13
+  `ALTER TABLE tasks ADD COLUMN today_order REAL;`,
+  // 14
+  `CREATE INDEX IF NOT EXISTS tasks_project_idx ON tasks (list_id, project_id, sort_order);`,
+  // 15 — backfill: every existing Today row keeps its exact current position
+  // on first load (today_order starts equal to its prior sort_order).
+  `UPDATE tasks SET today_order = sort_order WHERE bucket = 'today';`,
 ];
 
 interface ListRow {
@@ -88,6 +109,18 @@ interface TaskRow {
   carried_count: number;
   created_at: number;
   updated_at: number;
+  project_id: string | null;
+  today_order: number | null;
+}
+
+interface ProjectRow {
+  id: string;
+  list_id: string;
+  name: string;
+  color: TagColor;
+  collapsed: number;
+  sort_order: number;
+  created_at: number;
 }
 
 interface TagRow {
@@ -126,6 +159,7 @@ function taskRowToDto(
   subtasks: TaskDto[],
   counts: { total: number; done: number },
   tags: TagRefDto[],
+  trail: TrailDto | null,
 ): TaskDto {
   return {
     id: row.id,
@@ -146,6 +180,8 @@ function taskRowToDto(
     subtasks,
     subtaskCounts: counts,
     tags,
+    projectId: row.project_id,
+    trail,
   };
 }
 
@@ -198,61 +234,168 @@ function getTaskRow(db: Database.Database, id: string): TaskRow | undefined {
   return db.prepare(`SELECT * FROM tasks WHERE id = ?`).get(id) as TaskRow | undefined;
 }
 
+function getProjectRow(db: Database.Database, id: string): ProjectRow | undefined {
+  return db.prepare(`SELECT * FROM projects WHERE id = ?`).get(id) as ProjectRow | undefined;
+}
+
+type ProjectMap = Map<string, ProjectRow>;
+
+/** One query for every project in `listId`, keyed by id — same rationale as
+ * `loadTagMap`: call once per `getBoard`/`getArchive` and thread the result
+ * down instead of a per-task lookup. */
+function loadProjectMap(db: Database.Database, listId: string): ProjectMap {
+  const rows = db.prepare(`SELECT * FROM projects WHERE list_id = ?`).all(listId) as ProjectRow[];
+  return new Map(rows.map((r) => [r.id, r]));
+}
+
+/**
+ * The trail is `null` for a loose top-level task (no project, no parent) —
+ * those rows render exactly as they do today. Otherwise it carries the
+ * project's name/color and, for a subtask, the parent's title, so the
+ * client never has to look either up. `projectMap` is the whole-board batch
+ * (getBoard/getArchive); omit it for the single-DTO mutation return paths,
+ * which fall back to a targeted `getProjectRow` lookup — same split as
+ * `tagMap` vs `getTaskTags`.
+ */
+function buildTrail(db: Database.Database, row: TaskRow, projectMap?: ProjectMap): TrailDto | null {
+  if (!row.project_id && !row.parent_id) return null;
+  const project = row.project_id
+    ? (projectMap ? projectMap.get(row.project_id) : getProjectRow(db, row.project_id))
+    : undefined;
+  const parent = row.parent_id ? getTaskRow(db, row.parent_id) : undefined;
+  return {
+    projectId: row.project_id,
+    projectName: project ? project.name : null,
+    projectColor: project ? project.color : null,
+    parentId: row.parent_id,
+    parentTitle: parent ? parent.title : null,
+  };
+}
+
 function getChildrenRows(db: Database.Database, parentId: string): TaskRow[] {
   return db
     .prepare(`SELECT * FROM tasks WHERE parent_id = ? ORDER BY sort_order`)
     .all(parentId) as TaskRow[];
 }
 
-function getSiblingRows(
+/**
+ * `sort_order`'s scope: a task's "home" — its position within its project
+ * (or the loose group, when `projectId` is null) under its parent. This is
+ * independent of `bucket`: a ghost (flagged today, still filed) keeps its
+ * home slot exactly where it was, so unscheduling it later can snap it back
+ * there (see `moveTask`'s snap-home rule).
+ */
+function getHomeSiblingRows(
   db: Database.Database,
   listId: string,
+  projectId: string | null,
   parentId: string | null,
-  bucket: "backlog" | "today",
 ): TaskRow[] {
-  if (parentId === null) {
+  if (parentId !== null) {
+    return db
+      .prepare(`SELECT * FROM tasks WHERE list_id = ? AND parent_id = ? AND status = 'open' ORDER BY sort_order`)
+      .all(listId, parentId) as TaskRow[];
+  }
+  if (projectId === null) {
     return db
       .prepare(
-        `SELECT * FROM tasks WHERE list_id = ? AND parent_id IS NULL AND bucket = ? AND status = 'open' ORDER BY sort_order`,
+        `SELECT * FROM tasks WHERE list_id = ? AND parent_id IS NULL AND project_id IS NULL AND status = 'open' ORDER BY sort_order`,
       )
-      .all(listId, bucket) as TaskRow[];
+      .all(listId) as TaskRow[];
   }
   return db
     .prepare(
-      `SELECT * FROM tasks WHERE list_id = ? AND parent_id = ? AND bucket = ? AND status = 'open' ORDER BY sort_order`,
+      `SELECT * FROM tasks WHERE list_id = ? AND parent_id IS NULL AND project_id = ? AND status = 'open' ORDER BY sort_order`,
     )
-    .all(listId, parentId, bucket) as TaskRow[];
+    .all(listId, projectId) as TaskRow[];
 }
 
-function rebalanceSiblingGroup(
+/**
+ * `today_order`'s scope: the single flat Today list for `listId` — every
+ * scheduled row, whether a former top-level task or a subtask dragged in on
+ * its own, is a peer here. Unlike the home group, this is never split by
+ * project or parent_id: Today is a place-shaped view of a flag, not a tree.
+ */
+function getTodaySiblingRows(db: Database.Database, listId: string): TaskRow[] {
+  return db
+    .prepare(`SELECT * FROM tasks WHERE list_id = ? AND bucket = 'today' AND status = 'open' ORDER BY today_order`)
+    .all(listId) as TaskRow[];
+}
+
+/**
+ * The only code path allowed to write `sort_order` or `today_order`
+ * (risk mitigation from the design doc, made structurally true — see the
+ * regression test in db.test.ts that greps this file for stray writes).
+ * `column` picks exactly one of the two; the other is left untouched, so a
+ * ghost row (both columns meaningful at once) can have each written
+ * independently without the other clobbering it.
+ */
+function writeOrder(
   db: Database.Database,
-  listId: string,
-  parentId: string | null,
-  bucket: "backlog" | "today",
+  id: string,
+  column: "sort_order" | "today_order",
+  value: number | null,
   now: Date,
 ): void {
-  const siblings = getSiblingRows(db, listId, parentId, bucket);
-  const ts = now.getTime();
-  siblings.forEach((s, i) => {
-    db.prepare(`UPDATE tasks SET sort_order = ?, updated_at = ? WHERE id = ?`).run(
-      (i + 1) * 1000,
-      ts,
-      s.id,
-    );
-  });
+  db.prepare(`UPDATE tasks SET ${column} = ?, updated_at = ? WHERE id = ?`).run(value, now.getTime(), id);
+}
+
+function rebalanceHomeSiblingGroup(
+  db: Database.Database,
+  listId: string,
+  projectId: string | null,
+  parentId: string | null,
+  now: Date,
+): void {
+  const siblings = getHomeSiblingRows(db, listId, projectId, parentId);
+  siblings.forEach((s, i) => writeOrder(db, s.id, "sort_order", (i + 1) * 1000, now));
+}
+
+function rebalanceTodaySiblingGroup(db: Database.Database, listId: string, now: Date): void {
+  const siblings = getTodaySiblingRows(db, listId);
+  siblings.forEach((s, i) => writeOrder(db, s.id, "today_order", (i + 1) * 1000, now));
 }
 
 /** Builds a top-level TaskDto with its open subtasks nested and full counts.
- * `tagMap` is `undefined` for the single-DTO mutation return paths, which
- * use the targeted `getTaskTags` lookup instead of a whole-board map. */
-function buildTopLevelDto(db: Database.Database, row: TaskRow, tagMap?: TagMap): TaskDto {
+ * `tagMap`/`projectMap` are `undefined` for the single-DTO mutation return
+ * paths, which use targeted lookups instead of a whole-board map. */
+function buildTopLevelDto(
+  db: Database.Database,
+  row: TaskRow,
+  tagMap?: TagMap,
+  projectMap?: ProjectMap,
+): TaskDto {
   const children = getChildrenRows(db, row.id);
   const done = children.filter((c) => c.status === "done").length;
   const tagsFor = (id: string) => (tagMap ? (tagMap.get(id) ?? []) : getTaskTags(db, id));
   const subtasks = children
     .filter((c) => c.status === "open")
-    .map((c) => taskRowToDto(c, [], { total: 0, done: 0 }, tagsFor(c.id)));
-  return taskRowToDto(row, subtasks, { total: children.length, done }, tagsFor(row.id));
+    .map((c) => taskRowToDto(c, [], { total: 0, done: 0 }, tagsFor(c.id), buildTrail(db, c, projectMap)));
+  return taskRowToDto(
+    row,
+    subtasks,
+    { total: children.length, done },
+    tagsFor(row.id),
+    buildTrail(db, row, projectMap),
+  );
+}
+
+/** Today is flat: every scheduled row (former top-level task or a subtask
+ * dragged in on its own) renders as a standalone entry with its own trail,
+ * never nested under another Today row. `subtasks` is always forced to []
+ * here even for a top-level task whose own subtasks also happen to be
+ * scheduled — those render as their own separate flat Today entries. */
+function buildTodayDto(db: Database.Database, row: TaskRow, tagMap?: TagMap, projectMap?: ProjectMap): TaskDto {
+  const dto = row.parent_id
+    ? taskRowToDto(
+        row,
+        [],
+        { total: 0, done: 0 },
+        tagMap ? (tagMap.get(row.id) ?? []) : getTaskTags(db, row.id),
+        buildTrail(db, row, projectMap),
+      )
+    : buildTopLevelDto(db, row, tagMap, projectMap);
+  return { ...dto, subtasks: [] };
 }
 
 /**
@@ -297,6 +440,54 @@ function getListDtos(db: Database.Database, now: Date): ListDto[] {
 }
 
 // ---------------------------------------------------------------------------
+// Projects — read helpers
+// ---------------------------------------------------------------------------
+
+function projectRowToDto(row: ProjectRow, counts: { open: number; today: number; overdue: number }): ProjectDto {
+  return {
+    id: row.id,
+    listId: row.list_id,
+    name: row.name,
+    color: row.color,
+    sortOrder: row.sort_order,
+    collapsed: !!row.collapsed,
+    openCount: counts.open,
+    todayCount: counts.today,
+    overdueCount: counts.overdue,
+  };
+}
+
+/** Counts (open/today/overdue) span every task filed to the project,
+ * top-level and subtasks alike — same convention as ListDto.openCount. */
+function getProjectDtos(db: Database.Database, listId: string, now: Date): ProjectDto[] {
+  const today = localDay(now);
+  const ts = now.getTime();
+  const rows = db
+    .prepare(`SELECT * FROM projects WHERE list_id = ? ORDER BY sort_order`)
+    .all(listId) as ProjectRow[];
+  return rows.map((p) => {
+    const open = (
+      db.prepare(`SELECT COUNT(*) AS c FROM tasks WHERE project_id = ? AND status = 'open'`).get(p.id) as {
+        c: number;
+      }
+    ).c;
+    const todayCount = (
+      db
+        .prepare(`SELECT COUNT(*) AS c FROM tasks WHERE project_id = ? AND status = 'open' AND bucket = 'today' AND day = ?`)
+        .get(p.id, today) as { c: number }
+    ).c;
+    const overdue = (
+      db
+        .prepare(
+          `SELECT COUNT(*) AS c FROM tasks WHERE project_id = ? AND status = 'open' AND due_at IS NOT NULL AND due_at < ?`,
+        )
+        .get(p.id, ts) as { c: number }
+    ).c;
+    return projectRowToDto(p, { open, today: todayCount, overdue });
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Board / archive reads
 // ---------------------------------------------------------------------------
 
@@ -308,6 +499,7 @@ export interface BoardResult {
   totalOverdue: number;
   serverNow: number;
   tags: TagDto[];
+  projects: ProjectDto[];
 }
 
 export function getBoard(db: Database.Database, listId: string | null, now: Date): BoardResult {
@@ -315,6 +507,7 @@ export function getBoard(db: Database.Database, listId: string | null, now: Date
   const activeListId = listId && lists.some((l) => l.id === listId) ? listId : lists[0].id;
   const today = localDay(now);
   const tagMap = loadTagMap(db);
+  const projectMap = loadProjectMap(db, activeListId);
 
   // Single source of truth for "this row belongs to today": `day = today`.
   // Every selector and counter below is built from this exact predicate so
@@ -323,19 +516,34 @@ export function getBoard(db: Database.Database, listId: string | null, now: Date
   // or a bug in it) can never make a row appear in one and not the other.
   const isTodayRow = `day = ?`;
 
+  // Today is flat (no `parent_id IS NULL` filter): a subtask dragged
+  // straight into Today renders here as its own row, with its trail
+  // pointing back at its (possibly still-backlogged) parent — that's the
+  // whole point of the feature. Ordered by today_order, not sort_order.
   const topToday = db
     .prepare(
-      `SELECT * FROM tasks WHERE list_id = ? AND parent_id IS NULL AND bucket = 'today' AND status = 'open' AND ${isTodayRow} ORDER BY sort_order`,
+      `SELECT * FROM tasks WHERE list_id = ? AND bucket = 'today' AND status = 'open' AND ${isTodayRow} ORDER BY today_order`,
     )
     .all(activeListId, today) as TaskRow[];
-  const todayTasks = topToday.map((r) => buildTopLevelDto(db, r, tagMap));
+  const todayTasks = topToday.map((r) => buildTodayDto(db, r, tagMap, projectMap));
 
+  // Backlog now also returns today-flagged top-level rows so their ghost
+  // can render in-place in their project; `total` below stays the genuine
+  // backlog-bucket count so the "BACKLOG . n" header badge doesn't count
+  // ghosts twice (they're already counted by TODAY's own header).
   const topBacklog = db
     .prepare(
-      `SELECT * FROM tasks WHERE list_id = ? AND parent_id IS NULL AND bucket = 'backlog' AND status = 'open' ORDER BY sort_order`,
+      `SELECT * FROM tasks WHERE list_id = ? AND parent_id IS NULL AND status = 'open' AND (bucket = 'backlog' OR (bucket = 'today' AND ${isTodayRow})) ORDER BY sort_order`,
     )
-    .all(activeListId) as TaskRow[];
-  const backlogTasks = topBacklog.map((r) => buildTopLevelDto(db, r, tagMap));
+    .all(activeListId, today) as TaskRow[];
+  const backlogTasks = topBacklog.map((r) => buildTopLevelDto(db, r, tagMap, projectMap));
+  const backlogTotal = (
+    db
+      .prepare(
+        `SELECT COUNT(*) AS c FROM tasks WHERE list_id = ? AND parent_id IS NULL AND bucket = 'backlog' AND status = 'open'`,
+      )
+      .get(activeListId) as { c: number }
+  ).c;
 
   const planned = (
     db
@@ -355,10 +563,11 @@ export function getBoard(db: Database.Database, listId: string | null, now: Date
     lists,
     activeListId,
     today: { day: today, planned, completed, tasks: todayTasks },
-    backlog: { total: topBacklog.length, overdue: backlogOverdue, tasks: backlogTasks },
+    backlog: { total: backlogTotal, overdue: backlogOverdue, tasks: backlogTasks },
     totalOverdue,
     serverNow: now.getTime(),
     tags: getTagDtos(db),
+    projects: getProjectDtos(db, activeListId, now),
   };
 }
 
@@ -375,6 +584,7 @@ export function getArchive(
   offset: number,
 ): ArchiveResult {
   const tagMap = loadTagMap(db);
+  const projectMap = loadProjectMap(db, listId);
   const doneRows = db
     .prepare(`SELECT * FROM tasks WHERE list_id = ? AND status = 'done' ORDER BY completed_at DESC`)
     .all(listId) as TaskRow[];
@@ -394,14 +604,22 @@ export function getArchive(
   const hasMore = offset + limit < total;
 
   const dtoFor = (r: TaskRow, tagMap: TagMap): TaskDto => {
-    if (r.parent_id) return taskRowToDto(r, [], { total: 0, done: 0 }, tagMap.get(r.id) ?? []);
+    if (r.parent_id) {
+      return taskRowToDto(r, [], { total: 0, done: 0 }, tagMap.get(r.id) ?? [], buildTrail(db, r, projectMap));
+    }
     const children = getChildrenRows(db, r.id);
     const done = children.filter((c) => c.status === "done").length;
     const nested = children
       .filter((c) => c.status === "done" && dayOf(c) === dayOf(r))
       .sort((a, b) => a.sort_order - b.sort_order)
-      .map((c) => taskRowToDto(c, [], { total: 0, done: 0 }, tagMap.get(c.id) ?? []));
-    return taskRowToDto(r, nested, { total: children.length, done }, tagMap.get(r.id) ?? []);
+      .map((c) => taskRowToDto(c, [], { total: 0, done: 0 }, tagMap.get(c.id) ?? [], buildTrail(db, c, projectMap)));
+    return taskRowToDto(
+      r,
+      nested,
+      { total: children.length, done },
+      tagMap.get(r.id) ?? [],
+      buildTrail(db, r, projectMap),
+    );
   };
 
   const groups: { day: string; tasks: TaskDto[] }[] = [];
@@ -431,6 +649,8 @@ export interface CreateTaskInput {
   dueAt: number | null;
   hasDueTime: boolean;
   position: "top" | "bottom";
+  /** Omitted or `null` = loose. Ignored (mirrors the parent's) for a subtask. */
+  projectId?: string | null;
 }
 
 export function createTask(db: Database.Database, input: CreateTaskInput, now: Date): TaskDto {
@@ -451,18 +671,43 @@ export function createTask(db: Database.Database, input: CreateTaskInput, now: D
     const day = parentRow ? parentRow.day : bucket === "today" ? localDay(now) : null;
     const parentId = parentRow ? parentRow.id : null;
 
-    const siblings = getSiblingRows(db, listId, parentId, bucket);
-    const order =
+    // Invariant 2: a subtask's project_id always mirrors its parent's,
+    // enforced here rather than left to the caller.
+    let projectId: string | null;
+    if (parentRow) {
+      projectId = parentRow.project_id;
+    } else {
+      projectId = input.projectId ?? null;
+      if (projectId) {
+        const project = getProjectRow(db, projectId);
+        if (!project) throw new Error("invalid_input: project not found");
+        if (project.list_id !== listId) throw new Error("invalid_input: project belongs to a different list");
+      }
+    }
+
+    const homeSiblings = getHomeSiblingRows(db, listId, projectId, parentId);
+    const homeOrder =
       input.position === "top"
-        ? nextOrder(null, siblings[0]?.sort_order ?? null)
-        : nextOrder(siblings[siblings.length - 1]?.sort_order ?? null, null);
+        ? nextOrder(null, homeSiblings[0]?.sort_order ?? null)
+        : nextOrder(homeSiblings[homeSiblings.length - 1]?.sort_order ?? null, null);
 
     const id = mintTaskId();
     const ts = now.getTime();
     db.prepare(
-      `INSERT INTO tasks (id, list_id, parent_id, title, notes, bucket, day, sort_order, due_at, has_due_time, status, completed_at, carried_count, created_at, updated_at)
-       VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, 'open', NULL, 0, ?, ?)`,
-    ).run(id, listId, parentId, title, bucket, day, order, input.dueAt, input.hasDueTime ? 1 : 0, ts, ts);
+      `INSERT INTO tasks (id, list_id, parent_id, title, notes, bucket, day, sort_order, today_order, due_at, has_due_time, status, completed_at, carried_count, project_id, created_at, updated_at)
+       VALUES (?, ?, ?, ?, NULL, ?, ?, 0, NULL, ?, ?, 'open', NULL, 0, ?, ?, ?)`,
+    ).run(id, listId, parentId, title, bucket, day, input.dueAt, input.hasDueTime ? 1 : 0, projectId, ts, ts);
+
+    writeOrder(db, id, "sort_order", homeOrder, now);
+
+    if (bucket === "today") {
+      const todaySiblings = getTodaySiblingRows(db, listId);
+      const todayOrderVal =
+        input.position === "top"
+          ? nextOrder(null, todaySiblings[0]?.today_order ?? null)
+          : nextOrder(todaySiblings[todaySiblings.length - 1]?.today_order ?? null, null);
+      writeOrder(db, id, "today_order", todayOrderVal, now);
+    }
 
     return buildTopLevelDto(db, getTaskRow(db, id) as TaskRow);
   })();
@@ -497,7 +742,7 @@ export function updateTask(db: Database.Database, input: UpdateTaskInput, now: D
 
     const updated = getTaskRow(db, input.id) as TaskRow;
     return updated.parent_id
-      ? taskRowToDto(updated, [], { total: 0, done: 0 }, getTaskTags(db, updated.id))
+      ? taskRowToDto(updated, [], { total: 0, done: 0 }, getTaskTags(db, updated.id), buildTrail(db, updated))
       : buildTopLevelDto(db, updated);
   })();
 }
@@ -508,6 +753,9 @@ export interface MoveTaskInput {
   parentId: string | null;
   beforeId: string | null;
   afterId: string | null;
+  /** Target home. Omitted = unchanged (drives snap-home below). Ignored
+   * when `parentId` names a parent — a subtask always mirrors it instead. */
+  projectId?: string | null;
 }
 
 /** Returns the id of the list the moved task belongs to (for realtime). */
@@ -515,6 +763,12 @@ export function moveTask(db: Database.Database, input: MoveTaskInput, now: Date)
   return db.transaction(() => {
     const row = getTaskRow(db, input.id);
     if (!row) throw new Error("not_found: task not found");
+    // Captured before any write below — this is `row`'s home slot as it
+    // was on entry, independent of whatever this move does to it. Needed
+    // for the promoted-children gap (placed right after row's *old* spot)
+    // since row's own sort_order may or may not change in this same call.
+    const oldSortOrder = row.sort_order;
+    const oldProjectId = row.project_id;
 
     let parentRow: TaskRow | null = null;
     if (input.parentId) {
@@ -527,64 +781,125 @@ export function moveTask(db: Database.Database, input: MoveTaskInput, now: Date)
     }
 
     const listId = row.list_id;
-    const newBucket = parentRow ? parentRow.bucket : input.bucket;
-    const newDay = parentRow ? parentRow.day : newBucket === "today" ? localDay(now) : null;
+    const newBucket = input.bucket;
+    const newDay = newBucket === "today" ? localDay(now) : null;
     const newParentId = parentRow ? parentRow.id : null;
 
+    // Invariant 2: a subtask's project_id always mirrors its parent's,
+    // enforced here — a caller-supplied projectId is ignored once parentId
+    // names a parent. Invariant 3: a task's project must belong to its list.
+    let newProjectId: string | null;
+    if (parentRow) {
+      newProjectId = parentRow.project_id;
+    } else if (input.projectId !== undefined) {
+      newProjectId = input.projectId;
+      if (newProjectId) {
+        const project = getProjectRow(db, newProjectId);
+        if (!project) throw new Error("invalid_input: project not found");
+        if (project.list_id !== listId) throw new Error("invalid_input: project belongs to a different list");
+      }
+    } else {
+      newProjectId = row.project_id;
+    }
+
     // Making `row` a subtask promotes its own children to top-level
-    // siblings placed immediately after it, in their existing order.
+    // siblings placed immediately after row's old spot, in their existing
+    // order — unrelated to Today: their own bucket/day/today_order are
+    // left exactly as they were (invariant 4).
     const promoted = newParentId ? getChildrenRows(db, row.id) : [];
 
-    const siblings = getSiblingRows(db, listId, newParentId, newBucket).filter((s) => s.id !== row.id);
-    const beforeRow = input.beforeId ? siblings.find((s) => s.id === input.beforeId) : undefined;
-    const afterRow = input.afterId ? siblings.find((s) => s.id === input.afterId) : undefined;
-    let prevOrder = afterRow ? afterRow.sort_order : null;
-    let nextOrderVal = beforeRow ? beforeRow.sort_order : null;
-
-    if (prevOrder === null && nextOrderVal === null) {
-      prevOrder = siblings[siblings.length - 1]?.sort_order ?? null;
-      nextOrderVal = null;
-    } else if (needsRebalance(prevOrder, nextOrderVal)) {
-      rebalanceSiblingGroup(db, listId, newParentId, newBucket, now);
-      const refreshed = getSiblingRows(db, listId, newParentId, newBucket).filter((s) => s.id !== row.id);
-      const br = input.beforeId ? refreshed.find((s) => s.id === input.beforeId) : undefined;
-      const ar = input.afterId ? refreshed.find((s) => s.id === input.afterId) : undefined;
-      prevOrder = ar ? ar.sort_order : null;
-      nextOrderVal = br ? br.sort_order : null;
-    }
-    const order = nextOrder(prevOrder, nextOrderVal);
+    const wasToday = row.bucket === "today";
+    const enteringToday = newBucket === "today";
+    // Snap-home: dropping a Today row into the Backlog "anywhere" does not
+    // reposition it — it returns to the home slot it never actually left.
+    // Only a drop that explicitly names a *different* project re-homes it.
+    const reHome =
+      wasToday && !enteringToday && input.projectId !== undefined && input.projectId !== row.project_id;
+    const snapHome = wasToday && !enteringToday && !reHome;
 
     const ts = now.getTime();
     db.prepare(
-      `UPDATE tasks SET bucket = ?, day = ?, parent_id = ?, sort_order = ?, updated_at = ? WHERE id = ?`,
-    ).run(newBucket, newDay, newParentId, order, ts, row.id);
+      `UPDATE tasks SET bucket = ?, day = ?, parent_id = ?, project_id = ?, updated_at = ? WHERE id = ?`,
+    ).run(newBucket, newDay, newParentId, newProjectId, ts, row.id);
 
-    // Subtasks always mirror their parent's bucket/day. If `row` stays a
-    // parent (didn't itself become a subtask), carry its children along.
-    if (!newParentId) {
-      db.prepare(`UPDATE tasks SET bucket = ?, day = ?, updated_at = ? WHERE parent_id = ?`).run(
-        newBucket,
-        newDay,
-        ts,
-        row.id,
-      );
+    // If row remains (or becomes) a top-level parent and its project
+    // changed, its still-remaining children move with it (invariant 2).
+    // Promoted ex-children are handled separately below and are exempt —
+    // they're no longer row's children after this move.
+    if (!newParentId && newProjectId !== oldProjectId) {
+      db.prepare(`UPDATE tasks SET project_id = ? WHERE parent_id = ?`).run(newProjectId, row.id);
+    }
+
+    if (enteringToday) {
+      // Today write: today_order only. sort_order (the home slot) is left
+      // completely untouched here — that's what lets a later unschedule
+      // snap back to it.
+      const todaySiblings = getTodaySiblingRows(db, listId).filter((s) => s.id !== row.id);
+      const beforeRow = input.beforeId ? todaySiblings.find((s) => s.id === input.beforeId) : undefined;
+      const afterRow = input.afterId ? todaySiblings.find((s) => s.id === input.afterId) : undefined;
+      let prevOrder = afterRow ? afterRow.today_order : null;
+      let nextOrderVal = beforeRow ? beforeRow.today_order : null;
+
+      if (prevOrder === null && nextOrderVal === null) {
+        prevOrder = todaySiblings[todaySiblings.length - 1]?.today_order ?? null;
+        nextOrderVal = null;
+      } else if (needsRebalance(prevOrder, nextOrderVal)) {
+        rebalanceTodaySiblingGroup(db, listId, now);
+        const refreshed = getTodaySiblingRows(db, listId).filter((s) => s.id !== row.id);
+        const br = input.beforeId ? refreshed.find((s) => s.id === input.beforeId) : undefined;
+        const ar = input.afterId ? refreshed.find((s) => s.id === input.afterId) : undefined;
+        prevOrder = ar ? ar.today_order : null;
+        nextOrderVal = br ? br.today_order : null;
+      }
+      writeOrder(db, row.id, "today_order", nextOrder(prevOrder, nextOrderVal), now);
+    } else {
+      // Leaving/staying in the backlog: today_order always clears
+      // (invariant 5 — it's NULL iff bucket = 'backlog', unconditionally).
+      writeOrder(db, row.id, "today_order", null, now);
+
+      if (!snapHome) {
+        // A plain backlog reposition, a re-home into a different
+        // project/loose group, or an explicit re-home off Today.
+        const homeSiblings = getHomeSiblingRows(db, listId, newProjectId, newParentId).filter(
+          (s) => s.id !== row.id,
+        );
+        const beforeRow = input.beforeId ? homeSiblings.find((s) => s.id === input.beforeId) : undefined;
+        const afterRow = input.afterId ? homeSiblings.find((s) => s.id === input.afterId) : undefined;
+        let prevOrder = afterRow ? afterRow.sort_order : null;
+        let nextOrderVal = beforeRow ? beforeRow.sort_order : null;
+
+        if (prevOrder === null && nextOrderVal === null) {
+          prevOrder = homeSiblings[homeSiblings.length - 1]?.sort_order ?? null;
+          nextOrderVal = null;
+        } else if (needsRebalance(prevOrder, nextOrderVal)) {
+          rebalanceHomeSiblingGroup(db, listId, newProjectId, newParentId, now);
+          const refreshed = getHomeSiblingRows(db, listId, newProjectId, newParentId).filter(
+            (s) => s.id !== row.id,
+          );
+          const br = input.beforeId ? refreshed.find((s) => s.id === input.beforeId) : undefined;
+          const ar = input.afterId ? refreshed.find((s) => s.id === input.afterId) : undefined;
+          prevOrder = ar ? ar.sort_order : null;
+          nextOrderVal = br ? br.sort_order : null;
+        }
+        writeOrder(db, row.id, "sort_order", nextOrder(prevOrder, nextOrderVal), now);
+      }
+      // snapHome: sort_order is left exactly as it was — no write at all.
     }
 
     if (promoted.length > 0) {
-      const topSiblings = getSiblingRows(db, listId, null, newBucket).filter(
+      const topSiblings = getHomeSiblingRows(db, listId, oldProjectId, null).filter(
         (s) => s.id !== row.id && !promoted.some((p) => p.id === s.id),
       );
       const following = topSiblings
-        .filter((s) => s.sort_order > order)
+        .filter((s) => s.sort_order > oldSortOrder)
         .sort((a, b) => a.sort_order - b.sort_order)[0];
-      const gapEnd = following ? following.sort_order : order + 1000 * (promoted.length + 1);
-      const step = (gapEnd - order) / (promoted.length + 1);
+      const gapEnd = following ? following.sort_order : oldSortOrder + 1000 * (promoted.length + 1);
+      const step = (gapEnd - oldSortOrder) / (promoted.length + 1);
       promoted
         .sort((a, b) => a.sort_order - b.sort_order)
         .forEach((p, i) => {
-          db.prepare(
-            `UPDATE tasks SET parent_id = NULL, bucket = ?, day = ?, sort_order = ?, updated_at = ? WHERE id = ?`,
-          ).run(newBucket, newDay, order + step * (i + 1), ts, p.id);
+          db.prepare(`UPDATE tasks SET parent_id = NULL, updated_at = ? WHERE id = ?`).run(ts, p.id);
+          writeOrder(db, p.id, "sort_order", oldSortOrder + step * (i + 1), now);
         });
     }
 
@@ -713,6 +1028,100 @@ export function reorderLists(db: Database.Database, ids: string[], now: Date): L
 export function clearArchive(db: Database.Database, listId: string): number {
   const info = db.prepare(`DELETE FROM tasks WHERE list_id = ? AND status = 'done'`).run(listId);
   return info.changes;
+}
+
+// ---------------------------------------------------------------------------
+// Project mutations
+// ---------------------------------------------------------------------------
+
+export function listProjects(db: Database.Database, listId: string, now: Date): ProjectDto[] {
+  return getProjectDtos(db, listId, now);
+}
+
+export function createProject(
+  db: Database.Database,
+  input: { listId: string; name: string; color: TagColor },
+  now: Date,
+): ProjectDto {
+  return db.transaction(() => {
+    const name = input.name.trim();
+    if (!name) throw new Error("invalid_input: name must not be empty");
+    const { m } = db
+      .prepare(`SELECT MAX(sort_order) AS m FROM projects WHERE list_id = ?`)
+      .get(input.listId) as { m: number | null };
+    const sortOrder = (m ?? 0) + 1000;
+    const id = mintProjectId();
+    db.prepare(
+      `INSERT INTO projects (id, list_id, name, color, collapsed, sort_order, created_at) VALUES (?, ?, ?, ?, 0, ?, ?)`,
+    ).run(id, input.listId, name, input.color, sortOrder, now.getTime());
+    return projectRowToDto(getProjectRow(db, id) as ProjectRow, { open: 0, today: 0, overdue: 0 });
+  })();
+}
+
+export function updateProject(
+  db: Database.Database,
+  input: { id: string; name?: string; color?: TagColor },
+  now: Date,
+): ProjectDto {
+  return db.transaction(() => {
+    const row = getProjectRow(db, input.id);
+    if (!row) throw new Error("not_found: project not found");
+
+    let name = row.name;
+    if (input.name !== undefined) {
+      name = input.name.trim();
+      if (!name) throw new Error("invalid_input: name must not be empty");
+    }
+    const color = input.color ?? row.color;
+
+    db.prepare(`UPDATE projects SET name = ?, color = ? WHERE id = ?`).run(name, color, row.id);
+    const counts = getProjectDtos(db, row.list_id, now).find((p) => p.id === row.id);
+    return projectRowToDto(
+      { ...row, name, color },
+      { open: counts?.openCount ?? 0, today: counts?.todayCount ?? 0, overdue: counts?.overdueCount ?? 0 },
+    );
+  })();
+}
+
+/**
+ * Deletes the project and releases its tasks to loose (`project_id =
+ * NULL`), never into the bin (invariant 6). This UPDATE is explicit and
+ * runs *before* the DELETE rather than relying on the FK's `ON DELETE
+ * SET NULL` (there isn't one — see migration 12) — `PRAGMA foreign_keys`
+ * is ON in this codebase (server.ts turns it on explicitly; db.test.ts's
+ * `freshDb()` does too), so cascades *would* fire here, but the design
+ * doc's mitigation is to not depend on that, and this function doesn't.
+ */
+export function deleteProject(db: Database.Database, id: string): { listId: string } {
+  return db.transaction(() => {
+    const row = getProjectRow(db, id);
+    if (!row) throw new Error("not_found: project not found");
+    db.prepare(`UPDATE tasks SET project_id = NULL WHERE project_id = ?`).run(id);
+    db.prepare(`DELETE FROM projects WHERE id = ?`).run(id);
+    return { listId: row.list_id };
+  })();
+}
+
+export function reorderProjects(db: Database.Database, listId: string, ids: string[], now: Date): ProjectDto[] {
+  return db.transaction(() => {
+    ids.forEach((id, i) => {
+      db.prepare(`UPDATE projects SET sort_order = ? WHERE id = ? AND list_id = ?`).run(
+        (i + 1) * 1000,
+        id,
+        listId,
+      );
+    });
+    return getProjectDtos(db, listId, now);
+  })();
+}
+
+export function setProjectCollapsed(db: Database.Database, id: string, collapsed: boolean): { listId: string } {
+  return db.transaction(() => {
+    const row = getProjectRow(db, id);
+    if (!row) throw new Error("not_found: project not found");
+    db.prepare(`UPDATE projects SET collapsed = ? WHERE id = ?`).run(collapsed ? 1 : 0, id);
+    return { listId: row.list_id };
+  })();
 }
 
 // ---------------------------------------------------------------------------
@@ -877,7 +1286,7 @@ export function setTaskTags(db: Database.Database, taskId: string, tagIds: strin
     for (const tagId of uniqueIds) insert.run(taskId, tagId);
 
     return row.parent_id
-      ? taskRowToDto(row, [], { total: 0, done: 0 }, getTaskTags(db, taskId))
+      ? taskRowToDto(row, [], { total: 0, done: 0 }, getTaskTags(db, taskId), buildTrail(db, row))
       : buildTopLevelDto(db, row);
   })();
 }

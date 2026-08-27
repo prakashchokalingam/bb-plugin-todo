@@ -15,3 +15,7 @@ export function mintTaskId(): string {
 export function mintTagId(): string {
   return mint("tag_");
 }
+
+export function mintProjectId(): string {
+  return mint("prj_");
+}

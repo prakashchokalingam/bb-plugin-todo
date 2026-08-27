@@ -74,6 +74,8 @@ function makeTask(overrides: Partial<TaskDto> = {}): TaskDto {
     subtasks: [],
     subtaskCounts: { total: 0, done: 0 },
     tags: [],
+    projectId: null,
+    trail: null,
     ...overrides,
   };
 }

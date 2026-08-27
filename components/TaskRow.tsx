@@ -36,15 +36,58 @@ import { DueDatePicker } from "@/components/DueDatePicker";
 import { TagChips } from "@/components/TagChips";
 import { TagPicker } from "@/components/TagPicker";
 import { AddTaskRow } from "@/components/AddTaskRow";
+import { TrailLine } from "@/components/TrailLine";
 import type { BoardActions } from "@/components/Section";
+
+/** A ghost stays visible ~compact once it has been carried this many times,
+ * per the design's "carried >= 3" ghost marker rule. */
+const GHOST_CARRY_THRESHOLD = 3;
+
+/**
+ * A ghost's task id is deliberately identical to its scheduled Today
+ * counterpart's — same row, two homes (design doc's "Today stops being a
+ * place and becomes a flag"). That means the SAME `TaskDto.id` can be on
+ * screen twice at once (the ghost in its project/Backlog, the flat entry in
+ * Today), which would collide as a dnd-kit sortable/draggable id — dnd-kit
+ * requires unique ids per `DndContext`. Ghost rows therefore drag under a
+ * prefixed id instead of the bare task id; `data.taskId` (not dnd-kit's own
+ * `id`) is what the business logic (`lib/drag.ts`) actually reads, so this
+ * is purely a DOM/registry-uniqueness concern, invisible to the move math.
+ * Every `SortableContext`'s `items` list must use this same function so
+ * dnd-kit's internal id set matches what each row actually registers.
+ */
+export function taskDragId(task: TaskDto, ghost: boolean): string {
+  return ghost ? `ghost:${task.id}` : task.id;
+}
 
 export interface TaskRowProps {
   task: TaskDto;
   actions: BoardActions;
   indent?: boolean;
+  /** True when this row is a ghost: the task is scheduled (`bucket ===
+   * 'today'`) but rendered here inside its project body. Dims the row,
+   * swaps the checkbox for a ghost glyph, and shows a ". today" marker
+   * (plus the carry count once `carriedCount >= 3`). */
+  ghost?: boolean;
+  /** Fired when the ghost's ". today" marker is clicked, to unschedule it. */
+  onUnschedule?: (id: string) => void;
+  /** Renders the muted trail line (`# Project > Parent`) as a second line,
+   * for Today rows. `TrailLine` itself renders null with no context. */
+  showTrail?: boolean;
+  onNavigateToProject?: (projectId: string) => void;
+  onNavigateToParent?: (parentId: string) => void;
 }
 
-export function TaskRow({ task, actions, indent = false }: TaskRowProps) {
+export function TaskRow({
+  task,
+  actions,
+  indent = false,
+  ghost = false,
+  onUnschedule,
+  showTrail = false,
+  onNavigateToProject,
+  onNavigateToParent,
+}: TaskRowProps) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(task.title);
   const [dueOpen, setDueOpen] = useState(false);
@@ -54,7 +97,7 @@ export function TaskRow({ task, actions, indent = false }: TaskRowProps) {
 
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } =
     useSortable({
-      id: task.id,
+      id: taskDragId(task, ghost),
       data: { kind: "task", taskId: task.id, parentId: task.parentId, bucket: task.bucket },
     });
 
@@ -95,9 +138,12 @@ export function TaskRow({ task, actions, indent = false }: TaskRowProps) {
       <div
         ref={setNodeRef}
         style={style}
+        data-task-id={task.id}
+        data-ghost={ghost || undefined}
         className={cn(
           "flex min-h-8 items-center gap-2 px-2 py-1",
           indent && "pl-8",
+          ghost && "opacity-60",
           isDragging && "opacity-50",
           isOver && "bg-muted/60 ring-1 ring-inset ring-primary",
         )}
@@ -112,11 +158,20 @@ export function TaskRow({ task, actions, indent = false }: TaskRowProps) {
           <Icon name="DragDropVertical" className="size-3.5" aria-hidden="true" />
         </button>
 
-        <Checkbox
-          checked={false}
-          onCheckedChange={() => actions.onToggleComplete(task)}
-          aria-label={`Mark "${task.title}" done`}
-        />
+        {ghost ? (
+          <span
+            aria-hidden="true"
+            className="flex size-4 shrink-0 items-center justify-center text-muted-foreground"
+          >
+            <Icon name="CircleDashed" className="size-3.5" aria-hidden="true" />
+          </span>
+        ) : (
+          <Checkbox
+            checked={false}
+            onCheckedChange={() => actions.onToggleComplete(task)}
+            aria-label={`Mark "${task.title}" done`}
+          />
+        )}
 
         {editing ? (
           <input
@@ -144,10 +199,22 @@ export function TaskRow({ task, actions, indent = false }: TaskRowProps) {
           <ProgressRing done={task.subtaskCounts.done} total={task.subtaskCounts.total} />
         )}
 
-        {task.carriedCount > 0 && (
-          <Badge variant="secondary" className="whitespace-nowrap text-[10px]">
-            carried {task.carriedCount}×
-          </Badge>
+        {ghost ? (
+          <button
+            type="button"
+            onClick={() => onUnschedule?.(task.id)}
+            aria-label={`Unschedule "${task.title}"`}
+            className="shrink-0 whitespace-nowrap text-[10px] text-muted-foreground hover:text-foreground focus-visible:text-foreground"
+          >
+            · today
+            {task.carriedCount >= GHOST_CARRY_THRESHOLD ? ` ~${task.carriedCount}` : ""}
+          </button>
+        ) : (
+          task.carriedCount > 0 && (
+            <Badge variant="secondary" className="whitespace-nowrap text-[10px]">
+              carried {task.carriedCount}×
+            </Badge>
+          )
         )}
 
         <AgeChip
@@ -230,9 +297,32 @@ export function TaskRow({ task, actions, indent = false }: TaskRowProps) {
         </div>
       </div>
 
+      {showTrail && (
+        <TrailLine
+          trail={task.trail ?? null}
+          onNavigateToProject={onNavigateToProject}
+          onNavigateToParent={onNavigateToParent}
+        />
+      )}
+
+      {/* Only ever reached in the Backlog: Today rows are genuinely flat
+       * (deviation #1, design doc) — `task.subtasks` is always `[]` there.
+       * A subtask independently scheduled into Today (its parent stays
+       * put, per invariant 4) renders here as a ghost, exactly like a
+       * scheduled top-level task ghosts inside its ProjectGroup — see the
+       * design mockup's `-> (.) Get legal sign-off  . today` row. */}
       {isTopLevel &&
         task.subtasks.map((sub) => (
-          <TaskRow key={sub.id} task={sub} actions={actions} indent />
+          <TaskRow
+            key={sub.id}
+            task={sub}
+            actions={actions}
+            indent
+            ghost={sub.bucket === "today"}
+            onUnschedule={onUnschedule}
+            onNavigateToProject={onNavigateToProject}
+            onNavigateToParent={onNavigateToParent}
+          />
         ))}
 
       {addingSubtask && (

@@ -26,7 +26,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { loadPluginApp, renderSlot } from "@get-bb/plugin-sdk/testing/app";
 import { toast } from "sonner";
-import type { TaskDto } from "@/contract";
+import type { ProjectDto, TaskDto } from "@/contract";
 
 afterEach(() => {
   cleanup();
@@ -94,6 +94,21 @@ function makeTask(overrides: Partial<TaskDto> & { id: string; title: string }): 
     subtasks: [],
     subtaskCounts: { total: 0, done: 0 },
     tags: [],
+    projectId: null,
+    trail: null,
+    ...overrides,
+  };
+}
+
+function makeProject(overrides: Partial<ProjectDto> & { id: string; name: string }): ProjectDto {
+  return {
+    listId: "lst_1",
+    color: "teal",
+    sortOrder: 1000,
+    collapsed: false,
+    openCount: 0,
+    todayCount: 0,
+    overdueCount: 0,
     ...overrides,
   };
 }
@@ -767,5 +782,321 @@ describe("TodoPage — tags", () => {
       .map((c) => (c.input as { name: string }).name);
     expect(new Set(names).size).toBe(2);
     expect(names[0]).not.toBe(names[1]);
+  });
+});
+
+/**
+ * Phase 6 obligation 2 — end-to-end proof spanning the drag layer AND the
+ * board's rendering together. Phase 4's `lib/drag.test.ts` proves
+ * `computeTaskMove`'s shape in isolation; Phase 2's `lib/db.test.ts` proves
+ * the DB half. Neither exercises a REAL dnd-kit gesture through the actual
+ * component tree end to end — these tests do, following the same
+ * keyboard-drag technique (`stubSequentialRects` + dnd-kit's KeyboardSensor)
+ * as the "TodoPage — keyboard drag" describe block above.
+ *
+ * A subtlety this suite surfaces and fixes (not merely tests around): a
+ * ghost row and its scheduled Today counterpart share the same `TaskDto.id`
+ * by design (design doc's "same row, two homes") — which used to collide as
+ * a duplicate dnd-kit sortable id whenever both were mounted at once. See
+ * `taskDragId` in `TaskRow.tsx`.
+ */
+describe("TodoPage — projects & trail (end-to-end drag + render)", () => {
+  beforeEach(() => {
+    stubSequentialRects();
+  });
+
+  const project = makeProject({ id: "prj_1", name: "Q3 Launch", color: "teal" });
+
+  function subtaskInProjectBoard() {
+    const sub = makeTask({
+      id: "tsk_sub",
+      title: "Get legal sign-off",
+      parentId: "tsk_parent",
+      projectId: "prj_1",
+    });
+    const parent = makeTask({
+      id: "tsk_parent",
+      title: "Rewrite the onboarding email",
+      projectId: "prj_1",
+      subtasks: [sub],
+      subtaskCounts: { total: 1, done: 0 },
+    });
+    return {
+      lists: [{ id: "lst_1", name: "Work", sortOrder: 1000, openCount: 2, overdueCount: 0 }],
+      activeListId: "lst_1",
+      today: { day: "2026-08-27", planned: 0, completed: 0, tasks: [] },
+      backlog: { total: 1, overdue: 0, tasks: [parent] },
+      totalOverdue: 0,
+      serverNow: Date.now(),
+      tags: [],
+      projects: [project],
+    };
+  }
+
+  /** The server's authoritative board after `moveTask` schedules the
+   * subtask: it's flat in Today (with its trail) AND still ghosted in its
+   * project (bucket:"today" on the home copy too — design doc's "the task
+   * renders in Today with its trail, and stays visible — ghosted — in its
+   * project"). */
+  function scheduledSubtaskBoard() {
+    const ghostSub = makeTask({
+      id: "tsk_sub",
+      title: "Get legal sign-off",
+      parentId: "tsk_parent",
+      projectId: "prj_1",
+      bucket: "today",
+      day: "2026-08-27",
+    });
+    const parent = makeTask({
+      id: "tsk_parent",
+      title: "Rewrite the onboarding email",
+      projectId: "prj_1",
+      subtasks: [ghostSub],
+      subtaskCounts: { total: 1, done: 0 },
+    });
+    const flatSub = makeTask({
+      id: "tsk_sub",
+      title: "Get legal sign-off",
+      parentId: "tsk_parent",
+      projectId: "prj_1",
+      bucket: "today",
+      day: "2026-08-27",
+      trail: {
+        projectId: "prj_1",
+        projectName: "Q3 Launch",
+        projectColor: "teal",
+        parentId: "tsk_parent",
+        parentTitle: "Rewrite the onboarding email",
+      },
+    });
+    return {
+      lists: [{ id: "lst_1", name: "Work", sortOrder: 1000, openCount: 2, overdueCount: 0 }],
+      activeListId: "lst_1",
+      today: { day: "2026-08-27", planned: 1, completed: 0, tasks: [flatSub] },
+      backlog: { total: 1, overdue: 0, tasks: [parent] },
+      totalOverdue: 0,
+      serverNow: Date.now(),
+      tags: [],
+      projects: [{ ...project, todayCount: 1 }],
+    };
+  }
+
+  async function dragSubtaskIntoToday() {
+    const app = await loadPluginApp(() => import("@/app"));
+    const board = app.navPanels.find((p) => p.id === "board");
+    if (!board) throw new Error("app.tsx has not registered the 'board' navPanel yet");
+
+    let getBoardCalls = 0;
+    const view = renderSlot(
+      { component: board.component },
+      { subPath: "" },
+      {
+        rpc: {
+          getBoard: () => {
+            getBoardCalls += 1;
+            return getBoardCalls === 1 ? subtaskInProjectBoard() : scheduledSubtaskBoard();
+          },
+          moveTask: () => ({ ok: true as const }),
+        } as never,
+      },
+    );
+
+    await waitFor(() => screen.getByText("Get legal sign-off"));
+
+    const grip = screen.getByLabelText('Reorder "Get legal sign-off"');
+    grip.focus();
+    fireEvent.keyDown(grip, { key: " ", code: "Space" });
+    // See the KeyboardSensor deferred-`attach()` comment on the describe
+    // block above: a real macrotask, not a microtask, must elapse before
+    // its own keydown listener exists.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    // Empirically, landing the Today section's own (initially empty)
+    // droppable from a Backlog subtask takes several ArrowDown hops through
+    // every intervening sortable/droppable (project header, sibling rows,
+    // the project body, the loose-task row, both section containers) —
+    // dnd-kit's `sortableKeyboardCoordinates` walks its droppable registry
+    // one candidate at a time. 15 presses lands reliably past all of them
+    // onto the empty Today section and stays there (verified stable across
+    // a 12-30 press range), without needing to hand-compute dnd-kit's
+    // internal measurement order.
+    for (let i = 0; i < 15; i++) {
+      fireEvent.keyDown(grip, { key: "ArrowDown", code: "ArrowDown" });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    fireEvent.keyDown(grip, { key: " ", code: "Space" });
+
+    await waitFor(() => {
+      const moves = view.inspection.rpcCalls.filter((c) => c.method === "moveTask");
+      expect(moves.length).toBeGreaterThan(0);
+    });
+
+    return view;
+  }
+
+  it("(a) dragging a subtask from a project into Today keeps its parent, and Today shows its trail", async () => {
+    const view = await dragSubtaskIntoToday();
+
+    // The CENTRAL FIX (design doc's Problem section correction, lib/drag.ts
+    // "CENTRAL FIX" comment): parentId is KEPT, not nulled, and projectId is
+    // omitted entirely (moveTask's "omit = unchanged").
+    const moves = view.inspection.rpcCalls.filter((c) => c.method === "moveTask");
+    expect(moves[0].input).toEqual({
+      id: "tsk_sub",
+      bucket: "today",
+      parentId: "tsk_parent",
+      beforeId: null,
+      afterId: null,
+    });
+
+    // The server's authoritative post-move board (this test's `getBoard`
+    // stub's second response) renders the scheduled row in Today with its
+    // trail as a second line: `# Q3 Launch > Rewrite the onboarding email`.
+    // `TrailLine` renders the project badge and parent segment twice (an
+    // `md:flex`/`md:hidden` responsive pair — see TrailLine.tsx), so
+    // `getAllByText` rather than `getByText`.
+    await waitFor(() => {
+      expect(screen.getAllByText("Q3 Launch").length).toBeGreaterThan(0);
+    });
+    expect(screen.getAllByText("Rewrite the onboarding email").length).toBeGreaterThan(0);
+  });
+
+  it("(b) the subtask remains visible, ghosted, in its project after being scheduled", async () => {
+    await dragSubtaskIntoToday();
+
+    // Ghosted: the project's own copy of the subtask is still on screen
+    // (dimmed, checkbox swapped for the ghost glyph, "· today" marker) —
+    // "stays visible — ghosted — in its project" (design doc's Core
+    // decision). The ghost's marker doubles as the unschedule affordance.
+    await waitFor(() => {
+      expect(screen.getByLabelText('Unschedule "Get legal sign-off"')).toBeTruthy();
+    });
+    const ghostRow = screen
+      .getByLabelText('Unschedule "Get legal sign-off"')
+      .closest('[data-task-id="tsk_sub"]');
+    expect(ghostRow).toBeTruthy();
+    expect(ghostRow?.getAttribute("data-ghost")).toBe("true");
+
+    // The parent itself is untouched: still a normal (non-ghost) Backlog
+    // row, still showing the "add a subtask" affordance only top-level rows
+    // get — proving invariant 4 (scheduling a subtask never drags its
+    // parent into Today).
+    expect(
+      screen.getByLabelText('Add a subtask to "Rewrite the onboarding email"'),
+    ).toBeTruthy();
+  });
+
+  it("(c) dragging it back to the Backlog snaps it home to its original slot, not the drop position", async () => {
+    const app = await loadPluginApp(() => import("@/app"));
+    const board = app.navPanels.find((p) => p.id === "board");
+    if (!board) throw new Error("app.tsx has not registered the 'board' navPanel yet");
+
+    const view = renderSlot(
+      { component: board.component },
+      { subPath: "" },
+      {
+        rpc: {
+          getBoard: () => scheduledSubtaskBoard(),
+          moveTask: () => ({ ok: true as const }),
+        } as never,
+      },
+    );
+
+    await waitFor(() => {
+      expect(screen.getAllByText("Get legal sign-off").length).toBeGreaterThan(0);
+    });
+
+    // Two rows share this label: the ghost (inside the project, in the
+    // Backlog) and the flat Today row. Today renders after the Backlog in
+    // the DOM, so it's the last match.
+    const grips = screen.getAllByLabelText('Reorder "Get legal sign-off"');
+    const todayGrip = grips[grips.length - 1];
+    todayGrip.focus();
+    fireEvent.keyDown(todayGrip, { key: " ", code: "Space" });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    // Empirically, two ArrowDown hops from the Today row land the drop
+    // directly ON the (unrelated, still-in-the-Backlog) parent task's own
+    // row — a deliberately "wrong" landing spot within the Backlog, chosen
+    // specifically to prove the snap-home rule doesn't care where it lands.
+    fireEvent.keyDown(todayGrip, { key: "ArrowDown", code: "ArrowDown" });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    fireEvent.keyDown(todayGrip, { key: "ArrowDown", code: "ArrowDown" });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    fireEvent.keyDown(todayGrip, { key: " ", code: "Space" });
+
+    await waitFor(() => {
+      const moves = view.inspection.rpcCalls.filter((c) => c.method === "moveTask");
+      expect(moves.length).toBeGreaterThan(0);
+    });
+
+    // The snap-home rule (design doc "Drag matrix"): dropped ON
+    // "tsk_parent"'s own row, yet `beforeId`/`afterId` are both null — the
+    // drop position is discarded entirely. `parentId` is carried over
+    // unchanged (still "tsk_parent"), and `projectId` is omitted (moveTask's
+    // "omit = unchanged"), so the subtask returns to exactly the slot it
+    // already lived in, not wherever the pointer/focus happened to land.
+    const moves = view.inspection.rpcCalls.filter((c) => c.method === "moveTask");
+    expect(moves[0].input).toEqual({
+      id: "tsk_sub",
+      bucket: "backlog",
+      parentId: "tsk_parent",
+      beforeId: null,
+      afterId: null,
+    });
+  });
+
+  it("(d) a task carried several times still renders its full trail", async () => {
+    const app = await loadPluginApp(() => import("@/app"));
+    const board = app.navPanels.find((p) => p.id === "board");
+    if (!board) throw new Error("app.tsx has not registered the 'board' navPanel yet");
+
+    const carried = makeTask({
+      id: "tsk_carried",
+      title: "Draft the copy",
+      parentId: "tsk_parent",
+      projectId: "prj_1",
+      bucket: "today",
+      day: "2026-08-27",
+      carriedCount: 6,
+      trail: {
+        projectId: "prj_1",
+        projectName: "Q3 Launch",
+        projectColor: "teal",
+        parentId: "tsk_parent",
+        parentTitle: "Rewrite the onboarding email",
+      },
+    });
+
+    renderSlot(
+      { component: board.component },
+      { subPath: "" },
+      {
+        rpc: {
+          getBoard: () => ({
+            lists: [{ id: "lst_1", name: "Work", sortOrder: 1000, openCount: 1, overdueCount: 0 }],
+            activeListId: "lst_1",
+            today: { day: "2026-08-27", planned: 1, completed: 0, tasks: [carried] },
+            backlog: { total: 0, overdue: 0, tasks: [] },
+            totalOverdue: 0,
+            serverNow: Date.now(),
+            tags: [],
+            projects: [project],
+          }),
+        } as never,
+      },
+    );
+
+    await waitFor(() => screen.getByText("Draft the copy"));
+
+    // The existing "carried Nx" badge (unrelated to the ghost's separate
+    // "carried >= 3" marker, which only applies to a ghost row rendered
+    // inside its project) survives a task also having a trail — the two
+    // features coexist on the same row rather than one crowding out the
+    // other.
+    expect(screen.getByText("carried 6×")).toBeTruthy();
+    // The full trail — both the project badge and the parent segment —
+    // still renders as the row's second line, regardless of how many times
+    // it's been carried.
+    expect(screen.getAllByText("Q3 Launch").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("Rewrite the onboarding email").length).toBeGreaterThan(0);
   });
 });

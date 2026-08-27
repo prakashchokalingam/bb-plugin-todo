@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { TaskDto } from "@/contract";
 import {
   applyMoveToBoard,
+  computeProjectReorder,
   computeTaskMove,
   resolveDropZone,
   type DragBoardTasks,
@@ -28,6 +29,8 @@ function makeTask(overrides: Partial<TaskDto> & { id: string }): TaskDto {
     subtasks: [],
     subtaskCounts: { total: 0, done: 0 },
     tags: [],
+    projectId: null,
+    trail: null,
     ...overrides,
   };
 }
@@ -84,6 +87,12 @@ describe("computeTaskMove — cross-section (backlog <-> today)", () => {
     });
   });
 
+  // CHANGED — drag matrix "Today row -> Backlog (anywhere): unschedule;
+  // snaps home to its own project slot (NOT the drop position)". The old
+  // expectation appended the row at the end of the Backlog body; the new
+  // rule deliberately ignores drop position and leaves sort_order alone
+  // (moveTask's snapHome branch), so beforeId/afterId are both null and
+  // projectId is omitted rather than recomputed from the drop.
   it("today -> backlog onto an empty Backlog body appends as the only item", () => {
     const board: DragBoardTasks = {
       backlog: [],
@@ -103,7 +112,10 @@ describe("computeTaskMove — cross-section (backlog <-> today)", () => {
     });
   });
 
-  it("today -> backlog onto a populated Backlog body appends after the last row", () => {
+  // CHANGED — same snap-home rule as above; a populated Backlog body no
+  // longer changes the outcome, since position is never computed for a
+  // Today-sourced drop into Backlog.
+  it("today -> backlog onto a populated Backlog body snaps home, ignoring the drop position", () => {
     const board: DragBoardTasks = {
       backlog: [
         makeTask({ id: "tsk_x", bucket: "backlog" }),
@@ -121,7 +133,7 @@ describe("computeTaskMove — cross-section (backlog <-> today)", () => {
       bucket: "backlog",
       parentId: null,
       beforeId: null,
-      afterId: "tsk_y",
+      afterId: null,
     });
   });
 
@@ -289,15 +301,20 @@ describe("computeTaskMove — nesting into a subtask", () => {
   });
 
   it("dropping onto a subtask never nests — depth stays 1", () => {
+    // CHANGED — fixture only: bucket "today" -> "backlog". Per Phase 3
+    // deviation #1 ("Today is genuinely flat"), a Today row's `.subtasks`
+    // is always []; a real nested subtask (as this depth-cap test needs)
+    // can only exist in the Backlog home tree. The assertion itself is
+    // untouched — this test is about the depth cap, not about Today.
     const parent = makeTask({
       id: "tsk_parent",
-      bucket: "today",
-      subtasks: [makeTask({ id: "tsk_sub1", parentId: "tsk_parent", bucket: "today" })],
+      bucket: "backlog",
+      subtasks: [makeTask({ id: "tsk_sub1", parentId: "tsk_parent", bucket: "backlog" })],
       subtaskCounts: { total: 1, done: 0 },
     });
     const board: DragBoardTasks = {
-      backlog: [makeTask({ id: "tsk_drag", bucket: "backlog" })],
-      today: [parent],
+      backlog: [makeTask({ id: "tsk_drag", bucket: "backlog" }), parent],
+      today: [],
     };
     // Dead-center rects — if subtasks were nestable this would be "nest".
     const move = computeTaskMove(
@@ -315,12 +332,19 @@ describe("computeTaskMove — nesting into a subtask", () => {
   });
 });
 
-describe("computeTaskMove — promoting a subtask to top-level", () => {
-  it("dragging a subtask onto a section body promotes it (parentId: null)", () => {
+describe("computeTaskMove — the central fix: subtask -> Today keeps parentId", () => {
+  // This is the bug the design doc names directly: "lib/drag.ts:106 ...
+  // sends parentId: null on every cross-bucket drop — so the loss is
+  // client-side". Drag matrix: "subtask -> Today: flag scheduled; parent_id
+  // KEPT". Both routes into Today (dropping on the section body, and
+  // dropping near an existing Today row) must preserve it.
+
+  it("CENTRAL FIX — dropping a subtask on the Today section body keeps its parentId (was: nulled)", () => {
     const parent = makeTask({
       id: "tsk_parent",
       bucket: "backlog",
-      subtasks: [makeTask({ id: "tsk_sub", parentId: "tsk_parent", bucket: "backlog" })],
+      projectId: "prj_1",
+      subtasks: [makeTask({ id: "tsk_sub", parentId: "tsk_parent", bucket: "backlog", projectId: "prj_1" })],
       subtaskCounts: { total: 1, done: 0 },
     });
     const board: DragBoardTasks = { backlog: [parent], today: [] };
@@ -332,12 +356,60 @@ describe("computeTaskMove — promoting a subtask to top-level", () => {
     expect(move).toEqual({
       id: "tsk_sub",
       bucket: "today",
-      parentId: null,
+      parentId: "tsk_parent",
       beforeId: null,
       afterId: null,
     });
   });
 
+  it("CENTRAL FIX — dropping a subtask near an existing Today row also keeps its parentId", () => {
+    const parent = makeTask({
+      id: "tsk_parent",
+      bucket: "backlog",
+      projectId: "prj_1",
+      subtasks: [makeTask({ id: "tsk_sub", parentId: "tsk_parent", bucket: "backlog", projectId: "prj_1" })],
+      subtaskCounts: { total: 1, done: 0 },
+    });
+    const board: DragBoardTasks = {
+      backlog: [parent],
+      today: [makeTask({ id: "tsk_other", bucket: "today" })],
+    };
+    const move = computeTaskMove(
+      { taskId: "tsk_sub", parentId: "tsk_parent", bucket: "backlog" },
+      { kind: "task", taskId: "tsk_other" },
+      board,
+      rowRect(5), // well below -> "after"
+      rowRect(0),
+    );
+    expect(move).toEqual({
+      id: "tsk_sub",
+      bucket: "today",
+      parentId: "tsk_parent",
+      beforeId: null,
+      afterId: "tsk_other",
+    });
+  });
+
+  it("project task -> Today: parentId stays null and projectId is omitted (ghost stays put)", () => {
+    const task = makeTask({ id: "tsk_a", bucket: "backlog", projectId: "prj_1" });
+    const board: DragBoardTasks = { backlog: [task], today: [] };
+    const move = computeTaskMove(
+      { taskId: "tsk_a", parentId: null, bucket: "backlog" },
+      { kind: "section", bucket: "today" },
+      board,
+    );
+    expect(move).toEqual({
+      id: "tsk_a",
+      bucket: "today",
+      parentId: null,
+      beforeId: null,
+      afterId: null,
+    });
+    expect(move).not.toHaveProperty("projectId");
+  });
+});
+
+describe("computeTaskMove — promoting a subtask to top-level (Backlog only)", () => {
   it("dragging a subtask into the before/after zone of a top-level row promotes it", () => {
     const parent = makeTask({
       id: "tsk_parent",
@@ -358,6 +430,7 @@ describe("computeTaskMove — promoting a subtask to top-level", () => {
       id: "tsk_sub",
       bucket: "backlog",
       parentId: null,
+      projectId: null,
       beforeId: null,
       afterId: "tsk_other",
     });
@@ -365,18 +438,23 @@ describe("computeTaskMove — promoting a subtask to top-level", () => {
 });
 
 describe("computeTaskMove — a subtask reordering among its own siblings", () => {
-  it("keeps parentId and computes beforeId/afterId from the parent's subtasks only", () => {
-    const parent = makeTask({
-      id: "tsk_parent",
-      bucket: "today",
-      subtasks: [
+  // CHANGED — Phase 3 deviation #1: Today is genuinely flat (buildTodayDto
+  // forces subtasks: [] on every Today row), so a scheduled subtask never
+  // sits nested inside a Today parent's `.subtasks`; it's its own flat
+  // top-level entry, still carrying its real parentId. This fixture models
+  // that: three flat Today entries that happen to share a parentId, rather
+  // than one Today parent with a real nested `.subtasks` array. The
+  // resolved move is unchanged in shape (parentId kept, sibling group is
+  // the flat Today list) — only the board shape backing it changed.
+  it("keeps parentId and computes beforeId/afterId from the flat Today siblings", () => {
+    const board: DragBoardTasks = {
+      backlog: [],
+      today: [
         makeTask({ id: "tsk_s1", parentId: "tsk_parent", bucket: "today" }),
         makeTask({ id: "tsk_s2", parentId: "tsk_parent", bucket: "today" }),
         makeTask({ id: "tsk_s3", parentId: "tsk_parent", bucket: "today" }),
       ],
-      subtaskCounts: { total: 3, done: 0 },
-    });
-    const board: DragBoardTasks = { backlog: [], today: [parent] };
+    };
     // Drag s3 to before s1 (top of its sibling group).
     const move = computeTaskMove(
       { taskId: "tsk_s3", parentId: "tsk_parent", bucket: "today" },
@@ -428,7 +506,10 @@ describe("computeTaskMove — no-op edges", () => {
     expect(move).toBeNull();
   });
 
-  it("an empty board with a section drop still resolves to a clean append", () => {
+  // CHANGED — drag matrix "project task -> loose area: project_id = NULL".
+  // A drop on the generic Backlog section body (as opposed to a specific
+  // project header/body) now explicitly unfiles the task.
+  it("an empty board with a section drop still resolves to a clean append into the loose area", () => {
     const move = computeTaskMove(
       { taskId: "tsk_only", parentId: null, bucket: "backlog" },
       { kind: "section", bucket: "backlog" },
@@ -438,6 +519,7 @@ describe("computeTaskMove — no-op edges", () => {
       id: "tsk_only",
       bucket: "backlog",
       parentId: null,
+      projectId: null,
       beforeId: null,
       afterId: null,
     });
@@ -470,6 +552,188 @@ describe("Bucket type sanity", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// The drag matrix, table-driven — docs/design/2026-08-27-projects.md,
+// "Drag matrix". Each row below is one line of that table; the test name
+// says which.
+// ---------------------------------------------------------------------------
+describe("computeTaskMove — drag matrix", () => {
+  it("project task -> Today: flag scheduled, ghost stays (parentId null, projectId omitted)", () => {
+    const task = makeTask({ id: "tsk_a", bucket: "backlog", projectId: "prj_1" });
+    const board: DragBoardTasks = { backlog: [task], today: [] };
+    const move = computeTaskMove(
+      { taskId: "tsk_a", parentId: null, bucket: "backlog" },
+      { kind: "section", bucket: "today" },
+      board,
+    );
+    expect(move).toEqual({ id: "tsk_a", bucket: "today", parentId: null, beforeId: null, afterId: null });
+  });
+
+  it("subtask -> Today: flag scheduled, parent_id KEPT", () => {
+    const parent = makeTask({
+      id: "tsk_parent",
+      bucket: "backlog",
+      projectId: "prj_1",
+      subtasks: [makeTask({ id: "tsk_sub", parentId: "tsk_parent", bucket: "backlog", projectId: "prj_1" })],
+      subtaskCounts: { total: 1, done: 0 },
+    });
+    const board: DragBoardTasks = { backlog: [parent], today: [] };
+    const move = computeTaskMove(
+      { taskId: "tsk_sub", parentId: "tsk_parent", bucket: "backlog" },
+      { kind: "section", bucket: "today" },
+      board,
+    );
+    expect(move).toEqual({
+      id: "tsk_sub",
+      bucket: "today",
+      parentId: "tsk_parent",
+      beforeId: null,
+      afterId: null,
+    });
+  });
+
+  it("Today row -> Backlog (anywhere): unschedule, snaps home (parent kept, projectId omitted, no position)", () => {
+    const scheduled = makeTask({ id: "tsk_a", bucket: "today", projectId: "prj_1" });
+    const otherProjectTask = makeTask({ id: "tsk_b", bucket: "backlog", projectId: "prj_2" });
+    const board: DragBoardTasks = {
+      backlog: [otherProjectTask],
+      today: [scheduled],
+    };
+    // Landing on a specific task belonging to an unrelated project must
+    // still snap home, not reorder next to that task.
+    const move = computeTaskMove(
+      { taskId: "tsk_a", parentId: null, bucket: "today" },
+      { kind: "task", taskId: "tsk_b" },
+      board,
+      rowRect(5),
+      rowRect(0),
+    );
+    expect(move).toEqual({ id: "tsk_a", bucket: "backlog", parentId: null, beforeId: null, afterId: null });
+    expect(move).not.toHaveProperty("projectId");
+  });
+
+  it("Today row -> a different project's header: unschedule AND re-home", () => {
+    const scheduled = makeTask({ id: "tsk_a", bucket: "today", projectId: "prj_1" });
+    const board: DragBoardTasks = {
+      backlog: [
+        scheduled,
+        makeTask({ id: "tsk_in_prj2", bucket: "backlog", projectId: "prj_2" }),
+      ],
+      today: [scheduled],
+    };
+    const move = computeTaskMove(
+      { taskId: "tsk_a", parentId: null, bucket: "today" },
+      { kind: "project", projectId: "prj_2" },
+      board,
+    );
+    expect(move).toEqual({
+      id: "tsk_a",
+      bucket: "backlog",
+      parentId: null,
+      projectId: "prj_2",
+      beforeId: null,
+      afterId: "tsk_in_prj2",
+    });
+  });
+
+  it("Today row -> Today: reorder (parentId untouched)", () => {
+    const board: DragBoardTasks = {
+      backlog: [],
+      today: [
+        makeTask({ id: "tsk_a", bucket: "today" }),
+        makeTask({ id: "tsk_b", bucket: "today" }),
+      ],
+    };
+    const move = computeTaskMove(
+      { taskId: "tsk_b", parentId: null, bucket: "today" },
+      { kind: "task", taskId: "tsk_a" },
+      board,
+      rowRect(0),
+      rowRect(1),
+    );
+    expect(move).toEqual({ id: "tsk_b", bucket: "today", parentId: null, beforeId: "tsk_a", afterId: null });
+  });
+
+  it("project task -> another project: re-home (explicit projectId, top-level)", () => {
+    const target = makeTask({ id: "tsk_target", bucket: "backlog", projectId: "prj_2" });
+    const board: DragBoardTasks = {
+      backlog: [makeTask({ id: "tsk_a", bucket: "backlog", projectId: "prj_1" }), target],
+      today: [],
+    };
+    const move = computeTaskMove(
+      { taskId: "tsk_a", parentId: null, bucket: "backlog" },
+      { kind: "task", taskId: "tsk_target" },
+      board,
+      rowRect(5), // after
+      rowRect(1),
+    );
+    expect(move).toEqual({
+      id: "tsk_a",
+      bucket: "backlog",
+      parentId: null,
+      projectId: "prj_2",
+      beforeId: null,
+      afterId: "tsk_target",
+    });
+  });
+
+  it("project task -> loose area: projectId = null", () => {
+    const board: DragBoardTasks = {
+      backlog: [makeTask({ id: "tsk_a", bucket: "backlog", projectId: "prj_1" })],
+      today: [],
+    };
+    const move = computeTaskMove(
+      { taskId: "tsk_a", parentId: null, bucket: "backlog" },
+      { kind: "section", bucket: "backlog" },
+      board,
+    );
+    expect(move).toEqual({
+      id: "tsk_a",
+      bucket: "backlog",
+      parentId: null,
+      projectId: null,
+      beforeId: null,
+      afterId: null,
+    });
+  });
+
+  it("loose task -> project body: file into project", () => {
+    const inProject = makeTask({ id: "tsk_in_prj", bucket: "backlog", projectId: "prj_1" });
+    const board: DragBoardTasks = {
+      backlog: [makeTask({ id: "tsk_loose", bucket: "backlog", projectId: null }), inProject],
+      today: [],
+    };
+    const move = computeTaskMove(
+      { taskId: "tsk_loose", parentId: null, bucket: "backlog" },
+      { kind: "project", projectId: "prj_1" },
+      board,
+    );
+    expect(move).toEqual({
+      id: "tsk_loose",
+      bucket: "backlog",
+      parentId: null,
+      projectId: "prj_1",
+      beforeId: null,
+      afterId: "tsk_in_prj",
+    });
+  });
+
+  it("project header -> project header: reorder projects", () => {
+    const ids = ["prj_1", "prj_2", "prj_3"];
+    expect(computeProjectReorder("prj_3", "prj_1", ids)).toEqual(["prj_3", "prj_1", "prj_2"]);
+  });
+
+  it("project header -> itself is a no-op", () => {
+    const ids = ["prj_1", "prj_2"];
+    expect(computeProjectReorder("prj_1", "prj_1", ids)).toBeNull();
+  });
+
+  it("project header -> an unknown project id is a no-op", () => {
+    const ids = ["prj_1", "prj_2"];
+    expect(computeProjectReorder("prj_1", "prj_ghost", ids)).toBeNull();
+  });
+});
+
 describe("applyMoveToBoard", () => {
   it("returns the same board unchanged for a null move (no-op)", () => {
     const board: DragBoardTasks = {
@@ -479,8 +743,12 @@ describe("applyMoveToBoard", () => {
     expect(applyMoveToBoard(board, null)).toBe(board);
   });
 
-  it("cross-section move: relocates a top-level task to the other bucket's array, updating its bucket", () => {
-    const a = makeTask({ id: "tsk_a", bucket: "backlog" });
+  // CHANGED — drag matrix "project task -> Today: ghost stays in project".
+  // The old expectation removed the task from `backlog` entirely; the new
+  // ghost model keeps its home entry in place (now flagged `bucket:
+  // "today"`) *and* adds it to the flat `today` array.
+  it("scheduling into Today: the task stays in backlog as a ghost AND appears in today", () => {
+    const a = makeTask({ id: "tsk_a", bucket: "backlog", projectId: "prj_1" });
     const b = makeTask({ id: "tsk_b", bucket: "today" });
     const board: DragBoardTasks = { backlog: [a], today: [b] };
     const move: MoveTaskInput = {
@@ -490,12 +758,17 @@ describe("applyMoveToBoard", () => {
       beforeId: null,
       afterId: "tsk_b",
     };
-    const next = applyMoveToBoard(board, move);
+    const next = applyMoveToBoard(board, move, "2026-08-27");
 
-    expect(next.backlog).toHaveLength(0);
+    // Ghost: still in backlog, at the same slot, now flagged today.
+    expect(next.backlog.map((t) => t.id)).toEqual(["tsk_a"]);
+    expect(next.backlog[0].bucket).toBe("today");
+    expect(next.backlog[0].projectId).toBe("prj_1");
+    // Also present, flat, in today.
     expect(next.today.map((t) => t.id)).toEqual(["tsk_b", "tsk_a"]);
     expect(next.today[1].bucket).toBe("today");
     expect(next.today[1].parentId).toBeNull();
+    expect(next.today[1].projectId).toBe("prj_1");
   });
 
   it("reorder within a section: moves the task within the same top-level array per beforeId/afterId", () => {
@@ -537,28 +810,39 @@ describe("applyMoveToBoard", () => {
     expect(nextParent.subtasks[0].bucket).toBe("backlog");
   });
 
-  it("promoting a subtask: dropping a subtask onto a section makes it top-level again", () => {
+  // CHANGED — Phase 3 deviation #1 (Today is genuinely flat) plus drag
+  // matrix "Today row -> Backlog (anywhere): unschedule; snaps home". The
+  // old fixture nested a real subtask inside a Today parent's `.subtasks`,
+  // which can no longer happen (Today rows are always flat). This now
+  // models a subtask that is BOTH homed (nested in Backlog, under its real
+  // parent) and scheduled (flat in Today), and drags it back to the
+  // Backlog: it disappears from `today` and its home entry — never moved —
+  // is simply un-ghosted.
+  it("unscheduling a subtask: it leaves the flat Today array; its home nesting is untouched", () => {
+    const sub = makeTask({ id: "tsk_sub", parentId: "tsk_parent", bucket: "today", projectId: "prj_1" });
     const parent = makeTask({
       id: "tsk_parent",
-      bucket: "today",
-      subtasks: [makeTask({ id: "tsk_sub", parentId: "tsk_parent", bucket: "today" })],
+      bucket: "backlog",
+      projectId: "prj_1",
+      subtasks: [sub],
       subtaskCounts: { total: 1, done: 0 },
     });
-    const board: DragBoardTasks = { backlog: [], today: [parent] };
+    const flatToday = makeTask({ id: "tsk_sub", parentId: "tsk_parent", bucket: "today", projectId: "prj_1" });
+    const board: DragBoardTasks = { backlog: [parent], today: [flatToday] };
     const move: MoveTaskInput = {
       id: "tsk_sub",
       bucket: "backlog",
-      parentId: null,
+      parentId: "tsk_parent",
       beforeId: null,
       afterId: null,
     };
     const next = applyMoveToBoard(board, move);
 
-    expect(next.today[0].subtasks).toHaveLength(0);
-    expect(next.today[0].subtaskCounts.total).toBe(0);
-    expect(next.backlog.map((t) => t.id)).toEqual(["tsk_sub"]);
-    expect(next.backlog[0].parentId).toBeNull();
-    expect(next.backlog[0].bucket).toBe("backlog");
+    expect(next.today).toHaveLength(0);
+    const nextParent = next.backlog.find((t) => t.id === "tsk_parent");
+    expect(nextParent?.subtasks.map((s) => s.id)).toEqual(["tsk_sub"]);
+    expect(nextParent?.subtasks[0].bucket).toBe("backlog");
+    expect(nextParent?.subtasks[0].day).toBeNull();
   });
 
   it("nesting a task that itself has subtasks promotes those children to top-level siblings", () => {
@@ -589,8 +873,7 @@ describe("applyMoveToBoard", () => {
     expect(nestedA?.subtasks).toEqual([]);
     expect(nestedA?.subtaskCounts).toEqual({ total: 0, done: 0 });
 
-    // tsk_a's former children are promoted to top-level siblings, placed
-    // immediately after the parent they were nested under.
+    // tsk_a's former children are promoted to top-level siblings.
     const topIds = next.backlog.map((t) => t.id);
     expect(topIds).toContain("tsk_gc1");
     expect(topIds).toContain("tsk_gc2");
@@ -601,7 +884,13 @@ describe("applyMoveToBoard", () => {
     expect(gc1?.bucket).toBe("backlog");
   });
 
-  it("a parent moving (not being nested) carries its subtasks along, mirroring its new bucket", () => {
+  // CHANGED — invariant 4 ("scheduling a parent does not drag its
+  // subtasks along, and scheduling a parent does not drag its subtasks
+  // along ... reverses lib/db.ts:565") replaces the old "carries its
+  // subtasks along" behaviour. Scheduling a parent into Today now only
+  // gives the PARENT a flat Today entry; its real subtask stays exactly
+  // where it was — homed, unscheduled, in the Backlog.
+  it("scheduling a parent into Today does NOT drag its subtasks along (invariant 4)", () => {
     const sub = makeTask({ id: "tsk_sub", parentId: "tsk_a", bucket: "backlog" });
     const a = makeTask({
       id: "tsk_a",
@@ -619,33 +908,41 @@ describe("applyMoveToBoard", () => {
     };
     const next = applyMoveToBoard(board, move, "2026-08-20");
 
-    expect(next.backlog).toHaveLength(0);
+    // Ghost: tsk_a stays in backlog, still parenting tsk_sub, which is
+    // untouched (still backlog, still no day).
+    expect(next.backlog.map((t) => t.id)).toEqual(["tsk_a"]);
+    expect(next.backlog[0].bucket).toBe("today");
+    expect(next.backlog[0].subtasks.map((s) => s.id)).toEqual(["tsk_sub"]);
+    expect(next.backlog[0].subtasks[0].bucket).toBe("backlog");
+    expect(next.backlog[0].subtasks[0].day).toBeNull();
+
+    // Today gains only the parent, flat (no nested subtasks).
     expect(next.today.map((t) => t.id)).toEqual(["tsk_a"]);
-    expect(next.today[0].bucket).toBe("today");
-    expect(next.today[0].subtasks[0].bucket).toBe("today");
-    expect(next.today[0].subtasks[0].day).toBe("2026-08-20");
+    expect(next.today[0].day).toBe("2026-08-20");
+    expect(next.today[0].subtasks).toEqual([]);
   });
 
   it("does not mutate the input board's arrays or task objects", () => {
-    const sub = makeTask({ id: "tsk_sub", parentId: "tsk_parent", bucket: "today" });
+    const sub = makeTask({ id: "tsk_sub", parentId: "tsk_parent", bucket: "backlog" });
     const parent = makeTask({
       id: "tsk_parent",
-      bucket: "today",
+      bucket: "backlog",
       subtasks: [sub],
       subtaskCounts: { total: 1, done: 0 },
     });
     const other = makeTask({ id: "tsk_other", bucket: "backlog" });
-    const board: DragBoardTasks = { backlog: [other], today: [parent] };
+    const board: DragBoardTasks = { backlog: [other, parent], today: [] };
     const snapshotBacklog = [...board.backlog];
-    const snapshotToday = [...board.today];
     const snapshotParent = { ...parent, subtasks: [...parent.subtasks] };
 
+    // The central-fix case: scheduling the subtask into Today keeps its
+    // parentId, and must not mutate the source board while doing so.
     const move: MoveTaskInput = {
       id: "tsk_sub",
-      bucket: "backlog",
-      parentId: null,
+      bucket: "today",
+      parentId: "tsk_parent",
       beforeId: null,
-      afterId: "tsk_other",
+      afterId: null,
     };
     applyMoveToBoard(board, move);
 
@@ -653,10 +950,10 @@ describe("applyMoveToBoard", () => {
     // order, same length) and the original parent object's own fields and
     // `subtasks` array are unchanged.
     expect(board.backlog).toEqual(snapshotBacklog);
-    expect(board.today).toEqual(snapshotToday);
-    expect(board.today[0]).toEqual(snapshotParent);
-    expect(board.today[0].subtasks).toHaveLength(1);
-    expect(board.today[0].subtasks[0].id).toBe("tsk_sub");
+    expect(board.today).toEqual([]);
+    expect(board.backlog.find((t) => t.id === "tsk_parent")).toEqual(snapshotParent);
+    expect(board.backlog.find((t) => t.id === "tsk_parent")?.subtasks).toHaveLength(1);
+    expect(board.backlog.find((t) => t.id === "tsk_parent")?.subtasks[0].id).toBe("tsk_sub");
     expect(board.backlog[0]).toBe(other);
   });
 
@@ -673,5 +970,23 @@ describe("applyMoveToBoard", () => {
       afterId: null,
     };
     expect(applyMoveToBoard(board, move)).toBe(board);
+  });
+
+  it("re-homing to a different project relocates the home entry and writes the explicit projectId", () => {
+    const a = makeTask({ id: "tsk_a", bucket: "backlog", projectId: "prj_1" });
+    const inTarget = makeTask({ id: "tsk_in_prj2", bucket: "backlog", projectId: "prj_2" });
+    const board: DragBoardTasks = { backlog: [a, inTarget], today: [] };
+    const move: MoveTaskInput = {
+      id: "tsk_a",
+      bucket: "backlog",
+      parentId: null,
+      projectId: "prj_2",
+      beforeId: null,
+      afterId: "tsk_in_prj2",
+    };
+    const next = applyMoveToBoard(board, move);
+
+    expect(next.backlog.map((t) => t.id)).toEqual(["tsk_in_prj2", "tsk_a"]);
+    expect(next.backlog[1].projectId).toBe("prj_2");
   });
 });

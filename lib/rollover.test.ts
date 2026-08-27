@@ -157,4 +157,42 @@ describe("runRollover", () => {
     expect(child.day).toBe(parent.day);
     expect(child.carried_count).toBe(1);
   });
+
+  // Phase 2 requirement: prove runRollover (untouched by the projects
+  // feature) still carries a task forward correctly across several days,
+  // AND that its trail — computed by lib/db.ts, entirely outside
+  // runRollover — still resolves in full afterward. Carry-forward and the
+  // project/parent trail are orthogonal: rollover only ever touches
+  // day/carried_count, never project_id or parent_id.
+  it("a task carried several times still resolves its full trail (project + parent) afterward", () => {
+    db.prepare(
+      `INSERT INTO projects (id, list_id, name, color, collapsed, sort_order, created_at)
+       VALUES ('prj_1', 'lst_1', 'Q3 Launch', 'violet', 0, 1000, 0)`,
+    ).run();
+    insertTask(db, { id: "tsk_parent", day: "2026-08-15" });
+    db.prepare(`UPDATE tasks SET project_id = 'prj_1', title = 'Rewrite the onboarding email' WHERE id = 'tsk_parent'`).run();
+    db.prepare(
+      `INSERT INTO tasks (id, list_id, parent_id, title, notes, bucket, day, sort_order, due_at, has_due_time, status, completed_at, carried_count, project_id, today_order, created_at, updated_at)
+       VALUES ('tsk_child', 'lst_1', 'tsk_parent', 'Get legal sign-off', NULL, 'today', '2026-08-15', 1000, NULL, 0, 'open', NULL, 0, 'prj_1', 1000, 0, 0)`,
+    ).run();
+
+    // Carry forward three separate days, same as a task nobody touches for
+    // a while — each call simulates one lazy getBoard's rollover pass.
+    runRollover(db, new Date(2026, 7, 18, 9, 0, 0));
+    runRollover(db, new Date(2026, 7, 19, 9, 0, 0));
+    runRollover(db, now); // 2026-08-20
+
+    const child = db.prepare(`SELECT day, carried_count, parent_id, project_id FROM tasks WHERE id = 'tsk_child'`).get() as {
+      day: string;
+      carried_count: number;
+      parent_id: string | null;
+      project_id: string | null;
+    };
+    expect(child.day).toBe(localDay(now));
+    expect(child.carried_count).toBe(3);
+    // The trail's two anchors — parent_id and project_id — are exactly what
+    // they were before any rollover ran; runRollover never touches them.
+    expect(child.parent_id).toBe("tsk_parent");
+    expect(child.project_id).toBe("prj_1");
+  });
 });

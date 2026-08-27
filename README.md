@@ -1,9 +1,13 @@
 # Todo for BB
 
 A daily to-do list with two zones instead of one flat list: a Backlog and a
-Today, on one drag-and-drop board. Anything left unfinished in Today rolls
-forward automatically at midnight, with a visible "carried 3×" badge — so
-avoidance stops hiding in plain sight.
+Today, on one drag-and-drop board. The Backlog files work into projects and
+subtasks; Today is a commitment list, not a copy of your plans — scheduling
+something into Today just flags it, so it keeps its trail back to the project
+and parent it came from, and stays visible (ghosted) where it actually lives.
+Anything left unfinished in Today rolls forward automatically at midnight,
+with a visible "carried 3×" badge — so avoidance stops hiding in plain sight,
+right next to the project it's stalling.
 
 ## Why this exists
 
@@ -29,13 +33,29 @@ that willpower usually has to.
   midnight, anything left open in Today gets carried into the new day and
   its carry count increments, so unfinished work stays visible instead of
   quietly aging into invisibility.
+- **Projects** — file Backlog work into named, colour-coded projects (a
+  third level of context — List -> Project -> Task -> Subtask — without a
+  third level of nesting, since a project is a container, not a task).
+  Collapse a project, rename it inline, recolour it, or delete it (its tasks
+  release to loose, unfiled — nothing is deleted). Type `#Name` into the
+  Backlog's own add-row to create a project inline, no dialog.
+- **Today is a flag, not a place** — scheduling a task into Today never
+  changes where it lives: its parent and project stay exactly what they
+  were. The Today row shows a muted trail (`Project > Parent`) back to its
+  home, and the task stays visible in its project too — dimmed, checkbox
+  swapped for a ghost glyph, marked `· today` — so a stalled effort is
+  legible as a stalled *project*, not just a stalled row you scroll past in
+  Today. Click the ghost's marker to unschedule it; it snaps back to exactly
+  the Backlog slot it never left, regardless of where you drop it.
 - **Tabs** — multiple lists (e.g. Work, Personal), each with its own
   Backlog/Today, created, renamed, reordered, and deleted from the tab strip.
 - **Tags** — global, colour-coded tags. A 🏷 icon on every row opens a
   picker to search, create, and apply tags in place; a `Manage tags…` dialog
   handles rename, recolour, delete, and drag-to-reorder.
 - **Subtasks, one level deep** — break a task down without nesting getting
-  out of hand; a progress ring on the parent row shows how many are done.
+  out of hand; a progress ring on the parent row shows how many are done. A
+  subtask can be scheduled into Today on its own, independently of its
+  parent, and it ghosts in place exactly like a top-level task does.
 - **Humanised due dates** — "in 22 min", "2d late", "Fri 9:00am", tone-coded
   by urgency (neutral, soon, late), plus an "added N ago" age chip for
   context.
@@ -69,7 +89,7 @@ Requires BB `>=0.39` and plugin SDK `>=0.4.8` (see `package.json`'s
 ## Development
 
 ```sh
-npm test         # vitest — 208 tests across 9 files
+npm test         # vitest — 286 tests across 9 files
 npm run typecheck # tsc --noEmit
 npm run build     # bb plugin build
 ```

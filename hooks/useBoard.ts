@@ -4,7 +4,7 @@
 // re-sync after their own mutation lands.
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useRealtime, useRpc } from "@get-bb/plugin-sdk/app";
-import type { ListDto, TagDto, TaskDto, rpcContract } from "@/contract";
+import type { ListDto, ProjectDto, TagDto, TaskDto, rpcContract } from "@/contract";
 
 // Mirrors getBoard's output shape (contract.ts / SPEC.md) directly, rather
 // than fighting generic inference through the RPC client's call<Method>
@@ -18,6 +18,8 @@ export interface BoardData {
   serverNow: number;
   /** The full tag catalog with usage counts — see getBoard's output in contract.ts. */
   tags: TagDto[];
+  /** Every project in the active list, in sortOrder. */
+  projects: ProjectDto[];
 }
 
 const REALTIME_DEBOUNCE_MS = 250;

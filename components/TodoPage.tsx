@@ -18,7 +18,8 @@ import {
 import { arrayMove, sortableKeyboardCoordinates } from "@dnd-kit/sortable";
 import { useBbNavigate, useRpc } from "@get-bb/plugin-sdk/app";
 import { toast } from "sonner";
-import type { rpcContract, TagColor, TagDto, TagRefDto, TaskDto } from "@/contract";
+import type { ProjectDto, rpcContract, TagColor, TagDto, TagRefDto, TaskDto } from "@/contract";
+import { TAG_COLORS } from "@/contract";
 import type { BoardData } from "@/hooks/useBoard";
 import { useBoard } from "@/hooks/useBoard";
 import { useNow } from "@/hooks/useNow";
@@ -27,6 +28,7 @@ import { useBoardCommand } from "@/lib/board-bus";
 import { useCompleteWithUndo } from "@/hooks/useCompleteWithUndo";
 import {
   applyMoveToBoard,
+  computeProjectReorder,
   computeTaskMove,
   findTaskInBoard,
   type DragBoardTasks,
@@ -163,9 +165,25 @@ function flattenTasks(board: BoardData): TaskDto[] {
  * `lib/drag.test.ts`). */
 type DragData =
   | { kind: "list"; listId: string }
-  | { kind: "task"; taskId: string; parentId: string | null; bucket: "backlog" | "today" };
+  | { kind: "task"; taskId: string; parentId: string | null; bucket: "backlog" | "today" }
+  | { kind: "project"; projectId: string };
 
 type OverData = DragData | { kind: "section"; bucket: "backlog" | "today" };
+
+/** Flashes and scrolls a Backlog row (a project header or a task) into view —
+ * the click-through target of a Today row's trail line. Best-effort: jsdom
+ * (unit tests) has no `scrollIntoView` implementation, and a source row that
+ * has scrolled out of the DOM (virtualization) simply isn't found — neither
+ * case is worth surfacing an error for. */
+function flashRow(selector: string) {
+  const el = document.querySelector<HTMLElement>(selector);
+  if (!el) return;
+  el.scrollIntoView?.({ block: "center", behavior: "smooth" });
+  el.classList.add("ring-2", "ring-primary");
+  window.setTimeout(() => {
+    el.classList.remove("ring-2", "ring-primary");
+  }, 1200);
+}
 
 export interface TodoPageProps {
   subPath: string;
@@ -250,6 +268,33 @@ export function TodoPage({ subPath }: TodoPageProps) {
       if (oldIndex === -1 || newIndex === -1) return;
       const reordered = arrayMove(ids, oldIndex, newIndex);
       void rpc.call("reorderLists", { ids: reordered }).then(() => refetch());
+      return;
+    }
+
+    if (activeData.kind === "project") {
+      // Drag matrix: "project header -> project header: reorder projects".
+      const overData = over.data.current as OverData | undefined;
+      if (!overData || overData.kind !== "project" || over.id === active.id) return;
+      const projectIds = board.projects.map((p) => p.id);
+      const reordered = computeProjectReorder(activeData.projectId, overData.projectId, projectIds);
+      if (!reordered) return;
+      const preDropBoard = board;
+      patchBoard((current) => {
+        const byId = new Map(current.projects.map((p) => [p.id, p]));
+        return {
+          ...current,
+          projects: reordered
+            .map((id) => byId.get(id))
+            .filter((p): p is ProjectDto => p !== undefined),
+        };
+      });
+      void rpc
+        .call("reorderProjects", { listId: activeListId, ids: reordered })
+        .then(() => refetch())
+        .catch((err) => {
+          setOptimisticBoard(preDropBoard);
+          toast.error(err instanceof Error ? err.message : "Couldn't reorder projects.");
+        });
       return;
     }
 
@@ -391,12 +436,158 @@ export function TodoPage({ subPath }: TodoPageProps) {
     },
   };
 
+  // `const` arrow functions (not hoisted `function` declarations) placed
+  // after the `if (!board) return null` guard above, so TypeScript's
+  // control-flow narrowing of `board` to non-null carries into their
+  // closures — a hoisted declaration would be reachable (in principle)
+  // before the guard runs, so TS treats `board` as still nullable inside it.
+
+  /** Applies `patch` to one project in `current.projects`, leaving every
+   * other project untouched — the project-mutation analogue of
+   * `applyTaskTagsToBoard` above. */
+  const patchProjectLocal = (
+    current: BoardData,
+    id: string,
+    patch: Partial<ProjectDto>,
+  ): BoardData => ({
+    ...current,
+    projects: current.projects.map((p) => (p.id === id ? { ...p, ...patch } : p)),
+  });
+
+  const toggleProjectCollapsed = (project: ProjectDto) => {
+    const next = !project.collapsed;
+    patchBoard((current) => patchProjectLocal(current, project.id, { collapsed: next }));
+    void rpc.call("setProjectCollapsed", { id: project.id, collapsed: next }).catch((err) => {
+      patchBoard((current) => patchProjectLocal(current, project.id, { collapsed: !next }));
+      toast.error(err instanceof Error ? err.message : "Couldn't update project.");
+    });
+  };
+
+  const renameProject = (id: string, name: string) => {
+    const previousName = board.projects.find((p) => p.id === id)?.name ?? name;
+    patchBoard((current) => patchProjectLocal(current, id, { name }));
+    void rpc
+      .call("updateProject", { id, name })
+      .then(() => refetch())
+      .catch((err) => {
+        patchBoard((current) => patchProjectLocal(current, id, { name: previousName }));
+        toast.error(err instanceof Error ? err.message : "Couldn't rename project.");
+      });
+  };
+
+  const changeProjectColor = (id: string, color: TagColor) => {
+    const previousColor = board.projects.find((p) => p.id === id)?.color ?? color;
+    patchBoard((current) => patchProjectLocal(current, id, { color }));
+    void rpc
+      .call("updateProject", { id, color })
+      .then(() => refetch())
+      .catch((err) => {
+        patchBoard((current) => patchProjectLocal(current, id, { color: previousColor }));
+        toast.error(err instanceof Error ? err.message : "Couldn't change project colour.");
+      });
+  };
+
+  const deleteProject = (id: string) => {
+    const preDropBoard = board;
+    // Optimistically mirror the server: the project disappears and its
+    // tasks release to loose (`project_id = NULL`) rather than vanishing —
+    // "Nothing is deleted" (design doc's delete-confirm copy).
+    patchBoard((current) => ({
+      ...current,
+      projects: current.projects.filter((p) => p.id !== id),
+      backlog: {
+        ...current.backlog,
+        tasks: current.backlog.tasks.map((t) =>
+          (t.projectId ?? null) === id ? { ...t, projectId: null } : t,
+        ),
+      },
+    }));
+    void rpc
+      .call("deleteProject", { id })
+      .then(() => refetch())
+      .catch((err) => {
+        setOptimisticBoard(preDropBoard);
+        toast.error(err instanceof Error ? err.message : "Couldn't delete project.");
+      });
+  };
+
+  const addTaskToProject = (projectId: string, title: string) => {
+    void rpc
+      .call("createTask", {
+        listId: activeListId,
+        bucket: "backlog",
+        title,
+        parentId: null,
+        dueAt: null,
+        hasDueTime: false,
+        position: "bottom",
+        projectId,
+      })
+      .then(() => refetch());
+  };
+
+  /** The Backlog add-row's `#Name` entry point (design doc "Creating a
+   * project", entry point 1). Colours cycle through the palette so
+   * successive inline-created projects don't all land on the same swatch. */
+  const createProjectInline = (name: string) => {
+    const color: TagColor = TAG_COLORS[board.projects.length % TAG_COLORS.length];
+    void rpc
+      .call("createProject", { listId: activeListId, name, color })
+      .then(({ project }) => {
+        patchBoard((current) => ({ ...current, projects: [...current.projects, project] }));
+        void refetch();
+      })
+      .catch((err) => {
+        toast.error(err instanceof Error ? err.message : "Couldn't create project.");
+      });
+  };
+
+  /** Fired by a ghost row's "· today" marker: unschedule it back to its
+   * project/loose home. Drag matrix "Today row -> Backlog (anywhere)":
+   * parent/project unchanged, beforeId/afterId both omitted so `moveTask`
+   * snaps it home to its untouched slot rather than repositioning it. */
+  const unscheduleTask = (id: string) => {
+    const task = findTaskInBoard({ backlog: board.backlog.tasks, today: board.today.tasks }, id);
+    if (!task) return;
+    const move: MoveTaskInput = {
+      id,
+      bucket: "backlog",
+      parentId: task.parentId,
+      beforeId: null,
+      afterId: null,
+    };
+    const preDropBoard = board;
+    setOptimisticBoard(applyOptimisticBoard(board, move, now));
+    void rpc
+      .call("moveTask", move)
+      .then(() => refetch())
+      .catch((err) => {
+        setOptimisticBoard(preDropBoard);
+        toast.error(err instanceof Error ? err.message : "Couldn't unschedule task.");
+      });
+  };
+
+  /** The trail line's click-through: scroll the Backlog to the project's
+   * header row, or to the parent task's own row, and flash it. */
+  const navigateToProject = (projectId: string) => {
+    flashRow(`[data-project-id="${projectId}"]`);
+  };
+  const navigateToParent = (parentId: string) => {
+    flashRow(`[data-task-id="${parentId}"]`);
+  };
+
+  const looseBacklogTasks = board.backlog.tasks.filter((t) => (t.projectId ?? null) === null);
+  const projectTasks = (projectId: string) =>
+    board.backlog.tasks.filter((t) => t.projectId === projectId);
+
   const activeTask =
     activeDrag?.kind === "task"
       ? findTaskInBoard({ backlog: board.backlog.tasks, today: board.today.tasks }, activeDrag.taskId)
       : null;
   const activeList =
     activeDrag?.kind === "list" ? board.lists.find((l) => l.id === activeDrag.listId) : null;
+  const activeProject =
+    activeDrag?.kind === "project" ? board.projects.find((p) => p.id === activeDrag.projectId) : null;
 
   return (
     // TagChip's compact (below-`md`) rendering wraps its dot in a Tooltip —
@@ -433,9 +624,20 @@ export function TodoPage({ subPath }: TodoPageProps) {
             ringTotal={board.backlog.total}
             ringTone="destructive"
             ringLabel={`${board.backlog.overdue} overdue`}
-            tasks={board.backlog.tasks}
+            tasks={looseBacklogTasks}
             actions={actions}
-            addPlaceholder="add to backlog"
+            addPlaceholder="add to backlog · #Name for a new project"
+            projects={board.projects}
+            projectTasks={projectTasks}
+            onToggleProjectCollapsed={toggleProjectCollapsed}
+            onRenameProject={renameProject}
+            onChangeProjectColor={changeProjectColor}
+            onDeleteProject={deleteProject}
+            onAddTaskToProject={addTaskToProject}
+            onCreateProject={createProjectInline}
+            onUnscheduleTask={unscheduleTask}
+            onNavigateToProject={navigateToProject}
+            onNavigateToParent={navigateToParent}
           />
 
           <Section
@@ -448,6 +650,9 @@ export function TodoPage({ subPath }: TodoPageProps) {
             tasks={board.today.tasks}
             actions={actions}
             addPlaceholder="add to today"
+            showTrail
+            onNavigateToProject={navigateToProject}
+            onNavigateToParent={navigateToParent}
           />
         </div>
 
@@ -460,6 +665,10 @@ export function TodoPage({ subPath }: TodoPageProps) {
           ) : activeList ? (
             <div className="rounded-md border border-border bg-card px-3 py-1 text-sm shadow-md">
               {activeList.name}
+            </div>
+          ) : activeProject ? (
+            <div className="rounded-md border border-border bg-card px-3 py-1 text-sm shadow-md">
+              {activeProject.name}
             </div>
           ) : null}
         </DragOverlay>

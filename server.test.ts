@@ -380,6 +380,187 @@ describe("server.ts rpc surface", () => {
     expect((afterSetTags.at(-1)?.payload as any).listId).toBe(board.activeListId);
   });
 
+  it("createProject / updateProject / reorderProjects / setProjectCollapsed / deleteProject round-trip via RPC", async () => {
+    const { harness } = await setup();
+    const board = await getBoard(harness);
+    const listId = board.activeListId;
+    expect(board.projects).toEqual([]);
+
+    const created = (await harness.callRpc("createProject", {
+      listId,
+      name: "Q3 Launch",
+      color: "blue",
+    })) as any;
+    expect(created.project.name).toBe("Q3 Launch");
+    expect(created.project.color).toBe("blue");
+    expect(created.project.collapsed).toBe(false);
+
+    const secondProject = (await harness.callRpc("createProject", {
+      listId,
+      name: "Personal errands",
+      color: "green",
+    })) as any;
+
+    const updated = (await harness.callRpc("updateProject", {
+      id: created.project.id,
+      name: "Q3 Launch (revised)",
+      color: "violet",
+    })) as any;
+    expect(updated.project.name).toBe("Q3 Launch (revised)");
+    expect(updated.project.color).toBe("violet");
+
+    await expect(harness.callRpc("updateProject", { id: "prj_missing", name: "x" })).rejects.toBeTruthy();
+
+    const reordered = (await harness.callRpc("reorderProjects", {
+      listId,
+      ids: [secondProject.project.id, updated.project.id],
+    })) as any;
+    expect(reordered.projects.map((p: any) => p.id)).toEqual([secondProject.project.id, updated.project.id]);
+
+    const collapsed = (await harness.callRpc("setProjectCollapsed", {
+      id: updated.project.id,
+      collapsed: true,
+    })) as any;
+    expect(collapsed.ok).toBe(true);
+    const boardAfterCollapse = await getBoard(harness, listId);
+    expect(boardAfterCollapse.projects.find((p: any) => p.id === updated.project.id).collapsed).toBe(true);
+
+    // Filing a task, then deleting the project, releases it to loose rather
+    // than deleting it (invariant 6, exercised end-to-end through the RPC).
+    const filedTask = (await harness.callRpc("createTask", {
+      listId,
+      bucket: "backlog",
+      title: "Filed task",
+      parentId: null,
+      dueAt: null,
+      hasDueTime: false,
+      position: "bottom",
+      projectId: updated.project.id,
+    })) as any;
+    expect(filedTask.task.projectId).toBe(updated.project.id);
+
+    const deleted = (await harness.callRpc("deleteProject", { id: updated.project.id })) as any;
+    expect(deleted.ok).toBe(true);
+
+    const boardAfterDelete = await getBoard(harness, listId);
+    expect(boardAfterDelete.projects.map((p: any) => p.id)).not.toContain(updated.project.id);
+    const looseTask = boardAfterDelete.backlog.tasks.find((t: any) => t.id === filedTask.task.id);
+    expect(looseTask.projectId).toBeNull();
+  });
+
+  it("project mutations publish a board realtime signal scoped to the project's listId", async () => {
+    const { harness } = await setup();
+    const board = await getBoard(harness);
+    const before = harness.realtimeSignals.length;
+    await harness.callRpc("createProject", { listId: board.activeListId, name: "Signal check", color: "red" });
+    const signals = harness.realtimeSignals.slice(before);
+    expect(signals.length).toBeGreaterThan(0);
+    expect(signals.at(-1)?.channel).toBe("board");
+    expect((signals.at(-1)?.payload as any).listId).toBe(board.activeListId);
+  });
+
+  it("moveTask + projectId re-homes a task and its trail; a plain Backlog drop snaps it back to its own slot", async () => {
+    const { harness } = await setup();
+    const board = await getBoard(harness);
+    const listId = board.activeListId;
+
+    const project = (await harness.callRpc("createProject", { listId, name: "Q3 Launch", color: "blue" })) as any;
+    const otherProject = (await harness.callRpc("createProject", { listId, name: "Other", color: "red" })) as any;
+    const task = (await harness.callRpc("createTask", {
+      listId,
+      bucket: "backlog",
+      title: "Rewrite the onboarding email",
+      parentId: null,
+      dueAt: null,
+      hasDueTime: false,
+      position: "bottom",
+      projectId: project.project.id,
+    })) as any;
+
+    // Schedule it — the ghost stays filed under `project`.
+    await harness.callRpc("moveTask", {
+      id: task.task.id,
+      bucket: "today",
+      parentId: null,
+      beforeId: null,
+      afterId: null,
+    });
+    let afterSchedule = await getBoard(harness, listId);
+    let todayRow = afterSchedule.today.tasks.find((t: any) => t.id === task.task.id);
+    expect(todayRow.trail.projectId).toBe(project.project.id);
+    expect(todayRow.trail.projectName).toBe("Q3 Launch");
+    let ghost = afterSchedule.backlog.tasks.find((t: any) => t.id === task.task.id);
+    expect(ghost).toBeDefined();
+    expect(ghost.bucket).toBe("today");
+
+    // Unschedule with no projectId: snaps home, stays in `project`.
+    await harness.callRpc("moveTask", {
+      id: task.task.id,
+      bucket: "backlog",
+      parentId: null,
+      beforeId: null,
+      afterId: null,
+    });
+    let afterSnapHome = await getBoard(harness, listId);
+    let snapped = afterSnapHome.backlog.tasks.find((t: any) => t.id === task.task.id);
+    expect(snapped.projectId).toBe(project.project.id);
+    expect(afterSnapHome.today.tasks.map((t: any) => t.id)).not.toContain(task.task.id);
+
+    // Re-home to a different project.
+    await harness.callRpc("moveTask", {
+      id: task.task.id,
+      bucket: "backlog",
+      parentId: null,
+      beforeId: null,
+      afterId: null,
+      projectId: otherProject.project.id,
+    });
+    const afterRehome = await getBoard(harness, listId);
+    const rehomed = afterRehome.backlog.tasks.find((t: any) => t.id === task.task.id);
+    expect(rehomed.projectId).toBe(otherProject.project.id);
+  });
+
+  it("scheduling a subtask into Today keeps its parent_id and shows it as a flat, trailed row — the parent is not scheduled", async () => {
+    const { harness } = await setup();
+    const board = await getBoard(harness);
+    const listId = board.activeListId;
+
+    const parent = (await harness.callRpc("createTask", {
+      listId,
+      bucket: "backlog",
+      title: "Rewrite the onboarding email",
+      parentId: null,
+      dueAt: null,
+      hasDueTime: false,
+      position: "bottom",
+    })) as any;
+    const child = (await harness.callRpc("createTask", {
+      listId,
+      bucket: "backlog",
+      title: "Get legal sign-off",
+      parentId: parent.task.id,
+      dueAt: null,
+      hasDueTime: false,
+      position: "bottom",
+    })) as any;
+
+    await harness.callRpc("moveTask", {
+      id: child.task.id,
+      bucket: "today",
+      parentId: parent.task.id,
+      beforeId: null,
+      afterId: null,
+    });
+
+    const after = await getBoard(harness, listId);
+    expect(after.today.tasks.map((t: any) => t.id)).toEqual([child.task.id]);
+    expect(after.today.tasks[0].parentId).toBe(parent.task.id);
+    expect(after.today.tasks[0].trail.parentTitle).toBe("Rewrite the onboarding email");
+
+    const parentRow = after.backlog.tasks.find((t: any) => t.id === parent.task.id);
+    expect(parentRow.bucket).toBe("backlog"); // scheduling the subtask did not schedule the parent
+  });
+
   it("today counts survive completion vanishing rows from the board", async () => {
     const { harness } = await setup();
     const board = await getBoard(harness);

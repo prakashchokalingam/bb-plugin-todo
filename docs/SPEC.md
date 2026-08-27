@@ -33,6 +33,15 @@ against the real SDK, say so in your report rather than silently substituting.
    of 10 shows 5/10 even though those 5 are gone from the list.
 6. **Everything is per-list.** Overdue counts, archive, clear-archive: scoped to the
    active list. The sidebar accessory shows the total overdue across all lists.
+7. **Today is a flag, not a place.** A task's home is `(project_id, parent_id)`
+   and it never leaves. Dragging into Today sets `bucket='today'` + `day` and
+   nothing else about its identity — `parent_id` and `project_id` are
+   untouched. The task renders in Today with its trail (`TrailDto`, below),
+   and stays visible — ghosted — in its project. Scheduling a subtask never
+   schedules its parent, and scheduling a parent never drags its subtasks
+   along. Depth stays capped at one level (rule 2); a project is a container,
+   not a task, so this adds a third level of context without a third level
+   of nesting.
 
 ## Storage — SQLite via `bb.storage.database()`
 
@@ -93,7 +102,48 @@ CREATE TABLE IF NOT EXISTS task_tags (
 );
 -- 9
 CREATE INDEX IF NOT EXISTS task_tags_tag_idx ON task_tags (tag_id);
+-- 10
+CREATE TABLE IF NOT EXISTS projects (
+  id         TEXT PRIMARY KEY,
+  list_id    TEXT NOT NULL REFERENCES lists(id) ON DELETE CASCADE,
+  name       TEXT NOT NULL,
+  color      TEXT NOT NULL,
+  collapsed  INTEGER NOT NULL DEFAULT 0,
+  sort_order REAL NOT NULL,
+  created_at INTEGER NOT NULL
+);
+-- 11
+CREATE INDEX IF NOT EXISTS projects_list_idx ON projects (list_id, sort_order);
+-- 12
+ALTER TABLE tasks ADD COLUMN project_id TEXT REFERENCES projects(id);
+-- 13
+ALTER TABLE tasks ADD COLUMN today_order REAL;
+-- 14
+CREATE INDEX IF NOT EXISTS tasks_project_idx ON tasks (list_id, project_id, sort_order);
+-- 15
+UPDATE tasks SET today_order = sort_order WHERE bucket = 'today';
 ```
+
+`projects.color` reuses `TAG_COLORS`/`lib/tag-colors.ts`, exactly like
+`tags.color`. Migration 12 deliberately declares no `ON DELETE` clause — with
+`PRAGMA foreign_keys = ON` (see below), the implicit behaviour is `NO ACTION`
+(delete rejected), not a cascade, so `deleteProject` explicitly releases its
+tasks to `project_id = NULL` inside its own transaction rather than relying
+on the FK. Migration 15 is a one-time backfill: every existing Today row
+keeps its exact current position (`today_order = sort_order`) on first load,
+and it is not re-runnable — get it right against a pre-migration fixture DB
+before shipping a change to it.
+
+`project_id = NULL` means "loose" (unfiled); every task predating this
+feature gets that value automatically and renders exactly as before, below
+every project, with no group header. `sort_order` means "position within its
+project (or the loose group), under its parent"; `today_order` means
+"position in the Today list" — a task that is both filed and scheduled (a
+ghost) needs both independently, since reordering the day must never
+reshuffle the Backlog. `parent_id` is never cleared by a bucket change
+(dragging into Today is a flag, not a relocation — see the Core decision
+below); a subtask's `project_id` always mirrors its parent's, enforced
+inside the move/create transaction.
 
 `tags` is global (no `list_id`) — one catalog shared by every list. `task_tags`
 is a pure join with no payload, keyed `(task_id, tag_id)`. The
@@ -148,6 +198,13 @@ TagColor = (typeof TAG_COLORS)[number]
 TagRefDto = { id, name, color: TagColor }          // denormalized form, embedded in every TaskDto
 TagDto = TagRefDto & { sortOrder: number, taskCount: number }   // catalog form; taskCount is global, not per-list
 
+// Denormalized breadcrumb for a task's home, computed server-side in the
+// same pass that denormalizes tags. null for a loose top-level task.
+TrailDto = {
+  projectId: string|null, projectName: string|null, projectColor: TagColor|null,
+  parentId: string|null, parentTitle: string|null,
+}
+
 TaskDto = {
   id, listId, parentId: string|null, title, notes: string|null,
   bucket: 'backlog'|'today', day: string|null, sortOrder: number,
@@ -157,8 +214,14 @@ TaskDto = {
   subtasks: TaskDto[]          // present on top-level rows only, always [] on subtasks
   subtaskCounts: { total: number, done: number }   // done counts done subtasks
   tags: TagRefDto[]            // ordered by tag sortOrder; populated on subtasks too
+  projectId: string|null       // NULL = loose (not filed into a project)
+  trail: TrailDto|null
 }
 ListDto = { id, name, sortOrder, openCount, overdueCount }
+ProjectDto = {
+  id, listId, name, color: TagColor, sortOrder: number, collapsed: boolean,
+  openCount: number, todayCount: number, overdueCount: number,
+}
 ```
 
 `color` is validated against `TAG_COLORS` at the contract boundary
@@ -169,16 +232,23 @@ Methods:
 - `getBoard({ listId: string|null })` -> `{ lists: ListDto[], activeListId: string,
   today: { day: string, planned: number, completed: number, tasks: TaskDto[] },
   backlog: { total: number, overdue: number, tasks: TaskDto[] },
-  totalOverdue: number, serverNow: number, tags: TagDto[] }`
+  totalOverdue: number, serverNow: number, tags: TagDto[], projects: ProjectDto[] }`
   - `activeListId` falls back to the first list when the argument is null or unknown.
-  - `tasks` are top-level rows only, ordered by `sort_order`, each with its
-    `subtasks` nested and ordered.
+  - `today.tasks` is genuinely flat: `subtasks` is always `[]` on every Today
+    row. A subtask scheduled alone appears here as its own row while its
+    parent stays in the Backlog (rule 7); nesting it under a parent it isn't
+    with here would misrepresent that.
+  - `backlog.tasks` are top-level rows only, ordered by `sort_order`, each
+    with its `subtasks` nested and ordered — and now includes today-flagged
+    ghosts alongside plain open rows, so a scheduled task's ghost renders in
+    its project.
   - `planned` = rows with `day = today`; `completed` = those with `status='done'`.
     Both count top-level rows AND subtasks.
   - `tags` is the full tag catalog with usage counts, so the picker needs no
     extra fetch. `getArchive`'s output is **not** extended with this catalog —
     archived rows carry `TaskDto.tags` like any other row, but the archive
     panel renders no picker, so it needs no catalog.
+  - `projects` is every project in the active list, in `sort_order`.
   - Tag lookups for every row on the board are done with **one** query
     (`loadTagMap` in `lib/db.ts`), never a per-task query — see the N+1 note
     below.
@@ -187,18 +257,30 @@ Methods:
   grouped by the local day of `completed_at`, newest first. Subtasks appear nested
   under their parent when the parent is in the same group, otherwise as their own row.
 - `createTask({ listId, bucket, title, parentId: string|null, dueAt: number|null,
-  hasDueTime: boolean, position: 'top'|'bottom' })` -> `{ task: TaskDto }`
+  hasDueTime: boolean, position: 'top'|'bottom', projectId?: string|null })`
+  -> `{ task: TaskDto }`
   - Rejects an empty/whitespace title (`invalid_input`) and a `parentId` that is
     itself a subtask.
+  - `projectId` is optional, defaulting to loose (`null`) when omitted — there
+    is no prior row to leave "unchanged" for a brand-new task, unlike
+    `moveTask`'s `projectId` below.
 - `updateTask({ id, title?, notes?, dueAt?, hasDueTime? })` -> `{ task: TaskDto }`
   (`dueAt: null` clears the due date).
 - `moveTask({ id, bucket, parentId: string|null, beforeId: string|null,
-  afterId: string|null })` -> `{ ok: true }`
+  afterId: string|null, projectId?: string|null })` -> `{ ok: true }`
   - `beforeId`/`afterId` are the sibling ids the item lands between, in the target
     group. Both null = only item / append.
+  - `projectId` is the task's target home; **omitting it leaves the task's
+    current project unchanged** — this is what keeps a task scheduled into
+    Today in its existing project (its ghost's `sort_order` is never
+    touched) and what makes unscheduling it snap back to that exact slot
+    regardless of where it's dropped. Only a drop directly onto a
+    *different* project re-homes a task, by passing that project's id.
   - Making a task a subtask promotes that task's own children to top-level siblings
     placed immediately after it, in their existing order.
   - Rejects a move that would create a cycle or a depth > 1.
+  - A subtask's `project_id` always mirrors its (possibly new) parent's,
+    enforced in the same transaction.
 - `completeTask({ id })` -> `{ completedIds: string[] }`
 - `restoreTasks({ ids: string[] })` -> `{ ok: true }` (undo AND archive restore)
 - `deleteTask({ id })` -> `{ ok: true }` (cascades subtasks)
@@ -229,6 +311,16 @@ Methods:
   `DELETE FROM task_tags WHERE task_id = ?` then insert each id. Idempotent
   under retry. Duplicate ids in the input are deduped, not an error; an id
   that doesn't name a real tag throws `invalid_input: tag not found`.
+- `createProject({ listId, name, color: TagColor })` -> `{ project: ProjectDto }`.
+- `updateProject({ id, name?, color?: TagColor })` -> `{ project: ProjectDto }`.
+- `deleteProject({ id })` -> `{ ok: true }`. Releases the project's tasks to
+  loose (`project_id = NULL`) inside the transaction; never cascades into
+  the bin, and never touches `parent_id`/`bucket`/`day`.
+- `reorderProjects({ listId, ids: string[] })` -> `{ projects: ProjectDto[] }`.
+  Renumbers to `1000, 2000, …`, mirroring `reorderLists`/`reorderTags`.
+- `setProjectCollapsed({ id, collapsed: boolean })` -> `{ ok: true }`.
+  Server-side so collapse state survives a reload — single-user local
+  plugin, one column, no cost.
 
 Tag name uniqueness is case-insensitive: `createTag`/`updateTag` throw
 `invalid_input: a tag named "…" already exists` on a collision, and
@@ -281,15 +373,41 @@ divider) since they are two distinct drop zones, not one continuous list.
   menu (dropdown) to delete with an AlertDialog confirm, drag to reorder.
 - `Section.tsx` — header (label, count, `ProgressRing`) + droppable body +
   `AddTaskRow`. The header ring shows Today's `completed/planned` in the primary
-  tone, and Backlog's overdue share in the destructive tone.
+  tone, and Backlog's overdue share in the destructive tone. The Backlog body
+  additionally renders one `ProjectGroup` per project (a nested
+  `SortableContext` per project, plus an outer one over the project ids for
+  header reordering), followed by every loose top-level task with no group
+  header; `#Name` + Enter in the Backlog's own `AddTaskRow` creates a project
+  inline instead of a task. The Today body passes `showTrail` so each row
+  renders its `TrailLine` as a second line.
+- `ProjectGroup.tsx` — a project's card: `ProjectHeader` + a droppable body
+  (append-to-project / re-home drop target) + a per-project `AddTaskRow`.
+  Collapsed renders the header alone; an empty expanded project renders the
+  header plus its add-row only.
+- `ProjectHeader.tsx` — collapse chevron, colour badge (opens the shared
+  `ColorSwatchPicker`), inline-editable name (double-click, same mechanics
+  as `TabStrip`'s tab rename), a `+` that reveals and focuses the project's
+  add-row, and a `⋯` menu (Rename / Change colour / Delete, the last behind
+  the existing `AlertDialog`).
+- `TrailLine.tsx` — a Today row's muted second line, `# Project > Parent`.
+  Renders null with no context to show; truncates from the left so the
+  nearest ancestor survives; each segment is independently clickable
+  (scrolls the Backlog to the source row and flashes it); collapses to the
+  project badge alone below `md`.
 - `TaskRow.tsx` — grip, checkbox, title (click to edit inline), `ProgressRing` when
-  it has subtasks, a "carried Nx" badge, `AgeChip`, `DueChip`, then always-visible
-  inline icon actions in this order: a calendar button (opens `DueDatePicker`
+  it has subtasks, a "carried Nx" badge (or a ghost's `· today` marker in its
+  place), `AgeChip`, `DueChip`, then always-visible inline icon actions in this
+  order: a calendar button (opens `DueDatePicker`
   directly, one click), a plus button on top-level rows only (reveals the inline
   add-subtask input directly, focused — not shown on subtask rows, since depth is
   capped at 1), and a `⋯` menu holding Delete only (behind the existing AlertDialog
-  confirm). Renders its subtasks indented. Right-hand reading order: title -> ring
-  -> carried badge -> age -> due -> actions.
+  confirm). Renders its subtasks indented, each independently ghosted if
+  scheduled. Right-hand reading order: title -> ring -> carried badge/ghost
+  marker -> age -> due -> actions, with `TrailLine` as an optional second line
+  under a Today row. A ghost's dnd-kit sortable id is prefixed
+  (`taskDragId`) since a scheduled task's real id is legitimately on screen
+  twice at once (its ghost and its Today row) and dnd-kit ids must be
+  unique within one `DndContext`.
 - `AddTaskRow.tsx` — a borderless input; Enter creates and keeps focus for the next
   one, Escape blurs. This is the primary capture path — no modal. The placeholder
   and the leading `Plus` icon sit muted at `text-muted-foreground/50` at rest and
@@ -391,5 +509,19 @@ via the toast text.
   accessory shows the overdue count, a task row shows an `AgeChip` alongside its
   `DueChip`.
 - `components/leaf.test.tsx`: `AgeChip` renders the expected text, exposes the
-  absolute date via `title`, and is always muted (never a tone class).
+  absolute date via `title`, and is always muted (never a tone class);
+  `ProjectHeader`/`ProjectGroup`/`TrailLine`/ghost-row `TaskRow` rendering
+  and callbacks, presentational and fixture-driven.
+- `lib/drag.test.ts`: the full drag matrix (backlog<->today, reorder, nest,
+  project filing/re-homing, project header reorder) as table-driven pure
+  tests against `computeTaskMove`/`computeProjectReorder`/`applyMoveToBoard`
+  — no DOM, no dnd-kit runtime.
+- `components/TodoPage.test.tsx`: end-to-end proof spanning the drag layer
+  AND the board's rendering together, through a REAL dnd-kit gesture (the
+  same `stubSequentialRects` keyboard-drag technique as the base
+  reorder/optimistic tests) — a subtask dragged from its project into Today
+  keeps its parent and the Today row shows its trail; the subtask stays
+  visible, ghosted, in its project; dragging it back to the Backlog snaps it
+  home regardless of drop position; a carried task still renders its full
+  trail; the project header's `+` reveals and focuses its add-row.
 - `npm test` (vitest) must pass with zero failures, and `npx tsc --noEmit` clean.

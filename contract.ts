@@ -34,6 +34,20 @@ export interface TagDto extends TagRefDto {
   taskCount: number;
 }
 
+/**
+ * Denormalized breadcrumb for a task's home, computed server-side in the
+ * same pass that denormalizes tags — the client never does a lookup to
+ * render the trail line. `null` for a loose top-level task (no project, no
+ * parent); those rows render exactly as they do today.
+ */
+export interface TrailDto {
+  projectId: string | null;
+  projectName: string | null;
+  projectColor: TagColor | null;
+  parentId: string | null;
+  parentTitle: string | null;
+}
+
 export interface TaskDto {
   id: string;
   listId: string;
@@ -56,6 +70,9 @@ export interface TaskDto {
   subtaskCounts: { total: number; done: number };
   /** Ordered by tag sortOrder. Populated on subtasks too. */
   tags: TagRefDto[];
+  /** NULL = loose (not filed into a project). */
+  projectId: string | null;
+  trail: TrailDto | null;
 }
 
 export interface ListDto {
@@ -63,6 +80,18 @@ export interface ListDto {
   name: string;
   sortOrder: number;
   openCount: number;
+  overdueCount: number;
+}
+
+export interface ProjectDto {
+  id: string;
+  listId: string;
+  name: string;
+  color: TagColor;
+  sortOrder: number;
+  collapsed: boolean;
+  openCount: number;
+  todayCount: number;
   overdueCount: number;
 }
 
@@ -83,8 +112,20 @@ const tagDtoSchema = tagRefDtoSchema
   })
   .strict();
 
+const trailDtoSchema = z
+  .object({
+    projectId: idSchema.nullable(),
+    projectName: z.string().nullable(),
+    projectColor: z.enum(TAG_COLORS).nullable(),
+    parentId: idSchema.nullable(),
+    parentTitle: z.string().nullable(),
+  })
+  .strict();
+
 // Recursive schema needs an explicit type annotation — zod can't infer a
-// self-referential shape from z.lazy() alone.
+// self-referential shape from z.lazy() alone. The wire shape always
+// includes projectId/trail (unlike the TS interface's `?`, which is only a
+// source-compat concession for older fixtures — see TaskDto's comment).
 const taskDtoSchema: z.ZodType<TaskDto> = z.lazy(() =>
   z
     .object({
@@ -108,6 +149,8 @@ const taskDtoSchema: z.ZodType<TaskDto> = z.lazy(() =>
         .object({ total: z.number().int(), done: z.number().int() })
         .strict(),
       tags: z.array(tagRefDtoSchema),
+      projectId: idSchema.nullable(),
+      trail: trailDtoSchema.nullable(),
     })
     .strict(),
 );
@@ -118,6 +161,20 @@ const listDtoSchema = z
     name: z.string(),
     sortOrder: z.number(),
     openCount: z.number().int(),
+    overdueCount: z.number().int(),
+  })
+  .strict();
+
+const projectDtoSchema = z
+  .object({
+    id: idSchema,
+    listId: idSchema,
+    name: z.string(),
+    color: z.enum(TAG_COLORS),
+    sortOrder: z.number(),
+    collapsed: z.boolean(),
+    openCount: z.number().int(),
+    todayCount: z.number().int(),
     overdueCount: z.number().int(),
   })
   .strict();
@@ -148,6 +205,8 @@ export const rpcContract = defineRpcContract({
         serverNow: z.number(),
         /** The full tag catalog with usage counts, so the picker needs no extra fetch. */
         tags: z.array(tagDtoSchema),
+        /** Every project in the active list, in sortOrder. */
+        projects: z.array(projectDtoSchema),
       })
       .strict(),
   },
@@ -179,6 +238,11 @@ export const rpcContract = defineRpcContract({
         dueAt: z.number().nullable(),
         hasDueTime: z.boolean(),
         position: z.enum(["top", "bottom"]),
+        // Optional, defaulting to loose (null) when omitted — not just
+        // "unchanged" like moveTask's, since there is no prior row to keep
+        // unchanged from. Optional (rather than required) so existing
+        // callers that don't yet know about projects keep working.
+        projectId: idSchema.nullable().optional(),
       })
       .strict(),
     output: z.object({ task: taskDtoSchema }).strict(),
@@ -203,6 +267,8 @@ export const rpcContract = defineRpcContract({
         parentId: idSchema.nullable(),
         beforeId: idSchema.nullable(),
         afterId: idSchema.nullable(),
+        /** Target home. Omit = unchanged (snap-home / no re-file). */
+        projectId: idSchema.nullable().optional(),
       })
       .strict(),
     output: z.object({ ok: z.literal(true) }).strict(),
@@ -264,5 +330,31 @@ export const rpcContract = defineRpcContract({
   setTaskTags: {
     input: z.object({ taskId: idSchema, tagIds: z.array(idSchema) }).strict(),
     output: z.object({ task: taskDtoSchema }).strict(),
+  },
+  createProject: {
+    input: z.object({ listId: idSchema, name: z.string(), color: z.enum(TAG_COLORS) }).strict(),
+    output: z.object({ project: projectDtoSchema }).strict(),
+  },
+  updateProject: {
+    input: z
+      .object({
+        id: idSchema,
+        name: z.string().optional(),
+        color: z.enum(TAG_COLORS).optional(),
+      })
+      .strict(),
+    output: z.object({ project: projectDtoSchema }).strict(),
+  },
+  deleteProject: {
+    input: z.object({ id: idSchema }).strict(),
+    output: z.object({ ok: z.literal(true) }).strict(),
+  },
+  reorderProjects: {
+    input: z.object({ listId: idSchema, ids: z.array(idSchema) }).strict(),
+    output: z.object({ projects: z.array(projectDtoSchema) }).strict(),
+  },
+  setProjectCollapsed: {
+    input: z.object({ id: idSchema, collapsed: z.boolean() }).strict(),
+    output: z.object({ ok: z.literal(true) }).strict(),
   },
 });
