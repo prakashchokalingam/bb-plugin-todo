@@ -84,6 +84,11 @@ export const MIGRATIONS: string[] = [
   // 15 — backfill: every existing Today row keeps its exact current position
   // on first load (today_order starts equal to its prior sort_order).
   `UPDATE tasks SET today_order = sort_order WHERE bucket = 'today';`,
+  // 16 — the local day (YYYY-MM-DD) this task was last explicitly removed
+  // from the Today view; self-expiring — inert once it is no longer today.
+  // Purely additive, no backfill: NULL means "never dismissed", which is
+  // already correct for every existing row.
+  `ALTER TABLE tasks ADD COLUMN today_dismissed_day TEXT;`,
 ];
 
 interface ListRow {
@@ -111,6 +116,7 @@ interface TaskRow {
   updated_at: number;
   project_id: string | null;
   today_order: number | null;
+  today_dismissed_day: string | null;
 }
 
 interface ProjectRow {
@@ -129,6 +135,62 @@ interface TagRow {
   color: TagColor;
   sort_order: number;
   created_at: number;
+}
+
+// ---------------------------------------------------------------------------
+// Today membership — the one predicate
+//
+// "This row belongs to Today" has exactly one definition, expressed twice —
+// once as SQL, once as plain TS — so both a query and a client-side
+// recomputation can use it without either drifting out of sync with the
+// other or with itself over time. Neither form is wired into a caller yet:
+// `isTodayRow`/`getProjectDtos`'s todayCount query still use the old
+// `day = today` check. Phase 2 swaps those over; this phase only proves the
+// two forms agree (see db.test.ts's drift guard) so nothing built on top of
+// them can inherit a mismatch.
+// ---------------------------------------------------------------------------
+
+/**
+ * member = (bucket = 'today' AND day = today)                        -- manual
+ *        OR (due_at IS NOT NULL AND due_at < startOfTomorrow          -- due today or overdue
+ *            AND (today_dismissed_day IS NULL OR today_dismissed_day <> today))
+ *
+ * Positional `?` placeholders, matching every other query in this file (no
+ * named-parameter binding is used anywhere else in db.ts). Bind order —
+ * `today` is needed twice (the manual check and the dismissal check share
+ * the same value but SQLite has no named-parameter reuse with `?`):
+ *   1. today             — YYYY-MM-DD, `localDay(now)`
+ *   2. startOfTomorrowMs — epoch ms, exclusive upper bound; always
+ *                          `startOfNextLocalDay(now)` (lib/day.ts), never
+ *                          UTC/ms-arithmetic
+ *   3. today             — YYYY-MM-DD, same value as (1) again
+ *
+ * Wrapped in its own parens so a caller can safely `AND`/`OR` it into a
+ * larger WHERE clause without operator-precedence surprises.
+ */
+export const TODAY_MEMBERSHIP_SQL = `(
+    (bucket = 'today' AND day = ?)
+    OR (due_at IS NOT NULL AND due_at < ? AND (today_dismissed_day IS NULL OR today_dismissed_day <> ?))
+  )`;
+
+/**
+ * Pure TS twin of `TODAY_MEMBERSHIP_SQL`, operating on the raw row shape so
+ * tests — and, later, client-side code that only has the wire `TaskDto` —
+ * can recompute membership without a database round trip. The two must
+ * agree by construction: db.test.ts's drift guard runs both against the
+ * same hand-built rows and asserts identical membership sets.
+ */
+export function isTodayMember(
+  row: { bucket: "backlog" | "today"; day: string | null; due_at: number | null; today_dismissed_day: string | null },
+  todayStr: string,
+  startOfTomorrowMs: number,
+): boolean {
+  const manual = row.bucket === "today" && row.day === todayStr;
+  const auto =
+    row.due_at !== null &&
+    row.due_at < startOfTomorrowMs &&
+    (row.today_dismissed_day === null || row.today_dismissed_day !== todayStr);
+  return manual || auto;
 }
 
 /** Seeds `Work` (1000) then `Personal` (2000) — only when `lists` is empty. */

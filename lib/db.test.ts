@@ -3,6 +3,7 @@ import { fileURLToPath } from "node:url";
 import Database from "better-sqlite3";
 import { beforeEach, describe, expect, it } from "vitest";
 import * as db from "./db.js";
+import { startOfNextLocalDay } from "./day.js";
 
 function freshDb(): Database.Database {
   const conn = new Database(":memory:");
@@ -586,6 +587,123 @@ describe("migration 15 backfill", () => {
   });
 });
 
+describe("migration 16 — today_dismissed_day", () => {
+  it("applies cleanly on a fresh db and adds a nullable column", () => {
+    const conn = freshDb();
+    const cols = conn.prepare(`PRAGMA table_info(tasks)`).all() as { name: string; notnull: number }[];
+    const col = cols.find((c) => c.name === "today_dismissed_day");
+    expect(col).toBeDefined();
+    expect(col?.notnull).toBe(0);
+
+    conn.prepare(`INSERT INTO lists (id, name, sort_order, created_at) VALUES ('lst_1', 'Work', 1000, 0)`).run();
+    conn
+      .prepare(
+        `INSERT INTO tasks (id, list_id, parent_id, title, notes, bucket, day, sort_order, due_at, has_due_time, status, completed_at, carried_count, created_at, updated_at)
+         VALUES ('tsk_1', 'lst_1', NULL, 'task', NULL, 'backlog', NULL, 1000, NULL, 0, 'open', NULL, 0, 0, 0)`,
+      )
+      .run();
+    const row = conn.prepare(`SELECT today_dismissed_day FROM tasks WHERE id = 'tsk_1'`).get() as {
+      today_dismissed_day: string | null;
+    };
+    // NULL = "never dismissed" — the correct state for every pre-existing row.
+    expect(row.today_dismissed_day).toBeNull();
+  });
+
+  it("applies cleanly against a pre-16 fixture that already carries non-null today_order values (real-shaped legacy data)", () => {
+    const conn = new Database(":memory:");
+    conn.pragma("foreign_keys = ON");
+    // Fixture: the schema exactly as it shipped before this migration
+    // (statements 0-15) — mirrors the "migration 15 backfill" fixture
+    // pattern above. today_order is populated, mimicking a real Today row
+    // that predates today_dismissed_day entirely.
+    for (const stmt of db.MIGRATIONS.slice(0, 16)) conn.exec(stmt);
+    conn.prepare(`INSERT INTO lists (id, name, sort_order, created_at) VALUES ('lst_1', 'Work', 1000, 0)`).run();
+    conn
+      .prepare(
+        `INSERT INTO tasks (id, list_id, parent_id, title, notes, bucket, day, sort_order, today_order, due_at, has_due_time, status, completed_at, carried_count, created_at, updated_at)
+         VALUES ('tsk_today', 'lst_1', NULL, 'today task', NULL, 'today', '2026-08-20', 4242.5, 4242.5, NULL, 0, 'open', NULL, 0, 0, 0)`,
+      )
+      .run();
+
+    // The actual upgrade path: apply migration 16 on top of the legacy fixture.
+    for (const stmt of db.MIGRATIONS.slice(16)) conn.exec(stmt);
+
+    const row = conn
+      .prepare(`SELECT sort_order, today_order, today_dismissed_day FROM tasks WHERE id = 'tsk_today'`)
+      .get() as { sort_order: number; today_order: number | null; today_dismissed_day: string | null };
+    // The additive migration touches nothing that already existed.
+    expect(row.sort_order).toBe(4242.5);
+    expect(row.today_order).toBe(4242.5);
+    expect(row.today_dismissed_day).toBeNull();
+  });
+});
+
+describe("TODAY_MEMBERSHIP_SQL / isTodayMember agreement (drift guard)", () => {
+  // Hand-built rows covering every branch of the union, including the two
+  // opposite dismissal outcomes. `TODAY_MEMBERSHIP_SQL` and `isTodayMember`
+  // are two independent expressions of the same predicate (one SQL, one
+  // TS) — this test is the thing that would catch them silently diverging.
+  const TODAY = "2026-08-20";
+  const YESTERDAY = "2026-08-19";
+  const startOfTomorrowMs = startOfNextLocalDay(new Date(2026, 7, 20, 12, 0, 0));
+  const dueToday = new Date(2026, 7, 20, 9, 0, 0).getTime(); // within today's window
+  const dueOverdue = new Date(2026, 7, 18, 9, 0, 0).getTime(); // before today, still open
+  const dueFuture = new Date(2026, 7, 25, 9, 0, 0).getTime(); // not due yet
+
+  type FixtureRow = {
+    id: string;
+    bucket: "backlog" | "today";
+    day: string | null;
+    due_at: number | null;
+    today_dismissed_day: string | null;
+  };
+
+  const rows: FixtureRow[] = [
+    { id: "manual_only", bucket: "today", day: TODAY, due_at: null, today_dismissed_day: null },
+    { id: "auto_due_today", bucket: "backlog", day: null, due_at: dueToday, today_dismissed_day: null },
+    { id: "auto_overdue", bucket: "backlog", day: null, due_at: dueOverdue, today_dismissed_day: null },
+    { id: "both_manual_and_auto", bucket: "today", day: TODAY, due_at: dueOverdue, today_dismissed_day: null },
+    { id: "dismissed_today", bucket: "backlog", day: null, due_at: dueOverdue, today_dismissed_day: TODAY },
+    { id: "dismissed_yesterday", bucket: "backlog", day: null, due_at: dueOverdue, today_dismissed_day: YESTERDAY },
+    { id: "no_due_not_scheduled", bucket: "backlog", day: null, due_at: null, today_dismissed_day: null },
+    { id: "future_due_not_scheduled", bucket: "backlog", day: null, due_at: dueFuture, today_dismissed_day: null },
+  ];
+
+  function fixtureDb(): Database.Database {
+    const conn = freshDb();
+    conn.prepare(`INSERT INTO lists (id, name, sort_order, created_at) VALUES ('lst_1', 'Work', 1000, 0)`).run();
+    const insert = conn.prepare(
+      `INSERT INTO tasks (id, list_id, parent_id, title, notes, bucket, day, sort_order, due_at, has_due_time, status, completed_at, carried_count, today_dismissed_day, created_at, updated_at)
+       VALUES (?, 'lst_1', NULL, ?, NULL, ?, ?, 1000, ?, 0, 'open', NULL, 0, ?, 0, 0)`,
+    );
+    for (const r of rows) insert.run(r.id, r.id, r.bucket, r.day, r.due_at, r.today_dismissed_day);
+    return conn;
+  }
+
+  it("SQL and TS agree on every hand-built row, including both dismissal outcomes", () => {
+    const conn = fixtureDb();
+    const sqlIds = new Set(
+      (
+        conn
+          .prepare(`SELECT id FROM tasks WHERE ${db.TODAY_MEMBERSHIP_SQL}`)
+          .all(TODAY, startOfTomorrowMs, TODAY) as { id: string }[]
+      ).map((r) => r.id),
+    );
+    const tsIds = new Set(rows.filter((r) => db.isTodayMember(r, TODAY, startOfTomorrowMs)).map((r) => r.id));
+
+    expect(sqlIds).toEqual(tsIds);
+    // Pin the expected membership explicitly so a change to either
+    // predicate that happens to keep them in agreement, but drifts from
+    // the design doc's union, still fails this test.
+    expect([...sqlIds].sort()).toEqual(
+      ["manual_only", "auto_due_today", "auto_overdue", "both_manual_and_auto", "dismissed_yesterday"].sort(),
+    );
+    expect(sqlIds.has("dismissed_today")).toBe(false);
+    expect(sqlIds.has("no_due_not_scheduled")).toBe(false);
+    expect(sqlIds.has("future_due_not_scheduled")).toBe(false);
+  });
+});
+
 describe("PRAGMA foreign_keys finding", () => {
   // Finding (per the design doc's "verify before relying on it"): this
   // codebase turns PRAGMA foreign_keys ON explicitly — server.ts does it on
@@ -615,6 +733,25 @@ describe("writeOrder structural guard", () => {
       expect(stmt).not.toMatch(/\bsort_order\b/);
       expect(stmt).not.toMatch(/\btoday_order\b/);
     }
+  });
+
+  // Phase 1 note: the design doc calls for tightening this guard to assert
+  // ZERO writes to today_order anywhere in db.ts. That isn't safely
+  // achievable yet — `writeOrder`'s two remaining "today_order" call sites
+  // live inside `createTask` and `moveTask`, and `moveTask`'s body is
+  // Phase 2's to rewrite (it needs simultaneous surgery for the dismissal
+  // stamp in the same pass that removes this). Narrowing `writeOrder` or
+  // deleting these call sites here would either not type-check or silently
+  // break scheduling before Phase 2 lands its replacement. This tripwire
+  // pins the exact current count instead: Phase 2 must touch this test (and
+  // can't accidentally leave one behind) when it removes them.
+  it("(tripwire for Phase 2) pins the exact call sites still writing today_order, so the removal can't silently miss one", () => {
+    const src = readFileSync(fileURLToPath(new URL("./db.ts", import.meta.url)), "utf8");
+    const codeOnly = src.slice(src.indexOf("interface TaskRow"));
+    const callSites = codeOnly.match(/writeOrder\([^):]*,\s*"today_order"/g) ?? [];
+    // createTask (1), moveTask's entering-Today branch (1), moveTask's
+    // leaving/staying-in-backlog branch (1), rebalanceTodaySiblingGroup (1).
+    expect(callSites.length).toBe(4);
   });
 });
 
