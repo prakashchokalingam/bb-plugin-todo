@@ -10,9 +10,13 @@ against the real SDK, say so in your report rather than silently substituting.
 
 ## Product rules (non-negotiable)
 
-1. **Two sections, one list.** Backlog and Today render in a single dnd context.
-   Any item can be dragged Backlog -> Today, Today -> Backlog, or reordered within
-   either.
+1. **The Backlog is the complete, always-true list.** Every open top-level
+   task in the active list appears there, always, undimmed, fully
+   interactive — no bucket filter, no exceptions. **Today is a filtered,
+   project-grouped view over those same rows**, not a second place things
+   live: it renders in the same single dnd context, side by side with the
+   Backlog, and any item can be dragged Backlog -> Today, Today -> Backlog,
+   or reordered within either.
 2. **Subtasks are exactly one level deep.** A task with `parent_id` cannot itself
    have children. Dropping a top-level task onto another top-level task makes it a
    subtask (its own subtasks are promoted to top-level siblings at the drop point).
@@ -29,19 +33,48 @@ against the real SDK, say so in your report rather than silently substituting.
    (`5 0 * * *`) and lazily at the start of every `getBoard` / `getArchive` call,
    so a slept machine can never desync.
 5. **Today's progress survives the vanish.** The Today ring reads `done/total` where
-   total = all rows with `day = today` in this list (open + done). So completing 5
-   of 10 shows 5/10 even though those 5 are gone from the list.
+   total = all rows with `day = today` in this list (open + done), generalized
+   to cover auto-included tasks too: `completeTask` stamps `day = today` at the
+   moment of completion for any row that was a Today member by the shared
+   predicate (rule 7) but never had `day` written (because it was never
+   manually scheduled). Only `day` is stamped, never `bucket` — a historical
+   marker, not a reschedule. So completing 5 of 10 shows 5/10 even though
+   those 5 are gone from the list, whether they got there by being dragged in
+   or by falling due.
 6. **Everything is per-list.** Overdue counts, archive, clear-archive: scoped to the
    active list. The sidebar accessory shows the total overdue across all lists.
-7. **Today is a flag, not a place.** A task's home is `(project_id, parent_id)`
-   and it never leaves. Dragging into Today sets `bucket='today'` + `day` and
-   nothing else about its identity — `parent_id` and `project_id` are
-   untouched. The task renders in Today with its trail (`TrailDto`, below),
-   and stays visible — ghosted — in its project. Scheduling a subtask never
-   schedules its parent, and scheduling a parent never drags its subtasks
-   along. Depth stays capped at one level (rule 2); a project is a container,
-   not a task, so this adds a third level of context without a third level
-   of nesting.
+7. **Today membership is derived, not stored as a place.** A task's home is
+   `(project_id, parent_id, sort_order)` and it never leaves — Today is a
+   lens over the Backlog's own rows, not a second location with its own
+   copy. Membership is one predicate, defined once
+   (`TODAY_MEMBERSHIP_SQL` / `isTodayMember` in `lib/db.ts`) and evaluated
+   the same way everywhere it's needed:
+
+   ```
+   member = (bucket = 'today' AND day = today)                       -- manually scheduled
+         OR (due_at IS NOT NULL AND due_at < startOfTomorrow          -- due today or overdue
+             AND (today_dismissed_day IS NULL OR today_dismissed_day <> today))
+   ```
+
+   Dragging a task into Today sets `bucket='today'` + `day` and nothing else
+   about its identity — `parent_id` and `project_id` stay untouched. A task
+   whose due date lands today or earlier is *auto-included* with no write at
+   all — pure derivation from `due_at`. Either way the task renders as a
+   normal, undimmed, fully-interactive Backlog row (see the Storage section's
+   `TaskDto.inToday`), never dimmed and never duplicated with a different
+   visual treatment. Scheduling a subtask never schedules its parent, and
+   scheduling a parent never drags its subtasks along. Depth stays capped at
+   one level (rule 2); a project is a container, not a task, so this adds a
+   third level of context without a third level of nesting.
+
+   Removing a task from Today never mutates a fact the user didn't touch: a
+   manually-scheduled task flips back to `bucket='backlog'` (the existing
+   `moveTask` transition) and stamps `today_dismissed_day = today`; an
+   auto-included task (never `bucket='today'`) has no flag to clear, so
+   `dismissFromToday` stamps `today_dismissed_day` alone, touching nothing
+   else. `today_dismissed_day` is self-expiring — it only suppresses
+   membership while it equals today, so a still-overdue task returns
+   tomorrow with no rollover write and nothing to clean up.
 
 ## Storage — SQLite via `bb.storage.database()`
 
@@ -122,6 +155,8 @@ ALTER TABLE tasks ADD COLUMN today_order REAL;
 CREATE INDEX IF NOT EXISTS tasks_project_idx ON tasks (list_id, project_id, sort_order);
 -- 15
 UPDATE tasks SET today_order = sort_order WHERE bucket = 'today';
+-- 16
+ALTER TABLE tasks ADD COLUMN today_dismissed_day TEXT;
 ```
 
 `projects.color` reuses `TAG_COLORS`/`lib/tag-colors.ts`, exactly like
@@ -132,18 +167,28 @@ tasks to `project_id = NULL` inside its own transaction rather than relying
 on the FK. Migration 15 is a one-time backfill: every existing Today row
 keeps its exact current position (`today_order = sort_order`) on first load,
 and it is not re-runnable — get it right against a pre-migration fixture DB
-before shipping a change to it.
+before shipping a change to it. Migration 16 is purely additive and
+backfills nothing: `today_dismissed_day IS NULL` means "never explicitly
+removed from Today", which is already correct for every existing row.
 
 `project_id = NULL` means "loose" (unfiled); every task predating this
 feature gets that value automatically and renders exactly as before, below
 every project, with no group header. `sort_order` means "position within its
-project (or the loose group), under its parent"; `today_order` means
-"position in the Today list" — a task that is both filed and scheduled (a
-ghost) needs both independently, since reordering the day must never
-reshuffle the Backlog. `parent_id` is never cleared by a bucket change
-(dragging into Today is a flag, not a relocation — see the Core decision
-below); a subtask's `project_id` always mirrors its parent's, enforced
-inside the move/create transaction.
+project (or the loose group), under its parent" — the *only* order column
+either view reads. **`today_order` is abandoned, not dropped**: nothing
+reads or writes it anymore (`writeOrder` narrows to `sort_order` alone, and
+a source-scanning test in `lib/db.test.ts` asserts zero `today_order` writes
+anywhere in `lib/db.ts`), but the column stays in the schema as a rollback
+escape hatch and the revivable answer if shared ordering between Backlog and
+Today ever turns out to grate. Today now inherits `sort_order`, so
+reordering a task in the Today view reorders it in the Backlog too — that is
+the intended meaning of "Today is a filtered view", not a bug. `parent_id`
+is never cleared by a bucket change (dragging into Today is a flag, not a
+relocation — see the Core decision below); a subtask's `project_id` always
+mirrors its parent's, enforced inside the move/create transaction.
+`today_dismissed_day` records the local day (`YYYY-MM-DD`) a task was last
+explicitly removed from the Today view — see rule 7. It is never sent on the
+wire; the client only ever sees its effect via `TaskDto.inToday`.
 
 `tags` is global (no `list_id`) — one catalog shared by every list. `task_tags`
 is a pure join with no payload, keyed `(task_id, tag_id)`. The
@@ -216,6 +261,10 @@ TaskDto = {
   tags: TagRefDto[]            // ordered by tag sortOrder; populated on subtasks too
   projectId: string|null       // NULL = loose (not filed into a project)
   trail: TrailDto|null
+  inToday: boolean             // computed server-side by the shared membership
+                                // predicate (rule 7); the one bit the client
+                                // cannot reconstruct on its own. `today_dismissed_day`
+                                // itself is never sent.
 }
 ListDto = { id, name, sortOrder, openCount, overdueCount }
 ProjectDto = {
@@ -230,28 +279,48 @@ silent fallback.
 
 Methods:
 - `getBoard({ listId: string|null })` -> `{ lists: ListDto[], activeListId: string,
-  today: { day: string, planned: number, completed: number, tasks: TaskDto[] },
+  today: { day: string, planned: number, completed: number },
   backlog: { total: number, overdue: number, tasks: TaskDto[] },
   totalOverdue: number, serverNow: number, tags: TagDto[], projects: ProjectDto[] }`
   - `activeListId` falls back to the first list when the argument is null or unknown.
-  - `today.tasks` is genuinely flat: `subtasks` is always `[]` on every Today
-    row. A subtask scheduled alone appears here as its own row while its
-    parent stays in the Backlog (rule 7); nesting it under a parent it isn't
-    with here would misrepresent that.
+  - **`today` carries no `tasks` array.** The Backlog is comprehensive (see
+    below), so every field a Today row needs — `bucket`, `day`, `dueAt`,
+    `inToday`, `projectId`, `parentId`, `trail` — already sits on every
+    `TaskDto` in `backlog.tasks`. The client derives the grouped Today view
+    from that single tree via the pure `lib/todayView.ts`, rather than
+    trusting a second, independently-built server traversal that could
+    disagree with the first. This is safe **only** because `backlog.tasks`
+    is comprehensive — see the note below and the design doc.
   - `backlog.tasks` are top-level rows only, ordered by `sort_order`, each
-    with its `subtasks` nested and ordered — and now includes today-flagged
-    ghosts alongside plain open rows, so a scheduled task's ghost renders in
-    its project.
-  - `planned` = rows with `day = today`; `completed` = those with `status='done'`.
-    Both count top-level rows AND subtasks.
+    with its `subtasks` nested and ordered — **every open task in the list,
+    unconditionally**. There is no bucket filter here at all: a task's
+    presence in the Backlog no longer depends on whether it's also in Today.
+  - `backlog.overdue` counts overdue rows across the *whole* list, not just
+    a `bucket='backlog'` subset — overdue-ness is a Backlog fact now, since
+    the Backlog is the only place it's authoritatively surfaced.
+  - `planned` = `completed` (see below) plus every currently-open row
+    satisfying the Today membership predicate (rule 7); `completed` = rows
+    with `day = today AND status='done'`. Both count top-level rows AND
+    subtasks. Because `completeTask` stamps `day` for auto-included rows too
+    (rule 5), the ring's two halves can never disagree with what's actually
+    in play.
   - `tags` is the full tag catalog with usage counts, so the picker needs no
     extra fetch. `getArchive`'s output is **not** extended with this catalog —
     archived rows carry `TaskDto.tags` like any other row, but the archive
     panel renders no picker, so it needs no catalog.
-  - `projects` is every project in the active list, in `sort_order`.
+  - `projects` is every project in the active list, in `sort_order`; each
+    `ProjectDto.todayCount` uses the same membership predicate as the board,
+    so a project's "N today" badge picks up an auto-included task too, not
+    only one someone dragged in.
   - Tag lookups for every row on the board are done with **one** query
     (`loadTagMap` in `lib/db.ts`), never a per-task query — see the N+1 note
     below.
+
+  > **Tripwire.** Deriving Today client-side from `backlog.tasks` is correct
+  > only while the Backlog stays comprehensive and unpaged. If the Backlog
+  > is ever virtualized or lazily paged, Today silently goes blind to
+  > anything outside the loaded window — see README's Known gaps and
+  > `docs/design/2026-08-31-today-as-view.md`.
 - `getArchive({ listId: string, limit: number (<=200, default 100), offset: number })`
   -> `{ groups: [{ day: string, tasks: TaskDto[] }], total: number, hasMore: boolean }`
   grouped by the local day of `completed_at`, newest first. Subtasks appear nested
@@ -271,17 +340,31 @@ Methods:
   - `beforeId`/`afterId` are the sibling ids the item lands between, in the target
     group. Both null = only item / append.
   - `projectId` is the task's target home; **omitting it leaves the task's
-    current project unchanged** — this is what keeps a task scheduled into
-    Today in its existing project (its ghost's `sort_order` is never
-    touched) and what makes unscheduling it snap back to that exact slot
+    current project unchanged** — this is what keeps a task's home
+    `(project_id, parent_id, sort_order)` untouched by scheduling it into
+    Today, and what makes unscheduling it snap back to that exact slot
     regardless of where it's dropped. Only a drop directly onto a
     *different* project re-homes a task, by passing that project's id.
+  - The `today -> backlog` transition additionally stamps
+    `today_dismissed_day = today` (see rule 7) — unconditional, and harmless
+    on a row with no due date. This is what stops a manually-scheduled *and*
+    overdue task from boomeranging straight back into Today the instant its
+    `bucket` flips away from `'today'`. Entering Today (`backlog -> today`)
+    clears any stale `today_dismissed_day` from an earlier day.
   - Making a task a subtask promotes that task's own children to top-level siblings
     placed immediately after it, in their existing order.
   - Rejects a move that would create a cycle or a depth > 1.
   - A subtask's `project_id` always mirrors its (possibly new) parent's,
     enforced in the same transaction.
-- `completeTask({ id })` -> `{ completedIds: string[] }`
+- `completeTask({ id })` -> `{ completedIds: string[] }`. Also stamps `day`
+  per rule 5 for any completed row that was an auto-included Today member
+  with no `day` of its own yet.
+- `dismissFromToday({ id })` -> `{ ok: true }`. The counterpart to
+  `moveTask`'s dismissal stamp, for a task that was never manually scheduled
+  (`bucket='backlog'`) but renders in Today purely because it's due today or
+  overdue — there's no `moveTask` transition to hang the stamp off, so this
+  is a single-column write of `today_dismissed_day`, touching nothing else
+  about the task.
 - `restoreTasks({ ids: string[] })` -> `{ ok: true }` (undo AND archive restore)
 - `deleteTask({ id })` -> `{ ok: true }` (cascades subtasks)
 - `createList({ name })` / `renameList({ id, name })` / `deleteList({ id })` /
@@ -361,53 +444,69 @@ app.slots.navPanel({
 - Archive opens as an in-page overlay (`Dialog`, which the host renders as a bottom
   drawer on compact viewports) — NOT a second nav panel.
 
-Layout, top to bottom: tab strip -> BACKLOG section -> TODAY section. See the ASCII
-in `docs/UX.md`. The tab strip keeps its own tight spacing; the gap between the
-Backlog and Today sections is much larger (`gap-8`, ~2rem, whitespace only, no
-divider) since they are two distinct drop zones, not one continuous list.
+Layout: tab strip, then two side-by-side columns — Backlog left, Today right —
+each independently scrollable, inside a `@container` wrapper that degrades to
+a stacked layout (Today first) on narrow panels via Tailwind v4 native
+container queries, **never** viewport media queries (a bb nav panel's width
+is independent of the browser viewport — a maximized window with a narrow
+panel must still stack). See the ASCII in `docs/UX.md`.
 
 ### Components (one component per file, under `components/`)
 - `TodoPage.tsx` — data fetching (`useRpc`, `useRealtime("board")`), the single
-  `DndContext`, keyboard sensor included, and both sections.
+  `DndContext` spanning both columns, keyboard sensor included, and the
+  `@container` wrapper around both columns.
 - `TabStrip.tsx` — list tabs; double-click to rename inline, `+` to create, context
   menu (dropdown) to delete with an AlertDialog confirm, drag to reorder.
 - `Section.tsx` — header (label, count, `ProgressRing`) + droppable body +
-  `AddTaskRow`. The header ring shows Today's `completed/planned` in the primary
-  tone, and Backlog's overdue share in the destructive tone. The Backlog body
-  additionally renders one `ProjectGroup` per project (a nested
-  `SortableContext` per project, plus an outer one over the project ids for
-  header reordering), followed by every loose top-level task with no group
-  header; `#Name` + Enter in the Backlog's own `AddTaskRow` creates a project
-  inline instead of a task. The Today body passes `showTrail` so each row
-  renders its `TrailLine` as a second line.
+  `AddTaskRow`, one per column. The header ring shows Today's
+  `completed/planned` in the primary tone, and Backlog's overdue share in the
+  destructive tone. Both columns render the identical shape: one
+  `ProjectGroup` per project (a nested `SortableContext` per project, plus an
+  outer one over the project ids for header reordering — Backlog only, see
+  `ProjectGroup.tsx`), followed by every loose top-level task with no group
+  header. `#Name` + Enter in the Backlog's own `AddTaskRow` creates a project
+  inline instead of a task.
 - `ProjectGroup.tsx` — a project's card: `ProjectHeader` + a droppable body
   (append-to-project / re-home drop target) + a per-project `AddTaskRow`.
   Collapsed renders the header alone; an empty expanded project renders the
-  header plus its add-row only.
-- `ProjectHeader.tsx` — collapse chevron, colour badge (opens the shared
-  `ColorSwatchPicker`), inline-editable name (double-click, same mechanics
-  as `TabStrip`'s tab rename), a `+` that reveals and focuses the project's
-  add-row, and a `⋯` menu (Rename / Change colour / Delete, the last behind
-  the existing `AlertDialog`).
+  header plus its add-row only in the Backlog. In the Today column, an empty
+  project group renders nothing at all — Today is an ephemeral view, so a
+  project with nothing due or scheduled simply doesn't appear there, unlike
+  the Backlog where an empty project is a durable, always-visible container.
+- `ProjectHeader.tsx` — in the Backlog: collapse chevron, colour badge (opens
+  the shared `ColorSwatchPicker`), inline-editable name (double-click, same
+  mechanics as `TabStrip`'s tab rename), a `+` that reveals and focuses the
+  project's add-row, and a `⋯` menu (Rename / Change colour / Delete, the
+  last behind the existing `AlertDialog`). In the Today column the header is
+  a read-only, non-draggable label: the name and colour badge render, and
+  collapse still works, but rename/colour/delete/`+`/reordering are Backlog
+  only — one editing surface per concept, and two draggable orderings of one
+  `projects.sort_order` would fight each other.
 - `TrailLine.tsx` — a Today row's muted second line, `# Project > Parent`.
-  Renders null with no context to show; truncates from the left so the
-  nearest ancestor survives; each segment is independently clickable
-  (scrolls the Backlog to the source row and flashes it); collapses to the
-  project badge alone below `md`.
-- `TaskRow.tsx` — grip, checkbox, title (click to edit inline), `ProgressRing` when
-  it has subtasks, a "carried Nx" badge (or a ghost's `· today` marker in its
-  place), `AgeChip`, `DueChip`, then always-visible inline icon actions in this
-  order: a calendar button (opens `DueDatePicker`
-  directly, one click), a plus button on top-level rows only (reveals the inline
-  add-subtask input directly, focused — not shown on subtask rows, since depth is
-  capped at 1), and a `⋯` menu holding Delete only (behind the existing AlertDialog
-  confirm). Renders its subtasks indented, each independently ghosted if
-  scheduled. Right-hand reading order: title -> ring -> carried badge/ghost
-  marker -> age -> due -> actions, with `TrailLine` as an optional second line
-  under a Today row. A ghost's dnd-kit sortable id is prefixed
-  (`taskDragId`) since a scheduled task's real id is legitimately on screen
-  twice at once (its ghost and its Today row) and dnd-kit ids must be
-  unique within one `DndContext`.
+  Renders for exactly one live case: a Today row whose *parent* is not also
+  in Today. Inside a project group it shows the parent segment only (the
+  group header already names the project); in the loose/`Unfiled` group it
+  keeps both segments. Renders null with no context to show; truncates from
+  the left so the nearest ancestor survives; each segment is independently
+  clickable (scrolls the Backlog to the source row and flashes it); collapses
+  to the project badge alone below `md`. Archive's use of `TrailLine` is
+  unaffected by any of this.
+- `TaskRow.tsx` — grip, always-real checkbox (no ghost swap), title (click to
+  edit inline), `ProgressRing` when it has subtasks, a "carried Nx" badge, a
+  subtle today marker whenever `task.inToday` — no longer either/or with the
+  carried badge; a row can show both at once — `AgeChip`, `DueChip`, then
+  always-visible inline icon actions in this order: a calendar button (opens
+  `DueDatePicker` directly, one click), a plus button on top-level rows only
+  (reveals the inline add-subtask input directly, focused — not shown on
+  subtask rows, since depth is capped at 1), and a `⋯` menu holding Delete
+  only (behind the existing AlertDialog confirm). Renders its subtasks
+  indented. Right-hand reading order: title -> ring -> carried badge ->
+  today marker -> age -> due -> actions, with `TrailLine` as an optional
+  second line under a Today row. The same task can render at once in both
+  columns whenever `inToday` is true, so its dnd-kit sortable id is prefixed
+  (`taskDragId`) to stay unique within the single shared `DndContext` — this
+  is not ghost machinery and is *more* load-bearing after ghosts than before,
+  since every `inToday` task now renders twice, not just scheduled ones.
 - `AddTaskRow.tsx` — a borderless input; Enter creates and keeps focus for the next
   one, Escape blurs. This is the primary capture path — no modal. The placeholder
   and the leading `Plus` icon sit muted at `text-muted-foreground/50` at rest and
@@ -510,8 +609,14 @@ via the toast text.
   `DueChip`.
 - `components/leaf.test.tsx`: `AgeChip` renders the expected text, exposes the
   absolute date via `title`, and is always muted (never a tone class);
-  `ProjectHeader`/`ProjectGroup`/`TrailLine`/ghost-row `TaskRow` rendering
-  and callbacks, presentational and fixture-driven.
+  `ProjectHeader`/`ProjectGroup`/`TrailLine`/`TaskRow` rendering and
+  callbacks, presentational and fixture-driven, including the `variant`
+  differences between a Backlog and a Today `ProjectHeader`/`ProjectGroup`
+  and the today marker's rendering alongside a carried badge.
+- `lib/todayView.test.ts`: table-driven pure tests of `selectTodayView`
+  against `backlog.tasks` fixtures — manual-only, auto-only, both, dismissed
+  today (excluded), dismissed yesterday (reappears), orphan-subtask
+  grouping, empty-project suppression.
 - `lib/drag.test.ts`: the full drag matrix (backlog<->today, reorder, nest,
   project filing/re-homing, project header reorder) as table-driven pure
   tests against `computeTaskMove`/`computeProjectReorder`/`applyMoveToBoard`
@@ -521,7 +626,10 @@ via the toast text.
   same `stubSequentialRects` keyboard-drag technique as the base
   reorder/optimistic tests) — a subtask dragged from its project into Today
   keeps its parent and the Today row shows its trail; the subtask stays
-  visible, ghosted, in its project; dragging it back to the Backlog snaps it
-  home regardless of drop position; a carried task still renders its full
-  trail; the project header's `+` reveals and focuses its add-row.
+  visible, undimmed and fully interactive, in its project, marked; dragging
+  it back to the Backlog snaps it home regardless of drop position; a
+  carried task still renders its full trail; the project header's `+`
+  reveals and focuses its add-row (Backlog only); a task visible in both
+  columns at once (a live `inToday` task) can still be dragged without a
+  dnd-kit id collision.
 - `npm test` (vitest) must pass with zero failures, and `npx tsc --noEmit` clean.

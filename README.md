@@ -1,13 +1,15 @@
 # Todo for BB
 
-A daily to-do list with two zones instead of one flat list: a Backlog and a
-Today, on one drag-and-drop board. The Backlog files work into projects and
-subtasks; Today is a commitment list, not a copy of your plans — scheduling
-something into Today just flags it, so it keeps its trail back to the project
-and parent it came from, and stays visible (ghosted) where it actually lives.
-Anything left unfinished in Today rolls forward automatically at midnight,
-with a visible "carried 3×" badge — so avoidance stops hiding in plain sight,
-right next to the project it's stalling.
+A daily to-do list with two columns instead of one flat list: a Backlog and a
+Today, side by side on one drag-and-drop board. The Backlog is the complete,
+always-true list of everything — every open task, every project, always
+undimmed. Today is a filtered lens over that same list: whatever you've
+scheduled, plus whatever's due today or overdue, grouped by project exactly
+like the Backlog. Nothing is duplicated or dimmed to show it's "also" in
+Today — a task just carries a small marker and renders, fully interactive,
+in both places at once. Anything left unfinished in Today rolls forward
+automatically at midnight, with a visible "carried 3×" badge — so avoidance
+stops hiding in plain sight, right next to the project it's stalling.
 
 ## Why this exists
 
@@ -28,25 +30,30 @@ that willpower usually has to.
 
 ## What it does
 
-- **Two zones + rollover** — Backlog and Today live on one drag-and-drop
-  surface; drag a task either direction or reorder within a zone. At
-  midnight, anything left open in Today gets carried into the new day and
-  its carry count increments, so unfinished work stays visible instead of
-  quietly aging into invisibility.
+- **Two columns + rollover** — Backlog and Today sit side by side on one
+  drag-and-drop board, each scrolling independently; drag a task either
+  direction or reorder within a column (reordering in Today reorders the
+  Backlog too — they share one order, since Today is a view over the
+  Backlog's own rows, not a separate list). At midnight, anything left open
+  in Today gets carried into the new day and its carry count increments, so
+  unfinished work stays visible instead of quietly aging into invisibility.
 - **Projects** — file Backlog work into named, colour-coded projects (a
   third level of context — List -> Project -> Task -> Subtask — without a
   third level of nesting, since a project is a container, not a task).
   Collapse a project, rename it inline, recolour it, or delete it (its tasks
   release to loose, unfiled — nothing is deleted). Type `#Name` into the
-  Backlog's own add-row to create a project inline, no dialog.
-- **Today is a flag, not a place** — scheduling a task into Today never
-  changes where it lives: its parent and project stay exactly what they
-  were. The Today row shows a muted trail (`Project > Parent`) back to its
-  home, and the task stays visible in its project too — dimmed, checkbox
-  swapped for a ghost glyph, marked `· today` — so a stalled effort is
-  legible as a stalled *project*, not just a stalled row you scroll past in
-  Today. Click the ghost's marker to unschedule it; it snaps back to exactly
-  the Backlog slot it never left, regardless of where you drop it.
+  Backlog's own add-row to create a project inline, no dialog. Today mirrors
+  the same project grouping, read-only.
+- **The Backlog is the source of truth; Today is a filtered view** —
+  scheduling a task into Today never changes where it lives: its parent and
+  project stay exactly what they were, and it never disappears from the
+  Backlog or gets dimmed. Today also auto-includes anything due today or
+  overdue, with no drag required. Either way the task carries a small marker
+  and shows its trail (`Project > Parent`) back home when its parent isn't
+  also in Today — so a stalled effort is legible as a stalled *project*, not
+  just a stalled row you scroll past in Today. Click the marker to remove it
+  from Today; a manually-scheduled task snaps back to exactly the Backlog
+  slot it never left.
 - **Tabs** — multiple lists (e.g. Work, Personal), each with its own
   Backlog/Today, created, renamed, reordered, and deleted from the tab strip.
 - **Tags** — global, colour-coded tags. A 🏷 icon on every row opens a
@@ -111,6 +118,19 @@ pull request.
   stayed green, because nothing exercised it the way a mouse would. Treat
   anything interaction-heavy (drag-and-drop, popovers, inline rename) as
   under-tested until it's been clicked through by hand.
+- **The two-column drag "collision feel" is unverified by tests.** jsdom has
+  no layout, so nothing in the suite can prove that dragging a row across the
+  gap between the Backlog and Today columns feels right — a row may sit
+  geometrically closer to an unrelated row in the other column than to its
+  actual target. This is a manual-QA item, not something a unit test can
+  catch; see `docs/design/2026-08-31-today-as-view.md`.
+- **`lib/todayView.ts`'s correctness depends on the Backlog staying
+  comprehensive.** The Today view is derived client-side from
+  `backlog.tasks`, which today always holds every open task in the list. If
+  the Backlog is ever virtualized or lazily paged for performance, Today
+  would silently go blind to anything outside the loaded window — nothing
+  would error, it would just stop showing tasks that are, in fact, due or
+  scheduled.
 - **Tags are display-only.** You can apply, colour, and manage them, but you
   can't yet filter the board by tag.
 - **Tag name matching is ASCII-only.** Uniqueness is enforced with SQLite's

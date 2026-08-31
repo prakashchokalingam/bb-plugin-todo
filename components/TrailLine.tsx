@@ -9,6 +9,13 @@ import type { TrailDto } from "@/contract";
 
 export interface TrailLineProps {
   trail: TrailDto | null | undefined;
+  /** Suppresses the project segment: the caller already names the project
+   * elsewhere (a Today project group's own header names it, so an orphan
+   * subtask rendered inside that group would otherwise repeat it). Default
+   * `false`, so Archive's existing use — and the loose/Unfiled group's
+   * orphan rows, which have no header naming a project for them — are
+   * completely unaffected. */
+  hideProject?: boolean;
   onNavigateToProject?: (projectId: string) => void;
   onNavigateToParent?: (parentId: string) => void;
   className?: string;
@@ -27,13 +34,14 @@ export interface TrailLineProps {
  */
 export function TrailLine({
   trail,
+  hideProject = false,
   onNavigateToProject,
   onNavigateToParent,
   className,
 }: TrailLineProps) {
   if (!trail) return null;
 
-  const hasProject = trail.projectId !== null && trail.projectName !== null;
+  const hasProject = !hideProject && trail.projectId !== null && trail.projectName !== null;
   const hasParent = trail.parentId !== null && trail.parentTitle !== null;
   if (!hasProject && !hasParent) return null;
 

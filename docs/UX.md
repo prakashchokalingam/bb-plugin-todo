@@ -1,53 +1,58 @@
 # UX reference (build to this)
 
 ```
-┌──────────────────────────────────────────────────────────────────────────────────────────────┐
-│ ⛯ Todo                                                                    [Archive] [+ Tab]  │  host title bar + headerContent
-├──────────────────────────────────────────────────────────────────────────────────────────────┤
-│  Work │ Personal │ +                                                             ② overdue   │  TabStrip
-├──────────────────────────────────────────────────────────────────────────────────────────────┤
-│                        ↕ gap-8 (~2rem) — two distinct zones                                  │
-│  BACKLOG  · 12                                                   ◔ 3/12 overdue              │  Section header + ProgressRing (destructive)
-│  ┌────────────────────────────────────────────────────────────────────────────────────────┐  │
-│  │ ▾ ● Q3 Launch                                          4 open · 1 today       ＋ ⋯      │  │  ProjectGroup header
-│  │   ⠿ ☐  Rewrite the onboarding email  ●urgent ●bug    added 2mo ago  2d late    ▤ 🏷 ＋ ⋯ │  │
-│  │        ↳ ☐ Draft the copy                             added 1w ago              ▤ 🏷   ⋯ │  │  subtask: no plus
-│  │        ↳ ◌ Get legal sign-off              · today    added 1w ago              ▤ 🏷   ⋯ │  │  ghost subtask (scheduled)
-│  │   ⠿ ☐  Q3 planning doc  ●deep-work  ◕ 2/5            added 1w ago   Fri 9:00am ▤ 🏷 ＋ ⋯ │  │  ProgressRing (subtasks)
-│  │   + add to Q3 Launch                                                                   │  │  per-project AddTaskRow
-│  │                                                                                         │  │
-│  │ ▸ ● Personal errands                                              3 open       ＋ ⋯      │  │  collapsed: header only
-│  │                                                                                         │  │
-│  │ ⠿ ☐  Renew the domain                                added 3d ago   in 3 days  ▤ 🏷 ＋ ⋯ │  │  loose task, below every project
-│  │ + add to backlog                                                                       │  │  AddTaskRow; `#Name` + Enter files a new project
-│  └────────────────────────────────────────────────────────────────────────────────────────┘  │
-│                        ↕ gap-8 (~2rem) — two distinct zones                                  │
-│  TODAY · Thu 20 Aug                                           ◕ 5/10 done                    │  Section header + ProgressRing (primary)
-│  ┌────────────────────────────────────────────────────────────────────────────────────────┐  │
-│  │ ⠿ ☐  Ship the invoice fix                           added just now  in 22 min  ▤ 🏷 ＋ ⋯ │  │  tone: soon
-│  │ ⠿ ☐  Get legal sign-off                              added 1w ago   carried 1× ▤ 🏷   ⋯ │  │  ghost's live copy
-│  │        ● Q3 Launch › Rewrite the onboarding email                                      │  │  TrailLine (second line, muted)
-│  │ ⠿ ☐  Review Ana's PR  ◕ 1/2                          added 5h ago   tomorrow   ▤ 🏷 ＋ ⋯ │  │
-│  │ + add to today                                                                         │  │
-│  └────────────────────────────────────────────────────────────────────────────────────────┘  │
-└──────────────────────────────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────────────┐
+│ ⛯ Todo                                                            [Archive] [+ Tab]  │  host title bar + headerContent
+├──────────────────────────────────────────────────────────────────────────────────────┤
+│  Work │ Personal │ +                                                     ② overdue   │  TabStrip
+├───────────────────────────────────────────────┬──────────────────────────────────────┤
+│ BACKLOG · 12                    ◔ 3 overdue   │ TODAY · Thu 20 Aug      ◕ 5/10 done  │  sticky column headers (Section)
+├───────────────────────────────────────────────┼──────────────────────────────────────┤
+│ ▾ ● Q3 Launch            4 open · 1 today ＋⋯ │ ▾ ● Q3 Launch                        │  ProjectGroup + ProjectHeader
+│  ⠿ ☐ Rewrite onboarding email  ●urgent 2d late│  ⠿ ☐ Get legal sign-off  carried 1×  │  TaskRow — undimmed, fully interactive
+│      ↳ ☐ Draft the copy                       │        › Rewrite onboarding email    │  TrailLine: orphan subtask → parent trail
+│      ↳ ☐ Get legal sign-off       · today     │                                      │  TaskRow: today marker
+│  ⠿ ☐ Q3 planning doc  ◕2/5       Fri 9:00am   │ ▾ ● Personal errands                 │
+│  + add to Q3 Launch                           │  ⠿ ☐ Renew the domain    ⌁ due today │  ⌁ = auto-included marker
+│                                               │                                      │
+│ ▸ ● Personal errands              3 open  ＋⋯ │ ▾  Unfiled                           │  Today: empty groups hidden
+│                                               │  ⠿ ☐ Ship the invoice fix  in 22 min │
+│ ⠿ ☐ Renew the domain     ⌁ today    in 3 days │                                      │
+│ + add to backlog                              │ + add to today                       │
+└───────────────────────────────────────────────┴──────────────────────────────────────┘
+      ← independent scroll                            independent scroll →
+```
             ┌──────────────────────────────┐
             │ ✓ Done · Standup      [Undo] │  sonner, 8s
             └──────────────────────────────┘
 
+Both columns render the identical `ProjectGroup` → `TaskRow` tree, wired
+through one `DndContext` that spans both. A row is **undimmed and fully
+interactive in both columns** — same checkbox, tags, due picker,
+add-subtask, menu; the only difference is whether the project header is
+draggable/editable (Backlog) or a read-only label (Today — see "Projects"
+below).
+
+Below the container breakpoint (narrow bb nav panel, independent of browser
+viewport — see "Two-column layout" below), this falls back to the existing
+stacked layout, sticky collapsible section headers, **Today first** — when
+space is scarce, execution beats planning.
+
 Row reading order, left to right after the title: tag chips (if any, `TagChips`)
--> subtask ring (if any) -> carried badge (if any, or the ghost's `· today`
-marker in its place — see below) -> AgeChip ("added N ago", always muted,
-hidden below `sm` if a narrow row needs the room) -> DueChip (always visible,
-tone-coded) -> the four action icons below. A Today row additionally gets a
-second line — `TrailLine`, described below — directly under it, whenever it
-has one.
+-> subtask ring (if any) -> carried badge (if any) -> today marker (if any,
+see "The today marker" below — no longer either/or with the carried badge; a
+row can show both) -> AgeChip ("added N ago", always muted, hidden below `sm`
+if a narrow row needs the room) -> DueChip (always visible, tone-coded) -> the
+four action icons below. A Today row additionally gets a second line —
+`TrailLine`, described below — directly under it, whenever it has one.
 
 ## Projects (`ProjectGroup` / `ProjectHeader`)
 
-The Backlog renders one card per project, each project's tasks nested under
+Both columns render one card per project, each project's tasks nested under
 its own header, followed by every unfiled ("loose") task with no group header
-of its own — the migration path for every task that predates projects.
+of its own — the migration path for every task that predates projects. In
+the Today column the loose group is labelled `Unfiled` (see the mockup
+above).
 
 ```
 ▾ ● Q3 Launch                              4 open · 1 today   ＋ ⋯
@@ -55,7 +60,8 @@ of its own — the migration path for every task that predates projects.
 
 - `▾`/`▸` toggles collapse, persisted server-side via `setProjectCollapsed`
   (single-user local plugin — worth one column, costs nothing on reload).
-  Collapsed renders the header alone.
+  Collapsed renders the header alone. Collapse works in both columns and is
+  the one piece of header interaction Today keeps.
 - `●` opens the same `ColorSwatchPicker` tags already use; the colour reuses
   `TAG_COLORS`/`lib/tag-colors.ts`, so a project badge is legible in both
   themes with no new colour code.
@@ -68,8 +74,18 @@ of its own — the migration path for every task that predates projects.
   `AlertDialog`: deleting a project releases its tasks to loose (`project_id
   = NULL`); nothing is deleted.
 
-An empty (expanded) project shows only its add-row — projects are never
-auto-deleted, so an empty one just reads as a plan not yet written.
+An empty (expanded) project in the **Backlog** shows only its add-row —
+projects are never auto-deleted, so an empty one just reads as a plan not yet
+written. In the **Today** column an empty project group renders nothing at
+all: Today is an ephemeral view of what's due or scheduled right now, not a
+durable container, so a project with nothing in play today simply doesn't
+appear there. The Backlog never hides an empty group; Today always does.
+
+**Today's project headers are read-only, non-draggable labels.** The name and
+colour badge render and collapse still works, but rename / recolour / delete
+/ `＋` and project reordering live in the Backlog only — one editing surface
+per concept, and two independently-draggable orderings of the same
+`projects.sort_order` would fight each other for the same value.
 
 The Backlog's own add-row (`+ add to backlog`) doubles as the inline project
 creation entry point: typing `#Name` and pressing Enter creates a project
@@ -78,40 +94,84 @@ new project is deliberately out of scope for this change.)
 
 ## The trail line (`TrailLine`)
 
-A scheduled task's home never moves — Today is a flag, not a place (see the
-design doc's Core decision). Every Today row whose task has a project and/or
-a parent renders a second, muted line under it:
+A task's home never moves — Today is a filtered view over the Backlog's own
+rows, not a place a task relocates to (see the design doc's Core decision).
+`TrailLine` renders for exactly one live case: **a Today row whose parent is
+not also in Today.** Inside a project group it shows the parent segment
+only — the group header already names the project, so repeating it would be
+redundant:
+
+```
+⠿ ☐  Get legal sign-off                    added 1w ago   carried 1×  ▤ 🏷   ⋯
+     › Rewrite the onboarding email
+```
+
+In the loose/`Unfiled` group there is no header naming a project, so
+`TrailLine` keeps both segments:
 
 ```
 ⠿ ☐  Get legal sign-off                    added 1w ago   carried 1×  ▤ 🏷   ⋯
      ● Q3 Launch › Rewrite the onboarding email
 ```
 
-- Renders only when there is context to show — a loose top-level task gets no
-  second line, so most rows never gain height for nothing.
+- Renders only when there is context to show — a Today row whose parent is
+  also in Today, or a loose top-level task, gets no second line, so most
+  rows never gain height for nothing.
 - Truncates from the **left**, so the nearest ancestor (the most useful
   segment) survives: `● Q3 Launch › …boarding email`.
 - Each segment (the project badge, the parent title) is independently
   clickable: it scrolls the Backlog to that source row and flashes it.
-- Below `md` it collapses to the project badge alone (`● Q3 Launch`),
-  mirroring how `TagChips` already degrades — never JS measurement.
+- Below `md` it collapses to the project badge alone (`● Q3 Launch`) when
+  both segments are present, mirroring how `TagChips` already degrades —
+  never JS measurement.
+- Archive's use of `TrailLine`/`buildTrail` is unchanged by any of this — an
+  archived row still shows its full trail regardless of what's "in Today".
 
-## Ghost rows
+## The today marker
 
-A scheduled task stays visible in its project too, dimmed, its checkbox
-swapped for a hollow "ghost" glyph (`◌`) and a `· today` marker in place of
-the carried badge:
+Ghost rows are gone. A task that belongs to Today — whether dragged in or
+included automatically because it's due today or overdue — stays a **normal,
+undimmed, fully-interactive Backlog row**. The only visible sign is a subtle
+marker, rendered in the slot the carried badge already occupies:
 
 ```
-↳ ◌ Get legal sign-off              · today          added 1w ago    ▤ 🏷   ⋯
+⠿ ☐  Renew the domain                       ⌁ today       added 3d ago  in 3 days  ▤ 🏷 ＋ ⋯
+⠿ ☐  Get legal sign-off  carried 1×  ⌁ today               added 1w ago            ▤ 🏷   ⋯
 ```
 
-Once a ghost has carried 3 or more times, the marker also shows the count
-(`· today ~6`) — the same information a stalled effort's badge shows in
-Today, but sitting right next to the project it's stalling, not only in a day
-view that gets scrolled past. Clicking the `· today` marker unschedules the
-task: it snaps back to exactly the Backlog slot it never actually left,
-regardless of where it's dropped if unscheduled by dragging instead.
+- It is no longer either/or with the carried badge — a row can show **both**
+  `carried 1×` and the today marker at once, since a stalled task can also be
+  scheduled or due right now.
+- There are two visually distinct reasons a task carries the marker:
+  **manually scheduled** (dragged into Today) versus **auto-included**
+  (due today or overdue, no drag involved — `⌁ due today` / `⌁ overdue` in
+  the mockups above). The distinction matters because only the manual case
+  has a `bucket` to flip back; see the design doc for how removal is wired
+  for each.
+- Clicking the marker removes the task from Today: a manually-scheduled task
+  snaps back to `bucket='backlog'` (nothing about its Backlog slot moves,
+  since it never left); an auto-included task stays exactly as it is and is
+  simply excluded from the Today view until its due date or dismissal state
+  changes.
+
+## Two-column layout
+
+Wide (default): Backlog left, Today right, each independently scrollable —
+scrolling one never moves the other. Both columns sit inside a `@container`
+wrapper and share the single `DndContext` in `TodoPage.tsx`, so a drag
+between them is one continuous gesture, not a handoff between two surfaces.
+
+Narrow (below the container breakpoint): falls back to the stacked layout —
+sticky collapsible section headers, **Today first** — when space is scarce,
+execution beats planning.
+
+The breakpoint is a Tailwind v4 **container query** (`@container` /
+`@3xl:flex-row` or similar), never a viewport media query
+(`useMediaQuery`/browser width). A bb nav panel's width is independent of the
+browser viewport: a maximized window with a narrow panel must still stack,
+and a small window with a wide panel must still go side by side. The whole
+page must keep working at a 420px floor as one column, and two columns need
+roughly 2×340–380px plus a gap to be worth the split.
 
 Tag chips collapse responsively, mirroring the `hidden md:flex` / `flex
 md:hidden` breakpoint pair `AgeChip` already uses (two sibling elements, one

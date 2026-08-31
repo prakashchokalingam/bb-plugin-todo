@@ -257,6 +257,7 @@ function makeTask(overrides: Partial<TaskDto> & { id: string }): TaskDto {
     tags: [],
     projectId: null,
     trail: null,
+    inToday: false,
     ...overrides,
   };
 }
@@ -420,6 +421,43 @@ describe("TrailLine", () => {
     fireEvent.click(screen.getByText("Rewrite the onboarding email"));
     expect(onNavigateToParent).toHaveBeenCalledWith("tsk_1");
   });
+
+  it("hideProject suppresses the project badge, keeping the parent segment", () => {
+    const trail: TrailDto = {
+      projectId: "prj_1",
+      projectName: "Q3 Launch",
+      projectColor: "teal",
+      parentId: "tsk_1",
+      parentTitle: "Rewrite the onboarding email",
+    };
+    render(<TrailLine trail={trail} hideProject />);
+    expect(screen.queryByText("Q3 Launch")).toBeNull();
+    expect(screen.getAllByText("Rewrite the onboarding email").length).toBeGreaterThan(0);
+  });
+
+  it("hideProject with no parent context renders nothing (nothing left to show)", () => {
+    const trail: TrailDto = {
+      projectId: "prj_1",
+      projectName: "Q3 Launch",
+      projectColor: "teal",
+      parentId: null,
+      parentTitle: null,
+    };
+    const { container } = render(<TrailLine trail={trail} hideProject />);
+    expect(container.innerHTML).toBe("");
+  });
+
+  it("defaults hideProject to false — Archive's existing usage is unaffected", () => {
+    const trail: TrailDto = {
+      projectId: "prj_1",
+      projectName: "Q3 Launch",
+      projectColor: "teal",
+      parentId: "tsk_1",
+      parentTitle: "Rewrite the onboarding email",
+    };
+    render(<TrailLine trail={trail} />);
+    expect(screen.getAllByText("Q3 Launch").length).toBeGreaterThan(0);
+  });
 });
 
 describe("ProjectHeader", () => {
@@ -523,6 +561,48 @@ describe("ProjectHeader", () => {
     fireEvent.click(screen.getAllByText("Delete").slice(-1)[0]);
     expect(onDelete).toHaveBeenCalledTimes(1);
   });
+
+  it("variant='today' renders a read-only label: no colour picker, rename, add, or menu", () => {
+    render(
+      <ProjectHeader
+        project={makeProject({ id: "prj_1", name: "Q3 Launch", openCount: 3, todayCount: 2 })}
+        variant="today"
+        onToggleCollapsed={() => {}}
+      />,
+    );
+    expect(screen.getByText("Q3 Launch")).toBeTruthy();
+    expect(screen.getByText("3 open · 2 today")).toBeTruthy();
+    expect(screen.queryByLabelText('Change color for project "Q3 Launch"')).toBeNull();
+    expect(screen.queryByLabelText('Add task to "Q3 Launch"')).toBeNull();
+    expect(screen.queryByLabelText('More actions for project "Q3 Launch"')).toBeNull();
+    // The name is no longer an editable button — double-click does nothing.
+    fireEvent.doubleClick(screen.getByText("Q3 Launch"));
+    expect(screen.queryByLabelText("Rename project Q3 Launch")).toBeNull();
+  });
+
+  it("variant='today' still lets collapse work", () => {
+    const onToggleCollapsed = vi.fn();
+    render(
+      <ProjectHeader
+        project={makeProject({ id: "prj_1", collapsed: false })}
+        variant="today"
+        onToggleCollapsed={onToggleCollapsed}
+      />,
+    );
+    fireEvent.click(screen.getByLabelText('Collapse "Q3 Launch"'));
+    expect(onToggleCollapsed).toHaveBeenCalledTimes(1);
+  });
+
+  it("draggable=false renders a non-grab cursor on the header", () => {
+    const { container } = render(
+      <ProjectHeader
+        project={makeProject({ id: "prj_1" })}
+        draggable={false}
+        onToggleCollapsed={() => {}}
+      />,
+    );
+    expect(container.querySelector(".cursor-default")).toBeTruthy();
+  });
 });
 
 describe("ProjectGroup", () => {
@@ -565,7 +645,7 @@ describe("ProjectGroup", () => {
     expect(screen.getByPlaceholderText("add to Q3 Launch")).toBeTruthy();
   });
 
-  it("renders each task as a TaskRow, ghosting today-flagged tasks", () => {
+  it("renders every task as a normal row, marking only the inToday ones", () => {
     render(
       <DndContext>
         <ProjectGroup
@@ -577,6 +657,7 @@ describe("ProjectGroup", () => {
               title: "Get legal sign-off",
               bucket: "today",
               day: "2026-08-27",
+              inToday: true,
             }),
           ]}
           actions={makeActions()}
@@ -590,8 +671,109 @@ describe("ProjectGroup", () => {
     );
     expect(screen.getByText("Draft the copy")).toBeTruthy();
     expect(screen.getByText("Get legal sign-off")).toBeTruthy();
-    expect(screen.getByLabelText('Unschedule "Get legal sign-off"')).toBeTruthy();
-    expect(screen.queryByLabelText('Unschedule "Draft the copy"')).toBeNull();
+    // Both rows keep a real, interactive checkbox — no ghost swap.
+    expect(screen.getAllByRole("checkbox")).toHaveLength(2);
+    expect(screen.getByLabelText('Remove "Get legal sign-off" from Today')).toBeTruthy();
+    expect(screen.queryByLabelText('Remove "Draft the copy" from Today')).toBeNull();
+  });
+
+  it("variant='today' hides rename/colour/delete/add and skips the drag handle", () => {
+    render(
+      <DndContext>
+        <ProjectGroup
+          project={makeProject({ id: "prj_1", collapsed: false })}
+          variant="today"
+          tasks={[
+            makeTask({ id: "tsk_1", title: "Get legal sign-off", bucket: "today", inToday: true }),
+          ]}
+          actions={makeActions()}
+          onToggleCollapsed={() => {}}
+        />
+      </DndContext>,
+    );
+    expect(screen.getByText("Q3 Launch")).toBeTruthy();
+    expect(screen.queryByLabelText('Add task to "Q3 Launch"')).toBeNull();
+    expect(screen.queryByLabelText('More actions for project "Q3 Launch"')).toBeNull();
+    expect(screen.queryByLabelText('Change color for project "Q3 Launch"')).toBeNull();
+    expect(screen.queryByPlaceholderText(/add to/)).toBeNull();
+  });
+
+  it("variant='today' renders nothing when there are no tasks or orphan subtasks", () => {
+    render(
+      <DndContext>
+        <ProjectGroup
+          project={makeProject({ id: "prj_1", collapsed: false })}
+          variant="today"
+          tasks={[]}
+          actions={makeActions()}
+          onToggleCollapsed={() => {}}
+        />
+      </DndContext>,
+    );
+    // No project content at all — only dnd-kit's own hidden a11y scaffolding
+    // (DndContext's live region/instructions) is present.
+    expect(screen.queryByText("Q3 Launch")).toBeNull();
+    expect(document.querySelector("[data-project-id]")).toBeNull();
+  });
+
+  it("variant='today' still renders an empty project's header in the Backlog (unaffected)", () => {
+    render(
+      <DndContext>
+        <ProjectGroup
+          project={makeProject({ id: "prj_1", collapsed: false })}
+          tasks={[]}
+          actions={makeActions()}
+          onToggleCollapsed={() => {}}
+          onRenameProject={() => {}}
+          onChangeProjectColor={() => {}}
+          onDeleteProject={() => {}}
+          onAddTaskToProject={() => {}}
+        />
+      </DndContext>,
+    );
+    expect(screen.getByText("Q3 Launch")).toBeTruthy();
+    expect(screen.getByPlaceholderText("add to Q3 Launch")).toBeTruthy();
+  });
+
+  it("variant='today' renders orphanSubtasks standalone, after the nested tasks, with a trail", () => {
+    const trail: TrailDto = {
+      projectId: "prj_1",
+      projectName: "Q3 Launch",
+      projectColor: "teal",
+      parentId: "tsk_parent",
+      parentTitle: "Rewrite the onboarding email",
+    };
+    render(
+      <DndContext>
+        <ProjectGroup
+          project={makeProject({ id: "prj_1", collapsed: false })}
+          variant="today"
+          tasks={[
+            makeTask({ id: "tsk_nested", title: "Q3 planning doc", bucket: "today", inToday: true }),
+          ]}
+          orphanSubtasks={[
+            makeTask({
+              id: "tsk_orphan",
+              title: "Get legal sign-off",
+              parentId: "tsk_parent",
+              bucket: "today",
+              inToday: true,
+              trail,
+            }),
+          ]}
+          actions={makeActions()}
+          onToggleCollapsed={() => {}}
+        />
+      </DndContext>,
+    );
+    expect(screen.getByText("Q3 planning doc")).toBeTruthy();
+    expect(screen.getByText("Get legal sign-off")).toBeTruthy();
+    // The orphan's trail shows only the parent segment: hideProject
+    // suppresses the project badge since this group's own header already
+    // names "Q3 Launch". (TrailLine renders the parent segment twice —
+    // once per responsive breakpoint sibling — so use getAllByText.)
+    expect(screen.getAllByText("Rewrite the onboarding email").length).toBeGreaterThan(0);
+    expect(screen.queryAllByText("Q3 Launch")).toHaveLength(1); // the group header only
   });
 
   it("forwards a new-task title to onAddTaskToProject with the project id", () => {
@@ -674,56 +856,81 @@ describe("ProjectGroup", () => {
   });
 });
 
-describe("TaskRow — ghost state", () => {
-  it("renders dimmed with the ghost glyph and the '· today' marker", () => {
-    const task = makeTask({ id: "tsk_1", title: "Get legal sign-off", bucket: "today" });
-    renderWithDnd(<TaskRow task={task} actions={makeActions()} ghost />);
-    const row = screen.getByText("Get legal sign-off").closest("[data-ghost]");
-    expect(row).toBeTruthy();
-    expect(row?.className).toContain("opacity-60");
-    expect(screen.queryByRole("checkbox")).toBeNull();
-    expect(screen.getByText(/· today/)).toBeTruthy();
-  });
-
-  it("does not show the carry count below the threshold (carriedCount 2)", () => {
+describe("TaskRow — the Today marker (ghost rows deleted)", () => {
+  it("an inToday row keeps a real, interactive checkbox — never a ghost swap", () => {
     const task = makeTask({
       id: "tsk_1",
       title: "Get legal sign-off",
       bucket: "today",
-      carriedCount: 2,
+      inToday: true,
     });
-    renderWithDnd(<TaskRow task={task} actions={makeActions()} ghost />);
-    const marker = screen.getByLabelText('Unschedule "Get legal sign-off"');
-    expect(marker.textContent).not.toContain("~2");
-  });
-
-  it("shows the carry count once carriedCount >= 3", () => {
-    const task = makeTask({
-      id: "tsk_1",
-      title: "Get legal sign-off",
-      bucket: "today",
-      carriedCount: 3,
-    });
-    renderWithDnd(<TaskRow task={task} actions={makeActions()} ghost />);
-    const marker = screen.getByLabelText('Unschedule "Get legal sign-off"');
-    expect(marker.textContent).toContain("~3");
-  });
-
-  it("clicking the marker calls onUnschedule with the task id", () => {
-    const onUnschedule = vi.fn();
-    const task = makeTask({ id: "tsk_1", title: "Get legal sign-off", bucket: "today" });
-    renderWithDnd(
-      <TaskRow task={task} actions={makeActions()} ghost onUnschedule={onUnschedule} />,
-    );
-    fireEvent.click(screen.getByLabelText('Unschedule "Get legal sign-off"'));
-    expect(onUnschedule).toHaveBeenCalledWith("tsk_1");
-  });
-
-  it("a non-ghost row keeps the normal checkbox and no marker", () => {
-    const task = makeTask({ id: "tsk_1", title: "Ship the invoice fix", bucket: "today" });
     renderWithDnd(<TaskRow task={task} actions={makeActions()} />);
     expect(screen.getByRole("checkbox")).toBeTruthy();
-    expect(screen.queryByText(/· today/)).toBeNull();
+    const row = screen.getByText("Get legal sign-off").closest("[data-task-id]");
+    expect(row).toBeTruthy();
+    expect(row?.className).not.toContain("opacity-60");
+  });
+
+  it("shows a manual marker ('· today') for a manually scheduled row (bucket='today')", () => {
+    const task = makeTask({
+      id: "tsk_1",
+      title: "Get legal sign-off",
+      bucket: "today",
+      inToday: true,
+    });
+    renderWithDnd(<TaskRow task={task} actions={makeActions()} />);
+    expect(screen.getByLabelText('Remove "Get legal sign-off" from Today')).toBeTruthy();
+    expect(screen.getAllByText("· today").length).toBeGreaterThan(0);
+  });
+
+  it("shows an auto marker ('⌁ today') for an auto-included row (bucket='backlog', due today/overdue)", () => {
+    const task = makeTask({
+      id: "tsk_1",
+      title: "Renew the domain",
+      bucket: "backlog",
+      dueAt: 1,
+      inToday: true,
+    });
+    renderWithDnd(<TaskRow task={task} actions={makeActions()} />);
+    expect(screen.getByLabelText('Remove "Renew the domain" from Today')).toBeTruthy();
+    expect(screen.getAllByText("⌁ today").length).toBeGreaterThan(0);
+    expect(screen.queryAllByText("· today")).toHaveLength(0);
+  });
+
+  it("shows both the marker AND the carried badge at once — no longer either/or", () => {
+    const task = makeTask({
+      id: "tsk_1",
+      title: "Get legal sign-off",
+      bucket: "today",
+      inToday: true,
+      carriedCount: 2,
+    });
+    renderWithDnd(<TaskRow task={task} actions={makeActions()} />);
+    expect(screen.getByLabelText('Remove "Get legal sign-off" from Today')).toBeTruthy();
+    expect(screen.getByText("carried 2×")).toBeTruthy();
+  });
+
+  it("clicking the marker calls onRemoveFromToday with the task id", () => {
+    const onRemoveFromToday = vi.fn();
+    const task = makeTask({
+      id: "tsk_1",
+      title: "Get legal sign-off",
+      bucket: "today",
+      inToday: true,
+    });
+    renderWithDnd(
+      <TaskRow task={task} actions={makeActions()} onRemoveFromToday={onRemoveFromToday} />,
+    );
+    fireEvent.click(screen.getByLabelText('Remove "Get legal sign-off" from Today'));
+    expect(onRemoveFromToday).toHaveBeenCalledWith("tsk_1");
+  });
+
+  it("a row not in Today shows no marker", () => {
+    const task = makeTask({ id: "tsk_1", title: "Ship the invoice fix", inToday: false });
+    renderWithDnd(<TaskRow task={task} actions={makeActions()} />);
+    expect(screen.getByRole("checkbox")).toBeTruthy();
+    expect(screen.queryByText(/today/)).toBeNull();
+    expect(screen.queryByLabelText(/Remove .* from Today/)).toBeNull();
   });
 
   it("renders the trail line when showTrail is set and the task has trail context", () => {
@@ -738,6 +945,7 @@ describe("TaskRow — ghost state", () => {
       id: "tsk_1",
       title: "Get legal sign-off",
       bucket: "today",
+      inToday: true,
       trail,
     });
     renderWithDnd(<TaskRow task={task} actions={makeActions()} showTrail />);
@@ -751,5 +959,25 @@ describe("TaskRow — ghost state", () => {
     );
     // No trail content anywhere in the rendered row.
     expect(container.querySelector("[dir='rtl']")).toBeNull();
+  });
+
+  it("hideProject forwards to TrailLine, suppressing the project segment", () => {
+    const trail: TrailDto = {
+      projectId: "prj_1",
+      projectName: "Q3 Launch",
+      projectColor: "teal",
+      parentId: "tsk_parent",
+      parentTitle: "Rewrite the onboarding email",
+    };
+    const task = makeTask({
+      id: "tsk_1",
+      title: "Get legal sign-off",
+      bucket: "today",
+      inToday: true,
+      trail,
+    });
+    renderWithDnd(<TaskRow task={task} actions={makeActions()} showTrail hideProject />);
+    expect(screen.getAllByText("Rewrite the onboarding email").length).toBeGreaterThan(0);
+    expect(screen.queryByText("Q3 Launch")).toBeNull();
   });
 });

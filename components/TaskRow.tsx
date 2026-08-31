@@ -1,10 +1,16 @@
 // A single task row: drag handle, checkbox (routed through
 // useCompleteWithUndo, never completeTask directly), inline-editable title,
-// tag chips, ProgressRing when it has subtasks, a "carried Nx" badge, an
-// AgeChip (muted "added N ago" context, hidden below `sm` if the row is
-// tight), a DueChip, and always-visible inline icon actions (calendar, tags,
-// add-subtask, "..." menu), plus its own subtasks rendered indented beneath
-// it.
+// tag chips, ProgressRing when it has subtasks, a "carried Nx" badge, a
+// Today marker (whenever `task.inToday`), an AgeChip (muted "added N ago"
+// context, hidden below `sm` if the row is tight), a DueChip, and
+// always-visible inline icon actions (calendar, tags, add-subtask, "..."
+// menu), plus its own subtasks rendered indented beneath it.
+//
+// The row is ALWAYS a normal, undimmed, fully-interactive row — there is no
+// more "ghost" visual treatment. A task that qualifies for Today
+// (`task.inToday`) is distinguished only by its Today marker, and it can
+// render this same way in BOTH the Backlog and the Today column at once
+// (see `taskDragId` below).
 import { useState } from "react";
 import { useSortable } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
@@ -39,41 +45,54 @@ import { AddTaskRow } from "@/components/AddTaskRow";
 import { TrailLine } from "@/components/TrailLine";
 import type { BoardActions } from "@/components/Section";
 
-/** A ghost stays visible ~compact once it has been carried this many times,
- * per the design's "carried >= 3" ghost marker rule. */
-const GHOST_CARRY_THRESHOLD = 3;
-
 /**
- * A ghost's task id is deliberately identical to its scheduled Today
- * counterpart's — same row, two homes (design doc's "Today stops being a
- * place and becomes a flag"). That means the SAME `TaskDto.id` can be on
- * screen twice at once (the ghost in its project/Backlog, the flat entry in
- * Today), which would collide as a dnd-kit sortable/draggable id — dnd-kit
- * requires unique ids per `DndContext`. Ghost rows therefore drag under a
- * prefixed id instead of the bare task id; `data.taskId` (not dnd-kit's own
- * `id`) is what the business logic (`lib/drag.ts`) actually reads, so this
- * is purely a DOM/registry-uniqueness concern, invisible to the move math.
- * Every `SortableContext`'s `items` list must use this same function so
- * dnd-kit's internal id set matches what each row actually registers.
+ * A task that qualifies for Today (`task.inToday`) renders TWICE at once:
+ * once as a normal row in its Backlog home (project or loose list), and
+ * again as a normal row in the Today column's own project group — same
+ * `task.id`, two live DOM instances, both fully interactive. dnd-kit
+ * requires unique sortable/draggable ids within one `DndContext`, and the
+ * context spans both columns (they share one drag surface), so the second
+ * instance needs a distinct id or dnd-kit's internal registry collides.
+ *
+ * This is NOT a leftover of the deleted "ghost row" — ghosts dimmed a
+ * duplicate rendering, and this id-prefixing trick predates that and
+ * outlives it: the double-render it exists for is now MORE common than
+ * before (every `inToday` task appears in both columns side by side, not
+ * just carried-forward ones), not less. Do not remove the prefix when
+ * cleaning up ghost code; that would silently break drag the moment both
+ * columns render at once. `data.taskId` (not dnd-kit's own `id`) is what
+ * the business logic (`lib/drag.ts`) actually reads — this is purely a
+ * DOM/registry-uniqueness concern, invisible to the move math. Every
+ * `SortableContext`'s `items` list must use this same function so dnd-kit's
+ * internal id set matches what each row actually registers.
  */
-export function taskDragId(task: TaskDto, ghost: boolean): string {
-  return ghost ? `ghost:${task.id}` : task.id;
+export function taskDragId(task: TaskDto, inTodayColumn: boolean): string {
+  return inTodayColumn ? `today:${task.id}` : task.id;
 }
 
 export interface TaskRowProps {
   task: TaskDto;
   actions: BoardActions;
   indent?: boolean;
-  /** True when this row is a ghost: the task is scheduled (`bucket ===
-   * 'today'`) but rendered here inside its project body. Dims the row,
-   * swaps the checkbox for a ghost glyph, and shows a ". today" marker
-   * (plus the carry count once `carriedCount >= 3`). */
-  ghost?: boolean;
-  /** Fired when the ghost's ". today" marker is clicked, to unschedule it. */
-  onUnschedule?: (id: string) => void;
-  /** Renders the muted trail line (`# Project > Parent`) as a second line,
-   * for Today rows. `TrailLine` itself renders null with no context. */
+  /** True when this particular row instance is rendered in the Today
+   * column, as opposed to the Backlog column. Both columns can render the
+   * SAME task at once (whenever `task.inToday`) — this flag exists solely
+   * to give the two concurrent instances distinct dnd-kit ids (see
+   * `taskDragId`); it selects no visual treatment of its own, since rows no
+   * longer dim. */
+  inTodayColumn?: boolean;
+  /** Fired when the Today marker is clicked, to remove the task from
+   * Today. The caller routes this to either `moveTask` (bucket === 'today')
+   * or the `dismissFromToday` RPC (bucket === 'backlog', auto-included) —
+   * TaskRow itself stays agnostic of which. */
+  onRemoveFromToday?: (id: string) => void;
+  /** Renders the muted trail line (`# Project > Parent`) as a second line.
+   * `TrailLine` itself renders null with no context. */
   showTrail?: boolean;
+  /** Forwarded to `TrailLine`: suppress its project segment because the
+   * caller (a Today project group) already names the project via its own
+   * header. */
+  hideProject?: boolean;
   onNavigateToProject?: (projectId: string) => void;
   onNavigateToParent?: (parentId: string) => void;
 }
@@ -82,9 +101,10 @@ export function TaskRow({
   task,
   actions,
   indent = false,
-  ghost = false,
-  onUnschedule,
+  inTodayColumn = false,
+  onRemoveFromToday,
   showTrail = false,
+  hideProject = false,
   onNavigateToProject,
   onNavigateToParent,
 }: TaskRowProps) {
@@ -97,7 +117,7 @@ export function TaskRow({
 
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } =
     useSortable({
-      id: taskDragId(task, ghost),
+      id: taskDragId(task, inTodayColumn),
       data: { kind: "task", taskId: task.id, parentId: task.parentId, bucket: task.bucket },
     });
 
@@ -108,6 +128,12 @@ export function TaskRow({
 
   const isOver = actions.overId === task.id;
   const isTopLevel = task.parentId === null;
+  // Two distinct reasons a row can be in Today: manually scheduled, or
+  // auto-included by being due today/overdue. Both are surfaced by the
+  // same `inToday` bit, but the marker distinguishes them (design doc
+  // decision 5 — "auto-inclusion is derived", so the two are worth telling
+  // apart at a glance).
+  const isManuallyScheduled = task.bucket === "today";
 
   function startEdit() {
     setDraft(task.title);
@@ -139,11 +165,9 @@ export function TaskRow({
         ref={setNodeRef}
         style={style}
         data-task-id={task.id}
-        data-ghost={ghost || undefined}
         className={cn(
           "flex min-h-8 items-center gap-2 px-2 py-1",
           indent && "pl-8",
-          ghost && "opacity-60",
           isDragging && "opacity-50",
           isOver && "bg-muted/60 ring-1 ring-inset ring-primary",
         )}
@@ -158,20 +182,11 @@ export function TaskRow({
           <Icon name="DragDropVertical" className="size-3.5" aria-hidden="true" />
         </button>
 
-        {ghost ? (
-          <span
-            aria-hidden="true"
-            className="flex size-4 shrink-0 items-center justify-center text-muted-foreground"
-          >
-            <Icon name="CircleDashed" className="size-3.5" aria-hidden="true" />
-          </span>
-        ) : (
-          <Checkbox
-            checked={false}
-            onCheckedChange={() => actions.onToggleComplete(task)}
-            aria-label={`Mark "${task.title}" done`}
-          />
-        )}
+        <Checkbox
+          checked={false}
+          onCheckedChange={() => actions.onToggleComplete(task)}
+          aria-label={`Mark "${task.title}" done`}
+        />
 
         {editing ? (
           <input
@@ -199,22 +214,33 @@ export function TaskRow({
           <ProgressRing done={task.subtaskCounts.done} total={task.subtaskCounts.total} />
         )}
 
-        {ghost ? (
+        {/* Marker and carried badge are no longer either/or — a row can
+         * show both at once now that rows don't dim. Same reading-order
+         * slot the carried badge always occupied. */}
+        {task.inToday && (
           <button
             type="button"
-            onClick={() => onUnschedule?.(task.id)}
-            aria-label={`Unschedule "${task.title}"`}
+            onClick={() => onRemoveFromToday?.(task.id)}
+            aria-label={`Remove "${task.title}" from Today`}
             className="shrink-0 whitespace-nowrap text-[10px] text-muted-foreground hover:text-foreground focus-visible:text-foreground"
           >
-            · today
-            {task.carriedCount >= GHOST_CARRY_THRESHOLD ? ` ~${task.carriedCount}` : ""}
+            {/* Two sibling elements, one visible per breakpoint — never JS
+             * measurement, matching the AgeChip/TagChips idiom this file
+             * already relies on. Both are aria-hidden since the button's
+             * own aria-label already carries the accessible name. */}
+            <span aria-hidden="true" className="hidden sm:inline">
+              {isManuallyScheduled ? "· today" : "⌁ today"}
+            </span>
+            <span aria-hidden="true" className="sm:hidden">
+              {isManuallyScheduled ? "·" : "⌁"}
+            </span>
           </button>
-        ) : (
-          task.carriedCount > 0 && (
-            <Badge variant="secondary" className="whitespace-nowrap text-[10px]">
-              carried {task.carriedCount}×
-            </Badge>
-          )
+        )}
+
+        {task.carriedCount > 0 && (
+          <Badge variant="secondary" className="whitespace-nowrap text-[10px]">
+            carried {task.carriedCount}×
+          </Badge>
         )}
 
         <AgeChip
@@ -300,17 +326,17 @@ export function TaskRow({
       {showTrail && (
         <TrailLine
           trail={task.trail ?? null}
+          hideProject={hideProject}
           onNavigateToProject={onNavigateToProject}
           onNavigateToParent={onNavigateToParent}
         />
       )}
 
-      {/* Only ever reached in the Backlog: Today rows are genuinely flat
-       * (deviation #1, design doc) — `task.subtasks` is always `[]` there.
-       * A subtask independently scheduled into Today (its parent stays
-       * put, per invariant 4) renders here as a ghost, exactly like a
-       * scheduled top-level task ghosts inside its ProjectGroup — see the
-       * design mockup's `-> (.) Get legal sign-off  . today` row. */}
+      {/* Only ever reached in the Backlog tree (Today's project groups nest
+       * their own inToday-filtered subtasks the same way — `lib/todayView`
+       * already narrowed `task.subtasks` to inToday-only there, so this
+       * loop renders correctly in both columns without knowing which one
+       * it's in). */}
       {isTopLevel &&
         task.subtasks.map((sub) => (
           <TaskRow
@@ -318,8 +344,8 @@ export function TaskRow({
             task={sub}
             actions={actions}
             indent
-            ghost={sub.bucket === "today"}
-            onUnschedule={onUnschedule}
+            inTodayColumn={inTodayColumn}
+            onRemoveFromToday={onRemoveFromToday}
             onNavigateToProject={onNavigateToProject}
             onNavigateToParent={onNavigateToParent}
           />
