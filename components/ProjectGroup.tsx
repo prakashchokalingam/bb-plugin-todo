@@ -83,6 +83,10 @@ export function ProjectGroup({
   // registers with dnd-kit must be scoped by this, exactly like `TaskRow`'s
   // `taskDragId` already is for task rows.
   const column: Bucket = isBacklog ? "backlog" : "today";
+  // Collapse state is per-column — this instance must read (and, via the
+  // "+" reveal below, only ever expand) the bit that matches its own
+  // column, never the other column's rendered instance of the same project.
+  const isCollapsed = isBacklog ? project.collapsed : project.todayCollapsed;
 
   const { setNodeRef, isOver } = useDroppable({
     id: dropZoneId("project", column, project.id),
@@ -119,13 +123,14 @@ export function ProjectGroup({
   // add-task input. Bumping `addFocusToken` remounts `AddTaskRow` with
   // `autoFocus` — the same key-remount-to-refocus pattern documented on
   // `AddTaskRow`'s `autoFocus` prop — which also handles the "reveal" case
-  // for free: the row only exists in the DOM once `project.collapsed` flips
-  // to false, so its very first mount already carries the fresh token.
-  // Backlog-only: Today never shows this affordance.
+  // for free: the row only exists in the DOM once `isCollapsed` flips to
+  // false, so its very first mount already carries the fresh token.
+  // Backlog-only: Today never shows this affordance, so `isCollapsed` here
+  // always reads the Backlog bit (`project.collapsed`), never Today's.
   const [addFocusToken, setAddFocusToken] = useState(0);
 
   function handleHeaderAddClick() {
-    if (project.collapsed) onToggleCollapsed(project);
+    if (isCollapsed) onToggleCollapsed(project);
     setAddFocusToken((t) => t + 1);
     onHeaderAddClick?.();
   }
@@ -171,7 +176,7 @@ export function ProjectGroup({
         />
       </div>
 
-      {!project.collapsed && (
+      {!isCollapsed && (
         <div
           ref={setNodeRef}
           className={cn(isOver && "bg-muted/60 ring-1 ring-inset ring-primary")}

@@ -61,7 +61,13 @@ above).
 - `▾`/`▸` toggles collapse, persisted server-side via `setProjectCollapsed`
   (single-user local plugin — worth one column, costs nothing on reload).
   Collapsed renders the header alone. Collapse works in both columns and is
-  the one piece of header interaction Today keeps.
+  the one piece of header interaction Today keeps — but **each column's
+  collapse state is independent**: the Backlog and Today columns render the
+  same `ProjectDto` side by side, so collapsing a project in Today has no
+  effect on its Backlog card, and vice versa. Two server-side bits back
+  this (`ProjectDto.collapsed` for the Backlog, `.todayCollapsed` for
+  Today), and `setProjectCollapsed`'s `column` argument says which one a
+  given toggle writes.
 - `●` opens the same `ColorSwatchPicker` tags already use; the colour reuses
   `TAG_COLORS`/`lib/tag-colors.ts`, so a project badge is legible in both
   themes with no new colour code.

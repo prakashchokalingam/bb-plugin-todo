@@ -35,6 +35,7 @@ function makeProject(overrides: Partial<ProjectDto> & { id: string }): ProjectDt
     color: "teal",
     sortOrder: 1000,
     collapsed: false,
+    todayCollapsed: false,
     openCount: 0,
     todayCount: 0,
     overdueCount: 0,

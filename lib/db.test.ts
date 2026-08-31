@@ -638,6 +638,36 @@ describe("migration 16 — today_dismissed_day", () => {
     expect(row.today_order).toBe(4242.5);
     expect(row.today_dismissed_day).toBeNull();
   });
+
+  it("migration 17 applies cleanly against a pre-17 fixture and defaults existing projects to Today-expanded", () => {
+    const conn = new Database(":memory:");
+    conn.pragma("foreign_keys = ON");
+    // Fixture: the schema exactly as it shipped before this migration
+    // (statements 0-16) — mirrors the pre-16 fixture pattern above. A
+    // pre-existing project is collapsed in the Backlog (its only collapse
+    // bit at the time) to prove migration 17 doesn't disturb it.
+    for (const stmt of db.MIGRATIONS.slice(0, 17)) conn.exec(stmt);
+    conn.prepare(`INSERT INTO lists (id, name, sort_order, created_at) VALUES ('lst_1', 'Work', 1000, 0)`).run();
+    conn
+      .prepare(
+        `INSERT INTO projects (id, list_id, name, color, collapsed, sort_order, created_at)
+         VALUES ('prj_legacy', 'lst_1', 'Legacy project', 'blue', 1, 1000, 0)`,
+      )
+      .run();
+
+    // The actual upgrade path: apply migration 17 on top of the legacy fixture.
+    for (const stmt of db.MIGRATIONS.slice(17)) conn.exec(stmt);
+
+    const row = conn.prepare(`SELECT collapsed, today_collapsed FROM projects WHERE id = 'prj_legacy'`).get() as {
+      collapsed: number;
+      today_collapsed: number;
+    };
+    // The additive migration touches nothing that already existed...
+    expect(row.collapsed).toBe(1);
+    // ...and every existing project defaults to expanded in the column it
+    // never had an opinion about.
+    expect(row.today_collapsed).toBe(0);
+  });
 });
 
 describe("TODAY_MEMBERSHIP_SQL / isTodayMember agreement (drift guard)", () => {
@@ -844,9 +874,38 @@ describe("project CRUD", () => {
 
   it("setProjectCollapsed persists across reads", () => {
     const project = db.createProject(conn, { listId, name: "Q3 Launch", color: "blue" }, NOW);
-    db.setProjectCollapsed(conn, project.id, true);
+    db.setProjectCollapsed(conn, project.id, true, "backlog");
     const board = db.getBoard(conn, listId, NOW);
     expect(board.projects.find((p) => p.id === project.id)?.collapsed).toBe(true);
+  });
+
+  // Regression: collapse state must be independent per column. Before
+  // migration 17, both columns rendered the same single `collapsed` bit, so
+  // toggling one column's chevron silently toggled the other. `column`
+  // must route the write to exactly one of `collapsed` / `today_collapsed`,
+  // never both.
+  it("setProjectCollapsed writes only the given column's collapse bit, leaving the other untouched", () => {
+    const project = db.createProject(conn, { listId, name: "Q3 Launch", color: "blue" }, NOW);
+    expect(project.collapsed).toBe(false);
+    expect(project.todayCollapsed).toBe(false);
+
+    db.setProjectCollapsed(conn, project.id, true, "today");
+    let board = db.getBoard(conn, listId, NOW);
+    let found = board.projects.find((p) => p.id === project.id);
+    expect(found?.todayCollapsed).toBe(true);
+    expect(found?.collapsed).toBe(false); // backlog's bit is untouched
+
+    db.setProjectCollapsed(conn, project.id, true, "backlog");
+    board = db.getBoard(conn, listId, NOW);
+    found = board.projects.find((p) => p.id === project.id);
+    expect(found?.collapsed).toBe(true);
+    expect(found?.todayCollapsed).toBe(true); // still true from the prior call, not flipped back
+
+    db.setProjectCollapsed(conn, project.id, false, "today");
+    board = db.getBoard(conn, listId, NOW);
+    found = board.projects.find((p) => p.id === project.id);
+    expect(found?.todayCollapsed).toBe(false);
+    expect(found?.collapsed).toBe(true); // backlog's bit is still untouched by the today write
   });
 
   it("listProjects / getBoard.projects only returns projects for the active list", () => {

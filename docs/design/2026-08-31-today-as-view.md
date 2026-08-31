@@ -222,3 +222,40 @@ suite can observe rect distances the way `closestCenter` does at runtime.
 If the feel is wrong in practice, the mitigation is swapping collision
 strategies (e.g. a directional one), not a test — that's a real follow-up,
 not a scope failure of this change.
+
+## Correction (2026-08-31): collapse state must be per-column
+
+This doc originally shipped with a gap: "Today's headers are read-only
+mirrors: collapse works" (Deliberately out of scope, above) never said
+collapse state had to be per-column, and the implementation carried the
+predecessor doc's single `projects.collapsed` bit forward unchanged. Because
+both columns render the exact same `ProjectDto` for a project with
+qualifying tasks, that one bit was shared — collapsing a project in the
+Today column collapsed it in the Backlog too, and vice versa. A user
+reported this as the board "forgetting" their Backlog layout every time
+they tidied up Today.
+
+The fix (migration 17, `today_collapsed`) makes collapse a second,
+independent server-side column: `collapsed` is now specifically the
+Backlog's bit, `today_collapsed` is Today's, and `setProjectCollapsed`
+takes a `column: "backlog" | "today"` discriminator that writes exactly one
+of the two, never both. This is the same shape of fix the doc's own "Why
+`taskDragId`'s dual-id mechanism survived ghost removal" section already
+diagnosed for a different piece of state: **once a project or task can
+render in both columns at once, any state that describes "how this
+rendered instance looks right now" (collapse, dnd-kit sortable id) has to
+be per-column, or the two instances fight over one value.**
+
+This is deliberately *not* extended to task order. `today_order` was
+abandoned (see "Why `today_order` was abandoned" above) precisely because
+reordering is a fact about the row's position in the underlying list — the
+Backlog and Today columns are two filtered views of *one* order, so they
+must agree, and a user reordering Today is, by design, reordering the
+Backlog. Collapse is different in kind: it's not a fact about the task or
+project at all, it's a fact about how much of *this column* the user
+currently wants to see. Two views of one order share the order; two views
+of one project do not have to share how each view chooses to fold itself
+up. Migration 17 is additive and backfills nothing — `today_collapsed = 0`
+(expanded) is already correct for every project that existed before this
+correction, the same reasoning migration 16 used for
+`today_dismissed_day IS NULL`.

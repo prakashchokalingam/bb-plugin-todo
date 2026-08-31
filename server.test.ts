@@ -425,10 +425,13 @@ describe("server.ts rpc surface", () => {
     const collapsed = (await harness.callRpc("setProjectCollapsed", {
       id: updated.project.id,
       collapsed: true,
+      column: "backlog",
     })) as any;
     expect(collapsed.ok).toBe(true);
     const boardAfterCollapse = await getBoard(harness, listId);
-    expect(boardAfterCollapse.projects.find((p: any) => p.id === updated.project.id).collapsed).toBe(true);
+    const afterCollapse = boardAfterCollapse.projects.find((p: any) => p.id === updated.project.id);
+    expect(afterCollapse.collapsed).toBe(true);
+    expect(afterCollapse.todayCollapsed).toBe(false); // the other column's bit is untouched
 
     // Filing a task, then deleting the project, releases it to loose rather
     // than deleting it (invariant 6, exercised end-to-end through the RPC).
@@ -462,6 +465,46 @@ describe("server.ts rpc surface", () => {
     expect(signals.length).toBeGreaterThan(0);
     expect(signals.at(-1)?.channel).toBe("board");
     expect((signals.at(-1)?.payload as any).listId).toBe(board.activeListId);
+  });
+
+  // Regression for the reported bug: collapsing/expanding a project in one
+  // column silently collapsed/expanded it in the other, because both
+  // columns rendered the same single `collapsed` bit. `column` now routes
+  // the write to exactly one of `collapsed` / `todayCollapsed`.
+  it("setProjectCollapsed({ column }) writes only that column's collapse bit, over RPC, and still publishes board", async () => {
+    const { harness } = await setup();
+    const board = await getBoard(harness);
+    const listId = board.activeListId;
+    const project = (await harness.callRpc("createProject", { listId, name: "Q3 Launch", color: "blue" })) as any;
+    expect(project.project.collapsed).toBe(false);
+    expect(project.project.todayCollapsed).toBe(false);
+
+    const before = harness.realtimeSignals.length;
+    const todayCollapsed = (await harness.callRpc("setProjectCollapsed", {
+      id: project.project.id,
+      collapsed: true,
+      column: "today",
+    })) as any;
+    expect(todayCollapsed.ok).toBe(true);
+    const signals = harness.realtimeSignals.slice(before);
+    expect(signals.at(-1)?.channel).toBe("board");
+    expect((signals.at(-1)?.payload as any).listId).toBe(listId);
+
+    let board2 = await getBoard(harness, listId);
+    let found = board2.projects.find((p: any) => p.id === project.project.id);
+    expect(found.todayCollapsed).toBe(true);
+    expect(found.collapsed).toBe(false); // backlog's bit is untouched by a today write
+
+    // And the mirror: a backlog write leaves today's bit alone.
+    await harness.callRpc("setProjectCollapsed", {
+      id: project.project.id,
+      collapsed: true,
+      column: "backlog",
+    });
+    board2 = await getBoard(harness, listId);
+    found = board2.projects.find((p: any) => p.id === project.project.id);
+    expect(found.collapsed).toBe(true);
+    expect(found.todayCollapsed).toBe(true); // unchanged from the earlier today write, not reset
   });
 
   it("moveTask + projectId re-homes a task and its trail; a plain Backlog drop snaps it back to its own slot", async () => {

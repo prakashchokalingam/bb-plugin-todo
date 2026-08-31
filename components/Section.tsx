@@ -91,7 +91,10 @@ export interface SectionProps {
    * doesn't itself qualify — standalone, trailed rows in the "Unfiled" group. */
   looseOrphanSubtasks?: TaskDto[];
 
-  onToggleProjectCollapsed?: (project: ProjectDto) => void;
+  /** `column` is this Section's own `column` prop — collapse state is
+   * per-column (`ProjectDto.collapsed`/`todayCollapsed`), so the caller
+   * needs to know which one this toggle is for. */
+  onToggleProjectCollapsed?: (project: ProjectDto, column: Bucket) => void;
   /** Backlog-only. */
   onRenameProject?: (id: string, name: string) => void;
   onChangeProjectColor?: (id: string, color: TagColor) => void;
@@ -200,7 +203,7 @@ export function Section({
                 orphanSubtasks={orphanSubtasks}
                 actions={actions}
                 variant={column}
-                onToggleCollapsed={(p) => onToggleProjectCollapsed?.(p)}
+                onToggleCollapsed={(p) => onToggleProjectCollapsed?.(p, column)}
                 onRenameProject={(id, name) => onRenameProject?.(id, name)}
                 onChangeProjectColor={(id, color) => onChangeProjectColor?.(id, color)}
                 onDeleteProject={(id) => onDeleteProject?.(id)}

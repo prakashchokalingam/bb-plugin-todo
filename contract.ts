@@ -97,7 +97,12 @@ export interface ProjectDto {
   name: string;
   color: TagColor;
   sortOrder: number;
+  /** Collapse state is per-column (see `setProjectCollapsed`):
+   * `collapsed` is the Backlog column's own state, `todayCollapsed` is
+   * Today's — the same project renders in both columns at once, and
+   * collapsing it in one must never affect the other. */
   collapsed: boolean;
+  todayCollapsed: boolean;
   openCount: number;
   todayCount: number;
   overdueCount: number;
@@ -182,6 +187,7 @@ const projectDtoSchema = z
     color: z.enum(TAG_COLORS),
     sortOrder: z.number(),
     collapsed: z.boolean(),
+    todayCollapsed: z.boolean(),
     openCount: z.number().int(),
     todayCount: z.number().int(),
     overdueCount: z.number().int(),
@@ -374,7 +380,11 @@ export const rpcContract = defineRpcContract({
     output: z.object({ projects: z.array(projectDtoSchema) }).strict(),
   },
   setProjectCollapsed: {
-    input: z.object({ id: idSchema, collapsed: z.boolean() }).strict(),
+    // `column` says which of the two independent per-column bits this call
+    // writes — see `ProjectDto.collapsed`/`todayCollapsed`.
+    input: z
+      .object({ id: idSchema, collapsed: z.boolean(), column: z.enum(["backlog", "today"]) })
+      .strict(),
     output: z.object({ ok: z.literal(true) }).strict(),
   },
 });

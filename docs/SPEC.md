@@ -157,6 +157,8 @@ CREATE INDEX IF NOT EXISTS tasks_project_idx ON tasks (list_id, project_id, sort
 UPDATE tasks SET today_order = sort_order WHERE bucket = 'today';
 -- 16
 ALTER TABLE tasks ADD COLUMN today_dismissed_day TEXT;
+-- 17
+ALTER TABLE projects ADD COLUMN today_collapsed INTEGER NOT NULL DEFAULT 0;
 ```
 
 `projects.color` reuses `TAG_COLORS`/`lib/tag-colors.ts`, exactly like
@@ -170,6 +172,13 @@ and it is not re-runnable — get it right against a pre-migration fixture DB
 before shipping a change to it. Migration 16 is purely additive and
 backfills nothing: `today_dismissed_day IS NULL` means "never explicitly
 removed from Today", which is already correct for every existing row.
+Migration 17 is likewise purely additive with no backfill needed: collapse
+state is per-column — `projects.collapsed` (migration 10) is now
+specifically the BACKLOG column's collapse state, and `today_collapsed` is
+Today's. Both columns render the same `ProjectDto` at once, so a single
+shared bit meant collapsing a project in one column silently collapsed it
+in the other; `0` (expanded) is already the correct starting state for
+Today on every existing project.
 
 `project_id = NULL` means "loose" (unfiled); every task predating this
 feature gets that value automatically and renders exactly as before, below
@@ -268,7 +277,9 @@ TaskDto = {
 }
 ListDto = { id, name, sortOrder, openCount, overdueCount }
 ProjectDto = {
-  id, listId, name, color: TagColor, sortOrder: number, collapsed: boolean,
+  id, listId, name, color: TagColor, sortOrder: number,
+  collapsed: boolean,       // Backlog column's collapse state
+  todayCollapsed: boolean,  // Today column's collapse state, independent of the above
   openCount: number, todayCount: number, overdueCount: number,
 }
 ```
@@ -401,9 +412,14 @@ Methods:
   the bin, and never touches `parent_id`/`bucket`/`day`.
 - `reorderProjects({ listId, ids: string[] })` -> `{ projects: ProjectDto[] }`.
   Renumbers to `1000, 2000, …`, mirroring `reorderLists`/`reorderTags`.
-- `setProjectCollapsed({ id, collapsed: boolean })` -> `{ ok: true }`.
-  Server-side so collapse state survives a reload — single-user local
-  plugin, one column, no cost.
+- `setProjectCollapsed({ id, collapsed: boolean, column: 'backlog'|'today' })`
+  -> `{ ok: true }`. Server-side so collapse state survives a reload —
+  single-user local plugin, no cost. **Per-column, not shared**: `column`
+  says which of `ProjectDto.collapsed` (backlog) / `todayCollapsed` (today)
+  this call writes; the other field is never touched by the same call. This
+  matters because the Backlog and Today columns render the same
+  `ProjectDto` at once — without a discriminator, collapsing a project in
+  one column would silently collapse it in the other too.
 
 Tag name uniqueness is case-insensitive: `createTag`/`updateTag` throw
 `invalid_input: a tag named "…" already exists` on a collision, and

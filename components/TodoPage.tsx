@@ -486,11 +486,17 @@ export function TodoPage({ subPath }: TodoPageProps) {
     projects: current.projects.map((p) => (p.id === id ? { ...p, ...patch } : p)),
   });
 
-  const toggleProjectCollapsed = (project: ProjectDto) => {
-    const next = !project.collapsed;
-    patchBoard((current) => patchProjectLocal(current, project.id, { collapsed: next }));
-    void rpc.call("setProjectCollapsed", { id: project.id, collapsed: next }).catch((err) => {
-      patchBoard((current) => patchProjectLocal(current, project.id, { collapsed: !next }));
+  // Collapse state is per-column (ProjectDto.collapsed for backlog,
+  // .todayCollapsed for today) — `column` says which field this call reads
+  // and writes, so toggling a project's chevron in one column never
+  // touches the other's collapse state, even though both columns render
+  // the same ProjectDto at once.
+  const toggleProjectCollapsed = (project: ProjectDto, column: Bucket) => {
+    const field = column === "backlog" ? "collapsed" : "todayCollapsed";
+    const next = !project[field];
+    patchBoard((current) => patchProjectLocal(current, project.id, { [field]: next }));
+    void rpc.call("setProjectCollapsed", { id: project.id, collapsed: next, column }).catch((err) => {
+      patchBoard((current) => patchProjectLocal(current, project.id, { [field]: !next }));
       toast.error(err instanceof Error ? err.message : "Couldn't update project.");
     });
   };

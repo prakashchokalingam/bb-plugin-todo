@@ -188,8 +188,8 @@ export default async function plugin(bb: BbPluginApi) {
       return { projects };
     },
 
-    setProjectCollapsed({ id, collapsed }) {
-      const { listId } = db.setProjectCollapsed(conn, id, collapsed);
+    setProjectCollapsed({ id, collapsed, column }) {
+      const { listId } = db.setProjectCollapsed(conn, id, collapsed, column);
       publish(listId);
       return { ok: true as const };
     },

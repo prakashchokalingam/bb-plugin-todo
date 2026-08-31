@@ -63,7 +63,9 @@ export const MIGRATIONS: string[] = [
   );`,
   // 9
   `CREATE INDEX IF NOT EXISTS task_tags_tag_idx ON task_tags (tag_id);`,
-  // 10
+  // 10 — `collapsed` predates the two-column Backlog/Today split (migration
+  // 17 below adds Today's own `today_collapsed`); it is now specifically
+  // the BACKLOG column's collapse state, not a project-wide flag.
   `CREATE TABLE IF NOT EXISTS projects (
     id         TEXT PRIMARY KEY,
     list_id    TEXT NOT NULL REFERENCES lists(id) ON DELETE CASCADE,
@@ -89,6 +91,15 @@ export const MIGRATIONS: string[] = [
   // Purely additive, no backfill: NULL means "never dismissed", which is
   // already correct for every existing row.
   `ALTER TABLE tasks ADD COLUMN today_dismissed_day TEXT;`,
+  // 17 — collapse state is per-column, not shared: the Backlog and Today
+  // columns render the same `ProjectDto`, but a user collapsing a project
+  // in one column has no bearing on whether they want it collapsed in the
+  // other, so each column needs its own bit. `collapsed` (migration 10)
+  // keeps its existing meaning and is now specifically the BACKLOG
+  // column's collapse state; this column is Today's. Purely additive, no
+  // backfill: default 0 (expanded) is already the correct starting state
+  // for every existing project.
+  `ALTER TABLE projects ADD COLUMN today_collapsed INTEGER NOT NULL DEFAULT 0;`,
 ];
 
 interface ListRow {
@@ -125,6 +136,7 @@ interface ProjectRow {
   name: string;
   color: TagColor;
   collapsed: number;
+  today_collapsed: number;
   sort_order: number;
   created_at: number;
 }
@@ -489,6 +501,7 @@ function projectRowToDto(row: ProjectRow, counts: { open: number; today: number;
     color: row.color,
     sortOrder: row.sort_order,
     collapsed: !!row.collapsed,
+    todayCollapsed: !!row.today_collapsed,
     openCount: counts.open,
     todayCount: counts.today,
     overdueCount: counts.overdue,
@@ -1218,11 +1231,24 @@ export function reorderProjects(db: Database.Database, listId: string, ids: stri
   })();
 }
 
-export function setProjectCollapsed(db: Database.Database, id: string, collapsed: boolean): { listId: string } {
+/**
+ * Collapse state is per-column (migration 17): the Backlog and Today
+ * columns render the same `ProjectDto`, so `column` says which of the two
+ * independent bits — `collapsed` (backlog) or `today_collapsed` (today) —
+ * this call touches. Exactly one column is ever written; the other is left
+ * untouched, so collapsing a project in one view never affects the other.
+ */
+export function setProjectCollapsed(
+  db: Database.Database,
+  id: string,
+  collapsed: boolean,
+  column: "backlog" | "today",
+): { listId: string } {
   return db.transaction(() => {
     const row = getProjectRow(db, id);
     if (!row) throw new Error("not_found: project not found");
-    db.prepare(`UPDATE projects SET collapsed = ? WHERE id = ?`).run(collapsed ? 1 : 0, id);
+    const sqlColumn = column === "backlog" ? "collapsed" : "today_collapsed";
+    db.prepare(`UPDATE projects SET ${sqlColumn} = ? WHERE id = ?`).run(collapsed ? 1 : 0, id);
     return { listId: row.list_id };
   })();
 }

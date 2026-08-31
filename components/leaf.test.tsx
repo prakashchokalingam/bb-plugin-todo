@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { DndContext } from "@dnd-kit/core";
 import { AgeChip } from "./AgeChip";
 import { DueChip } from "./DueChip";
@@ -269,6 +269,7 @@ function makeProject(overrides: Partial<ProjectDto> & { id: string }): ProjectDt
     color: "teal",
     sortOrder: 1000,
     collapsed: false,
+    todayCollapsed: false,
     openCount: 0,
     todayCount: 0,
     overdueCount: 0,
@@ -853,6 +854,71 @@ describe("ProjectGroup", () => {
     fireEvent.click(screen.getByLabelText('Add task to "Q3 Launch"'));
 
     expect(document.activeElement).toBe(screen.getByPlaceholderText("add to Q3 Launch"));
+  });
+
+  // Regression for the reported bug: the Backlog and Today columns render
+  // the SAME project (and, for a task that's inToday, the same task) at
+  // once — a task visible in both columns is exactly the shape `taskDragId`
+  // exists for (see the design doc's "Why taskDragId's dual-id mechanism
+  // survived ghost removal"). Collapse state used to be a single server
+  // column shared by both renders, so toggling the chevron in one column's
+  // instance silently toggled the other's too. This harness renders both
+  // instances of one project side by side, each with its own collapse
+  // field (`collapsed` for backlog, `todayCollapsed` for today), and proves
+  // they're now independent.
+  it("collapsing a project in the Today column leaves the Backlog column's same project expanded, and vice versa", () => {
+    function Harness() {
+      const [collapsed, setCollapsed] = useState(false);
+      const [todayCollapsed, setTodayCollapsed] = useState(false);
+      const project = makeProject({ id: "prj_1", collapsed, todayCollapsed, openCount: 1, todayCount: 1 });
+      const task = makeTask({ id: "tsk_1", title: "Shared task", bucket: "today", inToday: true });
+      return (
+        <DndContext>
+          <div data-testid="backlog-column">
+            <ProjectGroup
+              project={project}
+              tasks={[task]}
+              actions={makeActions()}
+              variant="backlog"
+              onToggleCollapsed={() => setCollapsed((c) => !c)}
+              onRenameProject={() => {}}
+              onChangeProjectColor={() => {}}
+              onDeleteProject={() => {}}
+              onAddTaskToProject={() => {}}
+            />
+          </div>
+          <div data-testid="today-column">
+            <ProjectGroup
+              project={project}
+              tasks={[task]}
+              actions={makeActions()}
+              variant="today"
+              onToggleCollapsed={() => setTodayCollapsed((c) => !c)}
+            />
+          </div>
+        </DndContext>
+      );
+    }
+    render(<Harness />);
+
+    const backlogColumn = screen.getByTestId("backlog-column");
+    const todayColumn = screen.getByTestId("today-column");
+
+    // Both columns start expanded — the shared task's title is visible twice.
+    expect(screen.getAllByText("Shared task")).toHaveLength(2);
+
+    // Collapse Today only.
+    fireEvent.click(within(todayColumn).getByLabelText('Collapse "Q3 Launch"'));
+    // Today's row is gone; the Backlog's identical row is untouched.
+    expect(within(todayColumn).queryByText("Shared task")).toBeNull();
+    expect(within(backlogColumn).getByText("Shared task")).toBeTruthy();
+    expect(within(backlogColumn).getByLabelText('Collapse "Q3 Launch"')).toBeTruthy(); // still expanded
+
+    // Re-expand Today, then collapse Backlog instead — the mirror case.
+    fireEvent.click(within(todayColumn).getByLabelText('Expand "Q3 Launch"'));
+    fireEvent.click(within(backlogColumn).getByLabelText('Collapse "Q3 Launch"'));
+    expect(within(backlogColumn).queryByText("Shared task")).toBeNull();
+    expect(within(todayColumn).getByText("Shared task")).toBeTruthy();
   });
 });
 

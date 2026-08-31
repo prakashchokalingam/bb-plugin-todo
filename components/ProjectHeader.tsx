@@ -65,6 +65,9 @@ export function ProjectHeader({
   onAddTask,
 }: ProjectHeaderProps) {
   const isBacklog = variant === "backlog";
+  // Collapse state is per-column — read the field that matches this
+  // header's own variant, never the other column's bit.
+  const isCollapsed = isBacklog ? project.collapsed : project.todayCollapsed;
   const [renaming, setRenaming] = useState(false);
   const [draft, setDraft] = useState(project.name);
   const [colorOpen, setColorOpen] = useState(false);
@@ -98,11 +101,11 @@ export function ProjectHeader({
       <button
         type="button"
         onClick={onToggleCollapsed}
-        aria-label={project.collapsed ? `Expand "${project.name}"` : `Collapse "${project.name}"`}
+        aria-label={isCollapsed ? `Expand "${project.name}"` : `Collapse "${project.name}"`}
         className="shrink-0 text-muted-foreground hover:text-foreground focus-visible:text-foreground"
       >
         <Icon
-          name={project.collapsed ? "ChevronRight" : "ChevronDown"}
+          name={isCollapsed ? "ChevronRight" : "ChevronDown"}
           className="size-3.5"
           aria-hidden="true"
         />
