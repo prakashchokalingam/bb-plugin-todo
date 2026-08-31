@@ -76,6 +76,7 @@ function makeTask(overrides: Partial<TaskDto> = {}): TaskDto {
     tags: [],
     projectId: null,
     trail: null,
+    inToday: false,
     ...overrides,
   };
 }
@@ -157,7 +158,7 @@ describe("OverdueAccessory", () => {
           getBoard: () => ({
             lists: [],
             activeListId: "lst_1",
-            today: { day: "2026-08-20", planned: 0, completed: 0, tasks: [] },
+            today: { day: "2026-08-20", planned: 0, completed: 0 },
             backlog: { total: 0, overdue: 0, tasks: [] },
             totalOverdue: 5,
             serverNow: Date.now(),
@@ -179,7 +180,7 @@ describe("OverdueAccessory", () => {
           getBoard: () => ({
             lists: [],
             activeListId: "lst_1",
-            today: { day: "2026-08-20", planned: 0, completed: 0, tasks: [] },
+            today: { day: "2026-08-20", planned: 0, completed: 0 },
             backlog: { total: 0, overdue: 0, tasks: [] },
             totalOverdue: 0,
             serverNow: Date.now(),
@@ -318,7 +319,7 @@ describe("ArchivePanel", () => {
               { id: "lst_1", name: "Work", sortOrder: 1000, openCount: 0, overdueCount: 0 },
             ],
             activeListId: "lst_1",
-            today: { day: "2026-08-20", planned: 0, completed: 0, tasks: [] },
+            today: { day: "2026-08-20", planned: 0, completed: 0 },
             backlog: { total: 0, overdue: 0, tasks: [] },
             totalOverdue: 0,
             serverNow: Date.now(),
@@ -358,7 +359,7 @@ describe("ArchivePanel", () => {
               { id: "lst_1", name: "Work", sortOrder: 1000, openCount: 0, overdueCount: 0 },
             ],
             activeListId: "lst_1",
-            today: { day: "2026-08-20", planned: 0, completed: 0, tasks: [] },
+            today: { day: "2026-08-20", planned: 0, completed: 0 },
             backlog: { total: 0, overdue: 0, tasks: [] },
             totalOverdue: 0,
             serverNow: Date.now(),
@@ -402,7 +403,7 @@ describe("ArchivePanel", () => {
               { id: "lst_1", name: "Work", sortOrder: 1000, openCount: 0, overdueCount: 0 },
             ],
             activeListId: "lst_1",
-            today: { day: "2026-08-20", planned: 0, completed: 0, tasks: [] },
+            today: { day: "2026-08-20", planned: 0, completed: 0 },
             backlog: { total: 0, overdue: 0, tasks: [] },
             totalOverdue: 0,
             serverNow: Date.now(),
@@ -449,7 +450,7 @@ describe("ArchivePanel", () => {
               { id: "lst_1", name: "Work", sortOrder: 1000, openCount: 0, overdueCount: 0 },
             ],
             activeListId: "lst_1",
-            today: { day: "2026-08-20", planned: 0, completed: 0, tasks: [] },
+            today: { day: "2026-08-20", planned: 0, completed: 0 },
             backlog: { total: 0, overdue: 0, tasks: [] },
             totalOverdue: 0,
             serverNow: Date.now(),
@@ -617,16 +618,22 @@ describe("board nav panel (app.tsx)", () => {
               { id: "lst_1", name: "Work", sortOrder: 1000, openCount: 1, overdueCount: 0 },
             ],
             activeListId: "lst_1",
-            today: {
-              day: "2026-08-20",
-              planned: 1,
-              completed: 0,
-              tasks: [makeTask({ status: "open", bucket: "today" })],
+            today: { day: "2026-08-20", planned: 1, completed: 0 },
+            // The task lives in `backlog.tasks` (the one comprehensive tree
+            // since Phase 2) with `bucket: "today"` + `inToday: true`; the
+            // Today column derives its own grouped view from this same row
+            // via `lib/todayView`'s `selectTodayView` rather than trusting a
+            // separate `today.tasks` array, which no longer exists on the
+            // wire.
+            backlog: {
+              total: 1,
+              overdue: 0,
+              tasks: [makeTask({ status: "open", bucket: "today", inToday: true })],
             },
-            backlog: { total: 0, overdue: 0, tasks: [] },
             totalOverdue: 0,
             serverNow: Date.now(),
             tags: [],
+            projects: [],
           }),
         } as never,
       },
@@ -634,7 +641,12 @@ describe("board nav panel (app.tsx)", () => {
 
     await waitFor(() => {
       expect(screen.getByText(/backlog/i)).toBeTruthy();
-      expect(screen.getByText(/today/i)).toBeTruthy();
+      // The row is `inToday`, so it renders in both columns — once as a
+      // plain Backlog row and again under the Today heading — plus its own
+      // "· today" marker text, so more than one node now matches /today/i.
+      // The column heading itself is exact, so assert on it specifically
+      // rather than the ambiguous substring match.
+      expect(screen.getByText("TODAY · Thu 20 Aug")).toBeTruthy();
     });
   });
 
@@ -654,11 +666,12 @@ describe("board nav panel (app.tsx)", () => {
               { id: "lst_1", name: "Work", sortOrder: 1000, openCount: 0, overdueCount: 0 },
             ],
             activeListId: "lst_1",
-            today: { day: "2026-08-20", planned: 0, completed: 0, tasks: [] },
+            today: { day: "2026-08-20", planned: 0, completed: 0 },
             backlog: { total: 0, overdue: 0, tasks: [] },
             totalOverdue: 0,
             serverNow: Date.now(),
             tags: [],
+            projects: [],
           }),
           createTask: (input: unknown) => ({
             task: makeTask({ status: "open", ...(input as object) }),
@@ -698,16 +711,16 @@ describe("board nav panel (app.tsx)", () => {
               { id: "lst_1", name: "Work", sortOrder: 1000, openCount: 1, overdueCount: 0 },
             ],
             activeListId: "lst_1",
-            today: {
-              day: "2026-08-20",
-              planned: 1,
-              completed: 0,
-              tasks: [makeTask({ id: "tsk_open", status: "open" })],
+            today: { day: "2026-08-20", planned: 1, completed: 0 },
+            backlog: {
+              total: 1,
+              overdue: 0,
+              tasks: [makeTask({ id: "tsk_open", status: "open", inToday: true })],
             },
-            backlog: { total: 0, overdue: 0, tasks: [] },
             totalOverdue: 0,
             serverNow: Date.now(),
             tags: [],
+            projects: [],
           }),
           completeTask: () => ({ completedIds: ["tsk_open"] }),
         } as never,
@@ -715,7 +728,12 @@ describe("board nav panel (app.tsx)", () => {
     );
 
     // Same here: wait for the row to paint before clicking its checkbox.
-    const checkbox = await screen.findByRole("checkbox", { name: /standup/i });
+    // The task is `inToday`, so (per Phase 4's model) it renders once in the
+    // Backlog column and again in the Today column — two real, equally
+    // interactive checkboxes for the same task id. Either one calls
+    // `completeTask` with the same id, so the first match is as good as any.
+    await waitFor(() => screen.getAllByRole("checkbox", { name: /standup/i }));
+    const checkbox = screen.getAllByRole("checkbox", { name: /standup/i })[0];
     fireEvent.click(checkbox);
 
     await waitFor(() => {

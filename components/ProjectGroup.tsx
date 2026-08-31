@@ -25,6 +25,7 @@ import { CSS } from "@dnd-kit/utilities";
 import { useState } from "react";
 import type { ProjectDto, TagColor, TaskDto } from "@/contract";
 import { cn } from "@/lib/utils";
+import { dropZoneId, type Bucket } from "@/lib/drag";
 import { ProjectHeader } from "@/components/ProjectHeader";
 import { TaskRow, taskDragId } from "@/components/TaskRow";
 import { AddTaskRow } from "@/components/AddTaskRow";
@@ -76,19 +77,28 @@ export function ProjectGroup({
   onNavigateToParent,
 }: ProjectGroupProps) {
   const isBacklog = variant === "backlog";
+  // Which column this particular rendered instance belongs to — the same
+  // project can be on screen twice at once (its Backlog card and, whenever
+  // it has qualifying tasks, its Today card), so every id this component
+  // registers with dnd-kit must be scoped by this, exactly like `TaskRow`'s
+  // `taskDragId` already is for task rows.
+  const column: Bucket = isBacklog ? "backlog" : "today";
 
   const { setNodeRef, isOver } = useDroppable({
-    id: `project-${project.id}`,
-    data: { kind: "project", projectId: project.id },
+    id: dropZoneId("project", column, project.id),
+    data: { kind: "project", projectId: project.id, column },
   });
 
-  // The header row itself is the sortable/drop entity for BOTH "project
-  // header -> project header: reorder projects" (source) and "task ->
-  // project header: re-home" (target, via `over.data.current.kind ===
-  // "project"`) — the same id serves both roles. Called unconditionally
-  // (rules of hooks), but its ref/attributes/listeners are only ever wired
-  // into the DOM for variant="backlog" below: Today's header is a plain,
-  // non-draggable label, with no `projects.sort_order` write path.
+  // The header row itself is the sortable/drop entity for "project header ->
+  // project header: reorder projects" (source) and, in the Backlog, also a
+  // valid re-home drop target. Called unconditionally (rules of hooks), but
+  // its ref/attributes/listeners are only ever wired into the DOM for
+  // variant="backlog" below: Today's header is a plain, non-draggable label,
+  // with no `projects.sort_order` write path. Today's header id is still
+  // given a column-scoped, non-`project.id` value so it can never collide
+  // with the same project's Backlog header registration when both are
+  // mounted at once — reordering itself only ever reads `data.projectId`,
+  // never this raw dnd-kit id, so the id's exact shape is free to differ.
   const {
     attributes,
     listeners,
@@ -96,7 +106,10 @@ export function ProjectGroup({
     transform,
     transition,
     isDragging,
-  } = useSortable({ id: project.id, data: { kind: "project", projectId: project.id } });
+  } = useSortable({
+    id: isBacklog ? project.id : `today-header:${project.id}`,
+    data: { kind: "project", projectId: project.id },
+  });
   const headerStyle: React.CSSProperties = {
     transform: CSS.Transform.toString(transform),
     transition,

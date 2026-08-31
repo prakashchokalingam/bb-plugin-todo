@@ -12,7 +12,7 @@ import type { ListDto, ProjectDto, TagDto, TaskDto, rpcContract } from "@/contra
 export interface BoardData {
   lists: ListDto[];
   activeListId: string;
-  today: { day: string; planned: number; completed: number; tasks: TaskDto[] };
+  today: { day: string; planned: number; completed: number };
   backlog: { total: number; overdue: number; tasks: TaskDto[] };
   totalOverdue: number;
   serverNow: number;

@@ -96,6 +96,7 @@ function makeTask(overrides: Partial<TaskDto> & { id: string; title: string }): 
     tags: [],
     projectId: null,
     trail: null,
+    inToday: false,
     ...overrides,
   };
 }
@@ -135,7 +136,7 @@ describe("TodoPage — keyboard drag (dnd-kit KeyboardSensor)", () => {
               { id: "lst_1", name: "Work", sortOrder: 1000, openCount: 2, overdueCount: 0 },
             ],
             activeListId: "lst_1",
-            today: { day: "2026-08-20", planned: 0, completed: 0, tasks: [] },
+            today: { day: "2026-08-20", planned: 0, completed: 0 },
             backlog: {
               total: 2,
               overdue: 0,
@@ -147,6 +148,7 @@ describe("TodoPage — keyboard drag (dnd-kit KeyboardSensor)", () => {
             totalOverdue: 0,
             serverNow: Date.now(),
             tags: [],
+            projects: [],
           }),
           moveTask: () => ({ ok: true as const }),
         } as never,
@@ -219,7 +221,7 @@ describe("TodoPage — optimistic drag (destination visible before the RPC round
     return {
       lists: [{ id: "lst_1", name: "Work", sortOrder: 1000, openCount: 2, overdueCount: 0 }],
       activeListId: "lst_1",
-      today: { day: "2026-08-20", planned: 0, completed: 0, tasks: [] },
+      today: { day: "2026-08-20", planned: 0, completed: 0 },
       backlog: {
         total: 2,
         overdue: 0,
@@ -231,6 +233,7 @@ describe("TodoPage — optimistic drag (destination visible before the RPC round
       totalOverdue: 0,
       serverNow: Date.now(),
       tags: [],
+      projects: [],
     };
   }
 
@@ -252,11 +255,12 @@ describe("TodoPage — optimistic drag (destination visible before the RPC round
     return {
       lists: [{ id: "lst_1", name: "Work", sortOrder: 1000, openCount: 2, overdueCount: 0 }],
       activeListId: "lst_1",
-      today: { day: "2026-08-20", planned: 0, completed: 0, tasks: [] },
+      today: { day: "2026-08-20", planned: 0, completed: 0 },
       backlog: { total: 1, overdue: 0, tasks: [b] },
       totalOverdue: 0,
       serverNow: Date.now(),
       tags: [],
+      projects: [],
     };
   }
 
@@ -408,7 +412,7 @@ describe("TodoPage — tags", () => {
     return {
       lists: [{ id: "lst_1", name: "Work", sortOrder: 1000, openCount: 1, overdueCount: 0 }],
       activeListId: "lst_1",
-      today: { day: "2026-08-20", planned: 0, completed: 0, tasks: [] },
+      today: { day: "2026-08-20", planned: 0, completed: 0 },
       backlog: {
         total: 1,
         overdue: 0,
@@ -417,6 +421,7 @@ describe("TodoPage — tags", () => {
       totalOverdue: 0,
       serverNow: Date.now(),
       tags: tagCatalog(),
+      projects: [],
     };
   }
 
@@ -794,11 +799,15 @@ describe("TodoPage — tags", () => {
  * keyboard-drag technique (`stubSequentialRects` + dnd-kit's KeyboardSensor)
  * as the "TodoPage — keyboard drag" describe block above.
  *
- * A subtlety this suite surfaces and fixes (not merely tests around): a
- * ghost row and its scheduled Today counterpart share the same `TaskDto.id`
- * by design (design doc's "same row, two homes") — which used to collide as
- * a duplicate dnd-kit sortable id whenever both were mounted at once. See
- * `taskDragId` in `TaskRow.tsx`.
+ * Phase 4 rewrite: ghost rows are gone. A task that qualifies for Today
+ * (`task.inToday`) renders as a normal, fully-interactive row in BOTH
+ * columns at once — no dimming, no swapped checkbox — distinguished only by
+ * its today marker. The subtlety this suite surfaces and fixes (not merely
+ * tests around) survives that rewrite unchanged: the same `TaskDto.id` on
+ * screen twice at once used to collide as a duplicate dnd-kit sortable id;
+ * `taskDragId` (`TaskRow.tsx`) still exists to prevent exactly that, and (b)
+ * below plus the "same task, both columns" suite further down exercise it
+ * directly, through real gestures, not just by reading the source.
  */
 describe("TodoPage — projects & trail (end-to-end drag + render)", () => {
   beforeEach(() => {
@@ -824,7 +833,7 @@ describe("TodoPage — projects & trail (end-to-end drag + render)", () => {
     return {
       lists: [{ id: "lst_1", name: "Work", sortOrder: 1000, openCount: 2, overdueCount: 0 }],
       activeListId: "lst_1",
-      today: { day: "2026-08-27", planned: 0, completed: 0, tasks: [] },
+      today: { day: "2026-08-27", planned: 0, completed: 0 },
       backlog: { total: 1, overdue: 0, tasks: [parent] },
       totalOverdue: 0,
       serverNow: Date.now(),
@@ -833,34 +842,26 @@ describe("TodoPage — projects & trail (end-to-end drag + render)", () => {
     };
   }
 
-  /** The server's authoritative board after `moveTask` schedules the
-   * subtask: it's flat in Today (with its trail) AND still ghosted in its
-   * project (bucket:"today" on the home copy too — design doc's "the task
-   * renders in Today with its trail, and stays visible — ghosted — in its
-   * project"). */
+  /**
+   * The server's authoritative board after `moveTask` schedules the
+   * subtask. Since Phase 2, the Backlog is the one comprehensive tree: the
+   * SAME subtask row (`bucket: "today"`, `inToday: true`, its `trail` now
+   * populated) is nested under its parent here — that single row is what
+   * both columns render from. `lib/todayView`'s `selectTodayView` derives
+   * Today's copy from it: because the PARENT doesn't itself qualify
+   * (`tsk_parent.inToday` is false — never scheduled, never due), the
+   * subtask surfaces in Today as a standalone, trailed "orphan" row inside
+   * the `Q3 Launch` project group, per `TodayProjectGroup.orphanSubtasks`.
+   */
   function scheduledSubtaskBoard() {
-    const ghostSub = makeTask({
+    const sub = makeTask({
       id: "tsk_sub",
       title: "Get legal sign-off",
       parentId: "tsk_parent",
       projectId: "prj_1",
       bucket: "today",
       day: "2026-08-27",
-    });
-    const parent = makeTask({
-      id: "tsk_parent",
-      title: "Rewrite the onboarding email",
-      projectId: "prj_1",
-      subtasks: [ghostSub],
-      subtaskCounts: { total: 1, done: 0 },
-    });
-    const flatSub = makeTask({
-      id: "tsk_sub",
-      title: "Get legal sign-off",
-      parentId: "tsk_parent",
-      projectId: "prj_1",
-      bucket: "today",
-      day: "2026-08-27",
+      inToday: true,
       trail: {
         projectId: "prj_1",
         projectName: "Q3 Launch",
@@ -869,10 +870,17 @@ describe("TodoPage — projects & trail (end-to-end drag + render)", () => {
         parentTitle: "Rewrite the onboarding email",
       },
     });
+    const parent = makeTask({
+      id: "tsk_parent",
+      title: "Rewrite the onboarding email",
+      projectId: "prj_1",
+      subtasks: [sub],
+      subtaskCounts: { total: 1, done: 0 },
+    });
     return {
       lists: [{ id: "lst_1", name: "Work", sortOrder: 1000, openCount: 2, overdueCount: 0 }],
       activeListId: "lst_1",
-      today: { day: "2026-08-27", planned: 1, completed: 0, tasks: [flatSub] },
+      today: { day: "2026-08-27", planned: 1, completed: 0 },
       backlog: { total: 1, overdue: 0, tasks: [parent] },
       totalOverdue: 0,
       serverNow: Date.now(),
@@ -910,15 +918,15 @@ describe("TodoPage — projects & trail (end-to-end drag + render)", () => {
     // block above: a real macrotask, not a microtask, must elapse before
     // its own keydown listener exists.
     await new Promise((resolve) => setTimeout(resolve, 0));
-    // Empirically, landing the Today section's own (initially empty)
+    // Empirically, landing the Today column's own (initially empty)
     // droppable from a Backlog subtask takes several ArrowDown hops through
     // every intervening sortable/droppable (project header, sibling rows,
-    // the project body, the loose-task row, both section containers) —
+    // the project body, the loose-task row, both column containers) —
     // dnd-kit's `sortableKeyboardCoordinates` walks its droppable registry
     // one candidate at a time. 15 presses lands reliably past all of them
-    // onto the empty Today section and stays there (verified stable across
-    // a 12-30 press range), without needing to hand-compute dnd-kit's
-    // internal measurement order.
+    // onto the empty Today column and stays there (verified stable across a
+    // wide press range), without needing to hand-compute dnd-kit's internal
+    // measurement order.
     for (let i = 0; i < 15; i++) {
       fireEvent.keyDown(grip, { key: "ArrowDown", code: "ArrowDown" });
       await new Promise((resolve) => setTimeout(resolve, 0));
@@ -949,43 +957,44 @@ describe("TodoPage — projects & trail (end-to-end drag + render)", () => {
     });
 
     // The server's authoritative post-move board (this test's `getBoard`
-    // stub's second response) renders the scheduled row in Today with its
-    // trail as a second line: `# Q3 Launch > Rewrite the onboarding email`.
-    // `TrailLine` renders the project badge and parent segment twice (an
-    // `md:flex`/`md:hidden` responsive pair — see TrailLine.tsx), so
-    // `getAllByText` rather than `getByText`.
+    // stub's second response) renders the scheduled subtask as an orphan row
+    // inside Today's own "Q3 Launch" project group, with the parent's title
+    // as its trail's second line. "Q3 Launch" itself now comes from that
+    // group's OWN header (Today's `ProjectHeader`), not from `TrailLine` —
+    // `TrailLine` suppresses the project segment inside a project group
+    // (`hideProject`), since the header right above it already names it —
+    // so it appears at least twice on screen either way (once per column's
+    // copy of the project).
     await waitFor(() => {
       expect(screen.getAllByText("Q3 Launch").length).toBeGreaterThan(0);
     });
     expect(screen.getAllByText("Rewrite the onboarding email").length).toBeGreaterThan(0);
   });
 
-  it("(b) the subtask remains visible, ghosted, in its project after being scheduled", async () => {
+  it("(b) the subtask remains a normal, fully-interactive row in its project after being scheduled", async () => {
     await dragSubtaskIntoToday();
 
-    // Ghosted: the project's own copy of the subtask is still on screen
-    // (dimmed, checkbox swapped for the ghost glyph, "· today" marker) —
-    // "stays visible — ghosted — in its project" (design doc's Core
-    // decision). The ghost's marker doubles as the unschedule affordance.
+    // No more ghosts: the project's own (Backlog) copy of the subtask is
+    // still on screen as a real, undimmed row — the today marker is the
+    // ONLY visible sign it's scheduled, not a dimmed row with a swapped
+    // checkbox. Its marker button doubles as the removal affordance.
     await waitFor(() => {
-      expect(screen.getByLabelText('Unschedule "Get legal sign-off"')).toBeTruthy();
+      expect(screen.getAllByLabelText('Remove "Get legal sign-off" from Today').length).toBe(2);
     });
-    const ghostRow = screen
-      .getByLabelText('Unschedule "Get legal sign-off"')
-      .closest('[data-task-id="tsk_sub"]');
-    expect(ghostRow).toBeTruthy();
-    expect(ghostRow?.getAttribute("data-ghost")).toBe("true");
+    // Two full rows, not one real + one ghost: the drag handle (a real,
+    // interactive control only a live row has) exists for BOTH the Backlog
+    // instance and the Today instance.
+    expect(screen.getAllByLabelText('Reorder "Get legal sign-off"').length).toBe(2);
 
-    // The parent itself is untouched: still a normal (non-ghost) Backlog
-    // row, still showing the "add a subtask" affordance only top-level rows
-    // get — proving invariant 4 (scheduling a subtask never drags its
-    // parent into Today).
+    // The parent itself is untouched: still showing the "add a subtask"
+    // affordance only top-level rows get — proving invariant 4 (scheduling
+    // a subtask never drags its parent into Today).
     expect(
       screen.getByLabelText('Add a subtask to "Rewrite the onboarding email"'),
     ).toBeTruthy();
   });
 
-  it("(c) dragging it back to the Backlog snaps it home to its original slot, not the drop position", async () => {
+  it("(c) dragging its Today instance back to the Backlog snaps it home, without colliding with its own Backlog instance", async () => {
     const app = await loadPluginApp(() => import("@/app"));
     const board = app.navPanels.find((p) => p.id === "board");
     if (!board) throw new Error("app.tsx has not registered the 'board' navPanel yet");
@@ -1005,9 +1014,15 @@ describe("TodoPage — projects & trail (end-to-end drag + render)", () => {
       expect(screen.getAllByText("Get legal sign-off").length).toBeGreaterThan(0);
     });
 
-    // Two rows share this label: the ghost (inside the project, in the
-    // Backlog) and the flat Today row. Today renders after the Backlog in
-    // the DOM, so it's the last match.
+    // Two rows share this label at once: the Backlog instance (nested under
+    // its project) and the Today instance (the standalone orphan row) — the
+    // exact "same task, two live DOM instances" situation `taskDragId`
+    // exists for (`TaskRow.tsx`). Today renders after the Backlog in the
+    // DOM, so it's the last match. Grabbing and dropping THIS one (not the
+    // Backlog one) is the real-gesture proof that dnd-kit's id registry
+    // doesn't collide the two: if it did, this drag would either move the
+    // wrong instance or silently no-op instead of producing the snap-home
+    // `moveTask` call asserted below.
     const grips = screen.getAllByLabelText('Reorder "Get legal sign-off"');
     const todayGrip = grips[grips.length - 1];
     todayGrip.focus();
@@ -1034,6 +1049,11 @@ describe("TodoPage — projects & trail (end-to-end drag + render)", () => {
     // unchanged (still "tsk_parent"), and `projectId` is omitted (moveTask's
     // "omit = unchanged"), so the subtask returns to exactly the slot it
     // already lived in, not wherever the pointer/focus happened to land.
+    // This is also the `id` the id-collision proof above hinges on: had the
+    // Backlog instance moved instead, this input's `id` would still read
+    // "tsk_sub" (same task) but the drop math — computed from whichever DOM
+    // row dnd-kit actually tracked as "active" — would differ from what a
+    // correct Today-column drag produces.
     const moves = view.inspection.rpcCalls.filter((c) => c.method === "moveTask");
     expect(moves[0].input).toEqual({
       id: "tsk_sub",
@@ -1056,6 +1076,7 @@ describe("TodoPage — projects & trail (end-to-end drag + render)", () => {
       projectId: "prj_1",
       bucket: "today",
       day: "2026-08-27",
+      inToday: true,
       carriedCount: 6,
       trail: {
         projectId: "prj_1",
@@ -1064,6 +1085,19 @@ describe("TodoPage — projects & trail (end-to-end drag + render)", () => {
         parentId: "tsk_parent",
         parentTitle: "Rewrite the onboarding email",
       },
+    });
+    // `carried`'s parent must itself be reachable from `backlog.tasks` for
+    // `selectTodayView` to find it at all — since Phase 2 there is no
+    // separate flat `today.tasks` array to short-circuit through; the
+    // parent doesn't itself qualify for Today (never scheduled, never due),
+    // so `carried` surfaces as a standalone, trailed orphan row exactly like
+    // (a)/(b)'s subtask above.
+    const parent = makeTask({
+      id: "tsk_parent",
+      title: "Rewrite the onboarding email",
+      projectId: "prj_1",
+      subtasks: [carried],
+      subtaskCounts: { total: 1, done: 0 },
     });
 
     renderSlot(
@@ -1074,8 +1108,8 @@ describe("TodoPage — projects & trail (end-to-end drag + render)", () => {
           getBoard: () => ({
             lists: [{ id: "lst_1", name: "Work", sortOrder: 1000, openCount: 1, overdueCount: 0 }],
             activeListId: "lst_1",
-            today: { day: "2026-08-27", planned: 1, completed: 0, tasks: [carried] },
-            backlog: { total: 0, overdue: 0, tasks: [] },
+            today: { day: "2026-08-27", planned: 1, completed: 0 },
+            backlog: { total: 1, overdue: 0, tasks: [parent] },
             totalOverdue: 0,
             serverNow: Date.now(),
             tags: [],
@@ -1085,18 +1119,399 @@ describe("TodoPage — projects & trail (end-to-end drag + render)", () => {
       },
     );
 
-    await waitFor(() => screen.getByText("Draft the copy"));
+    await waitFor(() => screen.getAllByText("Draft the copy"));
 
-    // The existing "carried Nx" badge (unrelated to the ghost's separate
-    // "carried >= 3" marker, which only applies to a ghost row rendered
-    // inside its project) survives a task also having a trail — the two
-    // features coexist on the same row rather than one crowding out the
-    // other.
-    expect(screen.getByText("carried 6×")).toBeTruthy();
-    // The full trail — both the project badge and the parent segment —
-    // still renders as the row's second line, regardless of how many times
-    // it's been carried.
+    // The "carried Nx" badge survives a task also having a today marker and
+    // a trail — the today marker is no longer either/or with the carried
+    // badge (both features coexist on the same row).
+    expect(screen.getAllByText("carried 6×").length).toBeGreaterThan(0);
+    // The full trail — both the project (via the group's own header) and
+    // the parent segment (via `TrailLine`) — still renders regardless of
+    // how many times the task's been carried.
     expect(screen.getAllByText("Q3 Launch").length).toBeGreaterThan(0);
     expect(screen.getAllByText("Rewrite the onboarding email").length).toBeGreaterThan(0);
+  });
+});
+
+/**
+ * Coverage for the design doc's "one new question" (Data plan): an
+ * auto-included task (never manually scheduled — `bucket` stays
+ * `'backlog'`, `inToday` true purely from its due date) has no `bucket`
+ * flag for `moveTask` to clear, so dragging its TODAY instance out of Today
+ * must dispatch `dismissFromToday` instead — never `moveTask` — while
+ * dragging its BACKLOG instance is an entirely ordinary reorder that must
+ * NOT dismiss it. Both gestures exercise the exact same on-screen situation
+ * as the suite above (the same task, two live rows at once), so they double
+ * as further real-gesture proof that `taskDragId`'s column-scoped ids don't
+ * collide — this time on a task that was never dragged INTO Today at all,
+ * only ever auto-included.
+ */
+describe("TodoPage — dismissing vs. reordering an auto-included task", () => {
+  beforeEach(() => {
+    stubSequentialRects();
+  });
+
+  /** `tsk_auto` is due today (so `inToday: true` with `bucket` still
+   * "backlog" — the auto-included case), loose (no project, to keep the DOM
+   * simple and the keyboard-drag press counts stable), with a plain sibling
+   * loose task, `tsk_other`, purely as a Backlog reorder target. */
+  function autoIncludedBoard() {
+    return {
+      lists: [{ id: "lst_1", name: "Work", sortOrder: 1000, openCount: 2, overdueCount: 0 }],
+      activeListId: "lst_1",
+      today: { day: "2026-08-27", planned: 1, completed: 0 },
+      backlog: {
+        total: 2,
+        overdue: 0,
+        tasks: [
+          makeTask({
+            id: "tsk_auto",
+            title: "Renew the domain",
+            bucket: "backlog",
+            inToday: true,
+            dueAt: new Date("2026-08-27T10:00:00").getTime(),
+          }),
+          makeTask({ id: "tsk_other", title: "Buy stamps", bucket: "backlog" }),
+        ],
+      },
+      totalOverdue: 0,
+      serverNow: new Date("2026-08-27T09:00:00").getTime(),
+      tags: [],
+      projects: [],
+    };
+  }
+
+  it("dragging the Today instance into the Backlog column calls dismissFromToday, never moveTask", async () => {
+    const app = await loadPluginApp(() => import("@/app"));
+    const board = app.navPanels.find((p) => p.id === "board");
+    if (!board) throw new Error("app.tsx has not registered the 'board' navPanel yet");
+
+    const view = renderSlot(
+      { component: board.component },
+      { subPath: "" },
+      {
+        rpc: {
+          getBoard: () => autoIncludedBoard(),
+          dismissFromToday: () => ({ ok: true as const }),
+          moveTask: () => ({ ok: true as const }),
+        } as never,
+      },
+    );
+
+    await waitFor(() => {
+      expect(screen.getAllByText("Renew the domain").length).toBeGreaterThan(0);
+    });
+
+    // Two live rows for the same task: the Backlog instance and the Today
+    // instance (Today's "Unfiled" loose group, since this task is loose).
+    // Grab the SECOND — the Today one, rendered after the Backlog in the
+    // DOM — and hop it once. Empirically (verified against several
+    // press counts), dnd-kit's `sortableKeyboardCoordinates` wraps a single
+    // ArrowDown from the last sortable in its registry back onto the first
+    // droppable candidate, which — with only two loose tasks per column in
+    // this fixture — lands on the Backlog column's own body. A larger press
+    // count instead walks back into a Today-column target and re-enters
+    // Today (an ordinary reorder there), the opposite of what this test
+    // means to exercise.
+    const grips = screen.getAllByLabelText('Reorder "Renew the domain"');
+    const todayGrip = grips[grips.length - 1];
+    todayGrip.focus();
+    fireEvent.keyDown(todayGrip, { key: " ", code: "Space" });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    fireEvent.keyDown(todayGrip, { key: "ArrowDown", code: "ArrowDown" });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    fireEvent.keyDown(todayGrip, { key: " ", code: "Space" });
+
+    await waitFor(() => {
+      const dismisses = view.inspection.rpcCalls.filter((c) => c.method === "dismissFromToday");
+      expect(dismisses.length).toBeGreaterThan(0);
+    });
+
+    expect(
+      view.inspection.rpcCalls.filter((c) => c.method === "dismissFromToday")[0].input,
+    ).toEqual({ id: "tsk_auto" });
+    // The one thing this whole test exists to prove: no `moveTask` at all —
+    // there's no `bucket` flag on an auto-included task for it to clear.
+    expect(view.inspection.rpcCalls.some((c) => c.method === "moveTask")).toBe(false);
+  });
+
+  it("reordering the SAME task's Backlog instance among Backlog siblings is an ordinary reorder, not a dismissal", async () => {
+    const app = await loadPluginApp(() => import("@/app"));
+    const board = app.navPanels.find((p) => p.id === "board");
+    if (!board) throw new Error("app.tsx has not registered the 'board' navPanel yet");
+
+    const view = renderSlot(
+      { component: board.component },
+      { subPath: "" },
+      {
+        rpc: {
+          getBoard: () => autoIncludedBoard(),
+          dismissFromToday: () => ({ ok: true as const }),
+          moveTask: () => ({ ok: true as const }),
+        } as never,
+      },
+    );
+
+    await waitFor(() => {
+      expect(screen.getAllByText("Renew the domain").length).toBeGreaterThan(0);
+    });
+
+    // This time grab the FIRST instance — the Backlog one — and nudge it
+    // past its own sibling, entirely within the Backlog column.
+    const grips = screen.getAllByLabelText('Reorder "Renew the domain"');
+    const backlogGrip = grips[0];
+    backlogGrip.focus();
+    fireEvent.keyDown(backlogGrip, { key: " ", code: "Space" });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    fireEvent.keyDown(backlogGrip, { key: "ArrowDown", code: "ArrowDown" });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    fireEvent.keyDown(backlogGrip, { key: " ", code: "Space" });
+
+    await waitFor(() => {
+      const moves = view.inspection.rpcCalls.filter((c) => c.method === "moveTask");
+      expect(moves.length).toBeGreaterThan(0);
+    });
+
+    // An ordinary Backlog-to-Backlog reorder: `bucket` stays "backlog", and
+    // — the assertion this test exists for — no dismissal was triggered by
+    // merely moving the task's OWN Backlog row among its Backlog siblings.
+    expect(view.inspection.rpcCalls.some((c) => c.method === "dismissFromToday")).toBe(false);
+    const moves = view.inspection.rpcCalls.filter((c) => c.method === "moveTask");
+    expect(moves[0].input).toMatchObject({ id: "tsk_auto", bucket: "backlog" });
+  });
+});
+
+/**
+ * `removeFromToday` (`TodoPage.tsx`) is the today marker's click handler —
+ * the non-drag route to the same two outcomes the suite above exercises via
+ * a gesture. Routed purely off `task.bucket`, per the design doc's "two
+ * write paths".
+ */
+describe("TodoPage — the today marker's click routes to the right RPC", () => {
+  it("clicking the marker on a manually-scheduled task calls moveTask (snap-home), not dismissFromToday", async () => {
+    const app = await loadPluginApp(() => import("@/app"));
+    const board = app.navPanels.find((p) => p.id === "board");
+    if (!board) throw new Error("app.tsx has not registered the 'board' navPanel yet");
+
+    const view = renderSlot(
+      { component: board.component },
+      { subPath: "" },
+      {
+        rpc: {
+          getBoard: () => ({
+            lists: [{ id: "lst_1", name: "Work", sortOrder: 1000, openCount: 1, overdueCount: 0 }],
+            activeListId: "lst_1",
+            today: { day: "2026-08-27", planned: 1, completed: 0 },
+            backlog: {
+              total: 1,
+              overdue: 0,
+              tasks: [
+                makeTask({
+                  id: "tsk_scheduled",
+                  title: "Ship the invoice fix",
+                  bucket: "today",
+                  day: "2026-08-27",
+                  inToday: true,
+                }),
+              ],
+            },
+            totalOverdue: 0,
+            serverNow: Date.now(),
+            tags: [],
+            projects: [],
+          }),
+          moveTask: () => ({ ok: true as const }),
+          dismissFromToday: () => ({ ok: true as const }),
+        } as never,
+      },
+    );
+
+    await waitFor(() => {
+      expect(screen.getAllByLabelText('Remove "Ship the invoice fix" from Today').length).toBe(2);
+    });
+    fireEvent.click(
+      screen.getAllByLabelText('Remove "Ship the invoice fix" from Today')[0],
+    );
+
+    await waitFor(() => {
+      expect(view.inspection.rpcCalls.some((c) => c.method === "moveTask")).toBe(true);
+    });
+    expect(view.inspection.rpcCalls.find((c) => c.method === "moveTask")?.input).toEqual({
+      id: "tsk_scheduled",
+      bucket: "backlog",
+      parentId: null,
+      beforeId: null,
+      afterId: null,
+    });
+    expect(view.inspection.rpcCalls.some((c) => c.method === "dismissFromToday")).toBe(false);
+  });
+
+  it("clicking the marker on an auto-included task calls dismissFromToday, not moveTask", async () => {
+    const app = await loadPluginApp(() => import("@/app"));
+    const board = app.navPanels.find((p) => p.id === "board");
+    if (!board) throw new Error("app.tsx has not registered the 'board' navPanel yet");
+
+    const view = renderSlot(
+      { component: board.component },
+      { subPath: "" },
+      {
+        rpc: {
+          getBoard: () => ({
+            lists: [{ id: "lst_1", name: "Work", sortOrder: 1000, openCount: 1, overdueCount: 0 }],
+            activeListId: "lst_1",
+            today: { day: "2026-08-27", planned: 1, completed: 0 },
+            backlog: {
+              total: 1,
+              overdue: 0,
+              tasks: [
+                makeTask({
+                  id: "tsk_due",
+                  title: "Renew the domain",
+                  bucket: "backlog",
+                  inToday: true,
+                  dueAt: new Date("2026-08-27T10:00:00").getTime(),
+                }),
+              ],
+            },
+            totalOverdue: 0,
+            serverNow: new Date("2026-08-27T09:00:00").getTime(),
+            tags: [],
+            projects: [],
+          }),
+          moveTask: () => ({ ok: true as const }),
+          dismissFromToday: () => ({ ok: true as const }),
+        } as never,
+      },
+    );
+
+    await waitFor(() => {
+      expect(screen.getAllByLabelText('Remove "Renew the domain" from Today').length).toBe(2);
+    });
+    fireEvent.click(screen.getAllByLabelText('Remove "Renew the domain" from Today')[0]);
+
+    await waitFor(() => {
+      expect(view.inspection.rpcCalls.some((c) => c.method === "dismissFromToday")).toBe(true);
+    });
+    expect(view.inspection.rpcCalls.find((c) => c.method === "dismissFromToday")?.input).toEqual({
+      id: "tsk_due",
+    });
+    expect(view.inspection.rpcCalls.some((c) => c.method === "moveTask")).toBe(false);
+  });
+});
+
+/**
+ * The Today column's own grouping/hiding behaviour (`lib/todayView.ts`'s
+ * unit tests already cover the pure derivation exhaustively; this proves
+ * `TodoPage`/`Section`/`ProjectGroup` actually render what it derives).
+ */
+describe("TodoPage — Today column rendering", () => {
+  it("groups by project and hides a project with nothing qualifying for Today", async () => {
+    const app = await loadPluginApp(() => import("@/app"));
+    const board = app.navPanels.find((p) => p.id === "board");
+    if (!board) throw new Error("app.tsx has not registered the 'board' navPanel yet");
+
+    const busyProject = makeProject({ id: "prj_busy", name: "Q3 Launch", color: "teal" });
+    const quietProject = makeProject({ id: "prj_quiet", name: "Someday", color: "slate" });
+
+    renderSlot(
+      { component: board.component },
+      { subPath: "" },
+      {
+        rpc: {
+          getBoard: () => ({
+            lists: [{ id: "lst_1", name: "Work", sortOrder: 1000, openCount: 2, overdueCount: 0 }],
+            activeListId: "lst_1",
+            today: { day: "2026-08-27", planned: 1, completed: 0 },
+            backlog: {
+              total: 2,
+              overdue: 0,
+              tasks: [
+                makeTask({
+                  id: "tsk_busy",
+                  title: "Get legal sign-off",
+                  projectId: "prj_busy",
+                  bucket: "today",
+                  day: "2026-08-27",
+                  inToday: true,
+                }),
+                // Nothing in "Someday" qualifies for Today — it must not
+                // render a group there at all (unlike the Backlog, which
+                // never hides an empty project).
+                makeTask({
+                  id: "tsk_quiet",
+                  title: "Eventually reorganize the garage",
+                  projectId: "prj_quiet",
+                }),
+              ],
+            },
+            totalOverdue: 0,
+            serverNow: Date.now(),
+            tags: [],
+            projects: [busyProject, quietProject],
+          }),
+        } as never,
+      },
+    );
+
+    await waitFor(() => {
+      expect(screen.getAllByText("Q3 Launch").length).toBeGreaterThan(0);
+    });
+    // "Someday" still renders once, for its Backlog card — but never a
+    // second time for an (empty, hidden) Today card.
+    expect(screen.getAllByText("Someday").length).toBe(1);
+  });
+
+  it("shows a parent trail for an orphan subtask under the loose/Unfiled group", async () => {
+    const app = await loadPluginApp(() => import("@/app"));
+    const board = app.navPanels.find((p) => p.id === "board");
+    if (!board) throw new Error("app.tsx has not registered the 'board' navPanel yet");
+
+    const sub = makeTask({
+      id: "tsk_sub",
+      title: "Ship the invoice fix",
+      parentId: "tsk_parent",
+      bucket: "today",
+      day: "2026-08-27",
+      inToday: true,
+      trail: {
+        projectId: null,
+        projectName: null,
+        projectColor: null,
+        parentId: "tsk_parent",
+        parentTitle: "Q4 invoicing cleanup",
+      },
+    });
+    const parent = makeTask({
+      id: "tsk_parent",
+      title: "Q4 invoicing cleanup",
+      subtasks: [sub],
+      subtaskCounts: { total: 1, done: 0 },
+    });
+
+    renderSlot(
+      { component: board.component },
+      { subPath: "" },
+      {
+        rpc: {
+          getBoard: () => ({
+            lists: [{ id: "lst_1", name: "Work", sortOrder: 1000, openCount: 1, overdueCount: 0 }],
+            activeListId: "lst_1",
+            today: { day: "2026-08-27", planned: 1, completed: 0 },
+            backlog: { total: 1, overdue: 0, tasks: [parent] },
+            totalOverdue: 0,
+            serverNow: Date.now(),
+            tags: [],
+            projects: [],
+          }),
+        } as never,
+      },
+    );
+
+    // The loose group in Today is labelled "Unfiled" (see Section.tsx and
+    // the UX doc's mockup), and the orphan subtask's trail names its parent
+    // (no project segment — this task is loose, so there's nothing to hide
+    // OR to show on that side).
+    await waitFor(() => screen.getByText("Unfiled"));
+    expect(screen.getAllByText("Q4 invoicing cleanup").length).toBeGreaterThan(0);
   });
 });
