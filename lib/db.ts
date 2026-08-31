@@ -3,7 +3,7 @@
 // bb-specific concerns (kv, realtime, background scheduling).
 import type Database from "better-sqlite3";
 import type { ListDto, ProjectDto, TagColor, TagDto, TagRefDto, TaskDto, TrailDto } from "../contract.js";
-import { localDay } from "./day.js";
+import { localDay, startOfNextLocalDay } from "./day.js";
 import { mintListId, mintProjectId, mintTagId, mintTaskId } from "./ids.js";
 import { needsRebalance, nextOrder } from "./order.js";
 
@@ -143,11 +143,10 @@ interface TagRow {
 // "This row belongs to Today" has exactly one definition, expressed twice —
 // once as SQL, once as plain TS — so both a query and a client-side
 // recomputation can use it without either drifting out of sync with the
-// other or with itself over time. Neither form is wired into a caller yet:
-// `isTodayRow`/`getProjectDtos`'s todayCount query still use the old
-// `day = today` check. Phase 2 swaps those over; this phase only proves the
-// two forms agree (see db.test.ts's drift guard) so nothing built on top of
-// them can inherit a mismatch.
+// other or with itself over time. Wired into every caller that needs to
+// know "is this Today": getBoard's backlog query (via `inToday` on the
+// DTO) and planned count, getProjectDtos's todayCount badge, moveTask's
+// dismissal stamp, and completeTask's ring-preserving day stamp.
 // ---------------------------------------------------------------------------
 
 /**
@@ -222,6 +221,7 @@ function taskRowToDto(
   counts: { total: number; done: number },
   tags: TagRefDto[],
   trail: TrailDto | null,
+  inToday: boolean,
 ): TaskDto {
   return {
     id: row.id,
@@ -244,6 +244,7 @@ function taskRowToDto(
     tags,
     projectId: row.project_id,
     trail,
+    inToday,
   };
 }
 
@@ -343,9 +344,9 @@ function getChildrenRows(db: Database.Database, parentId: string): TaskRow[] {
 /**
  * `sort_order`'s scope: a task's "home" — its position within its project
  * (or the loose group, when `projectId` is null) under its parent. This is
- * independent of `bucket`: a ghost (flagged today, still filed) keeps its
- * home slot exactly where it was, so unscheduling it later can snap it back
- * there (see `moveTask`'s snap-home rule).
+ * independent of `bucket`: a scheduled row (flagged today, still filed)
+ * keeps its home slot exactly where it was, so unscheduling it later can
+ * snap it back there (see `moveTask`'s snap-home rule).
  */
 function getHomeSiblingRows(
   db: Database.Database,
@@ -373,32 +374,15 @@ function getHomeSiblingRows(
 }
 
 /**
- * `today_order`'s scope: the single flat Today list for `listId` — every
- * scheduled row, whether a former top-level task or a subtask dragged in on
- * its own, is a peer here. Unlike the home group, this is never split by
- * project or parent_id: Today is a place-shaped view of a flag, not a tree.
+ * The only code path allowed to write `sort_order` (risk mitigation from
+ * the design doc, made structurally true — see the regression test in
+ * db.test.ts that greps this file for stray writes). `today_order` is
+ * abandoned, not dropped (Phase 2 of the today-as-view plan): the column
+ * stays in the schema as a rollback escape hatch, but nothing in this file
+ * writes it anymore — Today now inherits `sort_order`, the same single
+ * order column the Backlog always used.
  */
-function getTodaySiblingRows(db: Database.Database, listId: string): TaskRow[] {
-  return db
-    .prepare(`SELECT * FROM tasks WHERE list_id = ? AND bucket = 'today' AND status = 'open' ORDER BY today_order`)
-    .all(listId) as TaskRow[];
-}
-
-/**
- * The only code path allowed to write `sort_order` or `today_order`
- * (risk mitigation from the design doc, made structurally true — see the
- * regression test in db.test.ts that greps this file for stray writes).
- * `column` picks exactly one of the two; the other is left untouched, so a
- * ghost row (both columns meaningful at once) can have each written
- * independently without the other clobbering it.
- */
-function writeOrder(
-  db: Database.Database,
-  id: string,
-  column: "sort_order" | "today_order",
-  value: number | null,
-  now: Date,
-): void {
+function writeOrder(db: Database.Database, id: string, column: "sort_order", value: number | null, now: Date): void {
   db.prepare(`UPDATE tasks SET ${column} = ?, updated_at = ? WHERE id = ?`).run(value, now.getTime(), id);
 }
 
@@ -413,17 +397,17 @@ function rebalanceHomeSiblingGroup(
   siblings.forEach((s, i) => writeOrder(db, s.id, "sort_order", (i + 1) * 1000, now));
 }
 
-function rebalanceTodaySiblingGroup(db: Database.Database, listId: string, now: Date): void {
-  const siblings = getTodaySiblingRows(db, listId);
-  siblings.forEach((s, i) => writeOrder(db, s.id, "today_order", (i + 1) * 1000, now));
-}
-
 /** Builds a top-level TaskDto with its open subtasks nested and full counts.
  * `tagMap`/`projectMap` are `undefined` for the single-DTO mutation return
- * paths, which use targeted lookups instead of a whole-board map. */
+ * paths, which use targeted lookups instead of a whole-board map.
+ * `today`/`startOfTomorrowMs` feed `isTodayMember` for `inToday` on both the
+ * row and every nested subtask — each row's own membership, not the
+ * parent's. */
 function buildTopLevelDto(
   db: Database.Database,
   row: TaskRow,
+  today: string,
+  startOfTomorrowMs: number,
   tagMap?: TagMap,
   projectMap?: ProjectMap,
 ): TaskDto {
@@ -432,32 +416,24 @@ function buildTopLevelDto(
   const tagsFor = (id: string) => (tagMap ? (tagMap.get(id) ?? []) : getTaskTags(db, id));
   const subtasks = children
     .filter((c) => c.status === "open")
-    .map((c) => taskRowToDto(c, [], { total: 0, done: 0 }, tagsFor(c.id), buildTrail(db, c, projectMap)));
+    .map((c) =>
+      taskRowToDto(
+        c,
+        [],
+        { total: 0, done: 0 },
+        tagsFor(c.id),
+        buildTrail(db, c, projectMap),
+        isTodayMember(c, today, startOfTomorrowMs),
+      ),
+    );
   return taskRowToDto(
     row,
     subtasks,
     { total: children.length, done },
     tagsFor(row.id),
     buildTrail(db, row, projectMap),
+    isTodayMember(row, today, startOfTomorrowMs),
   );
-}
-
-/** Today is flat: every scheduled row (former top-level task or a subtask
- * dragged in on its own) renders as a standalone entry with its own trail,
- * never nested under another Today row. `subtasks` is always forced to []
- * here even for a top-level task whose own subtasks also happen to be
- * scheduled — those render as their own separate flat Today entries. */
-function buildTodayDto(db: Database.Database, row: TaskRow, tagMap?: TagMap, projectMap?: ProjectMap): TaskDto {
-  const dto = row.parent_id
-    ? taskRowToDto(
-        row,
-        [],
-        { total: 0, done: 0 },
-        tagMap ? (tagMap.get(row.id) ?? []) : getTaskTags(db, row.id),
-        buildTrail(db, row, projectMap),
-      )
-    : buildTopLevelDto(db, row, tagMap, projectMap);
-  return { ...dto, subtasks: [] };
 }
 
 /**
@@ -523,6 +499,7 @@ function projectRowToDto(row: ProjectRow, counts: { open: number; today: number;
  * top-level and subtasks alike — same convention as ListDto.openCount. */
 function getProjectDtos(db: Database.Database, listId: string, now: Date): ProjectDto[] {
   const today = localDay(now);
+  const startOfTomorrowMs = startOfNextLocalDay(now);
   const ts = now.getTime();
   const rows = db
     .prepare(`SELECT * FROM projects WHERE list_id = ? ORDER BY sort_order`)
@@ -533,10 +510,13 @@ function getProjectDtos(db: Database.Database, listId: string, now: Date): Proje
         c: number;
       }
     ).c;
+    // The same union getBoard uses (manually scheduled OR due today/
+    // overdue and undismissed) — so a project's "N today" badge picks up
+    // an auto-included task too, not just one someone dragged in.
     const todayCount = (
       db
-        .prepare(`SELECT COUNT(*) AS c FROM tasks WHERE project_id = ? AND status = 'open' AND bucket = 'today' AND day = ?`)
-        .get(p.id, today) as { c: number }
+        .prepare(`SELECT COUNT(*) AS c FROM tasks WHERE project_id = ? AND status = 'open' AND ${TODAY_MEMBERSHIP_SQL}`)
+        .get(p.id, today, startOfTomorrowMs, today) as { c: number }
     ).c;
     const overdue = (
       db
@@ -556,7 +536,7 @@ function getProjectDtos(db: Database.Database, listId: string, now: Date): Proje
 export interface BoardResult {
   lists: ListDto[];
   activeListId: string;
-  today: { day: string; planned: number; completed: number; tasks: TaskDto[] };
+  today: { day: string; planned: number; completed: number };
   backlog: { total: number; overdue: number; tasks: TaskDto[] };
   totalOverdue: number;
   serverNow: number;
@@ -568,63 +548,56 @@ export function getBoard(db: Database.Database, listId: string | null, now: Date
   const lists = getListDtos(db, now);
   const activeListId = listId && lists.some((l) => l.id === listId) ? listId : lists[0].id;
   const today = localDay(now);
+  const startOfTomorrowMs = startOfNextLocalDay(now);
   const tagMap = loadTagMap(db);
   const projectMap = loadProjectMap(db, activeListId);
 
-  // Single source of truth for "this row belongs to today": `day = today`.
-  // Every selector and counter below is built from this exact predicate so
-  // the visible today.tasks list and the today.planned/today.completed
-  // counters can never disagree — a stale `day` (rollover not having run,
-  // or a bug in it) can never make a row appear in one and not the other.
-  const isTodayRow = `day = ?`;
-
-  // Today is flat (no `parent_id IS NULL` filter): a subtask dragged
-  // straight into Today renders here as its own row, with its trail
-  // pointing back at its (possibly still-backlogged) parent — that's the
-  // whole point of the feature. Ordered by today_order, not sort_order.
-  const topToday = db
-    .prepare(
-      `SELECT * FROM tasks WHERE list_id = ? AND bucket = 'today' AND status = 'open' AND ${isTodayRow} ORDER BY today_order`,
-    )
-    .all(activeListId, today) as TaskRow[];
-  const todayTasks = topToday.map((r) => buildTodayDto(db, r, tagMap, projectMap));
-
-  // Backlog now also returns today-flagged top-level rows so their ghost
-  // can render in-place in their project; `total` below stays the genuine
-  // backlog-bucket count so the "BACKLOG . n" header badge doesn't count
-  // ghosts twice (they're already counted by TODAY's own header).
+  // The Backlog is now the complete, always-true list of every open
+  // top-level task — no bucket filter, no ghost-manufacturing clause.
+  // `inToday` (computed per-row inside buildTopLevelDto via the shared
+  // `isTodayMember` predicate) is what flags which of these rows also
+  // belong to the Today view; nothing is excluded from the Backlog itself
+  // anymore. This is also why `today.tasks` no longer exists on the wire —
+  // everything a Today row needs is already here, once per task, so the
+  // client derives its own grouped Today view from this single tree.
   const topBacklog = db
-    .prepare(
-      `SELECT * FROM tasks WHERE list_id = ? AND parent_id IS NULL AND status = 'open' AND (bucket = 'backlog' OR (bucket = 'today' AND ${isTodayRow})) ORDER BY sort_order`,
-    )
-    .all(activeListId, today) as TaskRow[];
-  const backlogTasks = topBacklog.map((r) => buildTopLevelDto(db, r, tagMap, projectMap));
+    .prepare(`SELECT * FROM tasks WHERE list_id = ? AND parent_id IS NULL AND status = 'open' ORDER BY sort_order`)
+    .all(activeListId) as TaskRow[];
+  const backlogTasks = topBacklog.map((r) =>
+    buildTopLevelDto(db, r, today, startOfTomorrowMs, tagMap, projectMap),
+  );
   const backlogTotal = (
     db
-      .prepare(
-        `SELECT COUNT(*) AS c FROM tasks WHERE list_id = ? AND parent_id IS NULL AND bucket = 'backlog' AND status = 'open'`,
-      )
+      .prepare(`SELECT COUNT(*) AS c FROM tasks WHERE list_id = ? AND parent_id IS NULL AND status = 'open'`)
       .get(activeListId) as { c: number }
   ).c;
 
-  const planned = (
-    db
-      .prepare(`SELECT COUNT(*) AS c FROM tasks WHERE list_id = ? AND ${isTodayRow}`)
-      .get(activeListId, today) as { c: number }
-  ).c;
+  // today.completed counts rows historically stamped `day = today` at the
+  // moment they were completed (see completeTask) — that stamp is what
+  // keeps a vanished row counted even though it no longer satisfies
+  // TODAY_MEMBERSHIP_SQL (done rows aren't `status = 'open'`, so they'd
+  // never match it anyway). today.planned adds every currently-open row
+  // that *does* satisfy the predicate, so the two halves of the ring can
+  // never disagree with what's actually in play right now.
   const completed = (
     db
-      .prepare(`SELECT COUNT(*) AS c FROM tasks WHERE list_id = ? AND ${isTodayRow} AND status = 'done'`)
+      .prepare(`SELECT COUNT(*) AS c FROM tasks WHERE list_id = ? AND day = ? AND status = 'done'`)
       .get(activeListId, today) as { c: number }
   ).c;
+  const openToday = (
+    db
+      .prepare(`SELECT COUNT(*) AS c FROM tasks WHERE list_id = ? AND status = 'open' AND ${TODAY_MEMBERSHIP_SQL}`)
+      .get(activeListId, today, startOfTomorrowMs, today) as { c: number }
+  ).c;
+  const planned = completed + openToday;
 
-  const backlogOverdue = countOverdue(db, activeListId, "backlog", now);
+  const backlogOverdue = countOverdue(db, activeListId, null, now);
   const totalOverdue = lists.reduce((sum, l) => sum + l.overdueCount, 0);
 
   return {
     lists,
     activeListId,
-    today: { day: today, planned, completed, tasks: todayTasks },
+    today: { day: today, planned, completed },
     backlog: { total: backlogTotal, overdue: backlogOverdue, tasks: backlogTasks },
     totalOverdue,
     serverNow: now.getTime(),
@@ -644,7 +617,18 @@ export function getArchive(
   listId: string,
   limit: number,
   offset: number,
+  now: Date,
 ): ArchiveResult {
+  // `inToday` is part of every TaskDto now (the contract's `.strict()`
+  // schema requires it), so an archived row needs one too — computed with
+  // the same shared predicate as everywhere else, even though it's largely
+  // incidental here (Today's own selection logic never reads from the
+  // archive). `getArchive`'s nesting and `buildTrail` are otherwise
+  // untouched: unlike the Backlog, an archived subtask's parent may not be
+  // on the current page, so this traversal still has to build its own tree
+  // rather than delegate to a single comprehensive list.
+  const today = localDay(now);
+  const startOfTomorrowMs = startOfNextLocalDay(now);
   const tagMap = loadTagMap(db);
   const projectMap = loadProjectMap(db, listId);
   const doneRows = db
@@ -667,20 +651,37 @@ export function getArchive(
 
   const dtoFor = (r: TaskRow, tagMap: TagMap): TaskDto => {
     if (r.parent_id) {
-      return taskRowToDto(r, [], { total: 0, done: 0 }, tagMap.get(r.id) ?? [], buildTrail(db, r, projectMap));
+      return taskRowToDto(
+        r,
+        [],
+        { total: 0, done: 0 },
+        tagMap.get(r.id) ?? [],
+        buildTrail(db, r, projectMap),
+        isTodayMember(r, today, startOfTomorrowMs),
+      );
     }
     const children = getChildrenRows(db, r.id);
     const done = children.filter((c) => c.status === "done").length;
     const nested = children
       .filter((c) => c.status === "done" && dayOf(c) === dayOf(r))
       .sort((a, b) => a.sort_order - b.sort_order)
-      .map((c) => taskRowToDto(c, [], { total: 0, done: 0 }, tagMap.get(c.id) ?? [], buildTrail(db, c, projectMap)));
+      .map((c) =>
+        taskRowToDto(
+          c,
+          [],
+          { total: 0, done: 0 },
+          tagMap.get(c.id) ?? [],
+          buildTrail(db, c, projectMap),
+          isTodayMember(c, today, startOfTomorrowMs),
+        ),
+      );
     return taskRowToDto(
       r,
       nested,
       { total: children.length, done },
       tagMap.get(r.id) ?? [],
       buildTrail(db, r, projectMap),
+      isTodayMember(r, today, startOfTomorrowMs),
     );
   };
 
@@ -756,22 +757,13 @@ export function createTask(db: Database.Database, input: CreateTaskInput, now: D
     const id = mintTaskId();
     const ts = now.getTime();
     db.prepare(
-      `INSERT INTO tasks (id, list_id, parent_id, title, notes, bucket, day, sort_order, today_order, due_at, has_due_time, status, completed_at, carried_count, project_id, created_at, updated_at)
-       VALUES (?, ?, ?, ?, NULL, ?, ?, 0, NULL, ?, ?, 'open', NULL, 0, ?, ?, ?)`,
+      `INSERT INTO tasks (id, list_id, parent_id, title, notes, bucket, day, sort_order, due_at, has_due_time, status, completed_at, carried_count, project_id, created_at, updated_at)
+       VALUES (?, ?, ?, ?, NULL, ?, ?, 0, ?, ?, 'open', NULL, 0, ?, ?, ?)`,
     ).run(id, listId, parentId, title, bucket, day, input.dueAt, input.hasDueTime ? 1 : 0, projectId, ts, ts);
 
     writeOrder(db, id, "sort_order", homeOrder, now);
 
-    if (bucket === "today") {
-      const todaySiblings = getTodaySiblingRows(db, listId);
-      const todayOrderVal =
-        input.position === "top"
-          ? nextOrder(null, todaySiblings[0]?.today_order ?? null)
-          : nextOrder(todaySiblings[todaySiblings.length - 1]?.today_order ?? null, null);
-      writeOrder(db, id, "today_order", todayOrderVal, now);
-    }
-
-    return buildTopLevelDto(db, getTaskRow(db, id) as TaskRow);
+    return buildTopLevelDto(db, getTaskRow(db, id) as TaskRow, localDay(now), startOfNextLocalDay(now));
   })();
 }
 
@@ -803,9 +795,18 @@ export function updateTask(db: Database.Database, input: UpdateTaskInput, now: D
     ).run(title, notes, dueAt, hasDueTime ? 1 : 0, ts, input.id);
 
     const updated = getTaskRow(db, input.id) as TaskRow;
+    const today = localDay(now);
+    const startOfTomorrowMs = startOfNextLocalDay(now);
     return updated.parent_id
-      ? taskRowToDto(updated, [], { total: 0, done: 0 }, getTaskTags(db, updated.id), buildTrail(db, updated))
-      : buildTopLevelDto(db, updated);
+      ? taskRowToDto(
+          updated,
+          [],
+          { total: 0, done: 0 },
+          getTaskTags(db, updated.id),
+          buildTrail(db, updated),
+          isTodayMember(updated, today, startOfTomorrowMs),
+        )
+      : buildTopLevelDto(db, updated, today, startOfTomorrowMs);
   })();
 }
 
@@ -879,10 +880,23 @@ export function moveTask(db: Database.Database, input: MoveTaskInput, now: Date)
       wasToday && !enteringToday && input.projectId !== undefined && input.projectId !== row.project_id;
     const snapHome = wasToday && !enteringToday && !reHome;
 
+    // Today membership is a flag on the row, not a separate place —
+    // `today_dismissed_day` is the one thing a bare `bucket` flip can't
+    // express: an explicit "take this out of Today" for a row that is (or
+    // remains) auto-included by its own due date. Stamped the instant a row
+    // leaves Today for the Backlog — this is what stops a manually
+    // scheduled *and* overdue task from boomeranging straight back in via
+    // TODAY_MEMBERSHIP_SQL the moment its `bucket` flips away from 'today'.
+    // Unconditional and harmless when the row has no due date at all.
+    // Cleared the instant a row (re-)enters Today: a prior dismissal from
+    // some earlier day is stale the moment the row is deliberately
+    // scheduled again.
+    const nextDismissedDay = enteringToday ? null : wasToday ? localDay(now) : row.today_dismissed_day;
+
     const ts = now.getTime();
     db.prepare(
-      `UPDATE tasks SET bucket = ?, day = ?, parent_id = ?, project_id = ?, updated_at = ? WHERE id = ?`,
-    ).run(newBucket, newDay, newParentId, newProjectId, ts, row.id);
+      `UPDATE tasks SET bucket = ?, day = ?, parent_id = ?, project_id = ?, today_dismissed_day = ?, updated_at = ? WHERE id = ?`,
+    ).run(newBucket, newDay, newParentId, newProjectId, nextDismissedDay, ts, row.id);
 
     // If row remains (or becomes) a top-level parent and its project
     // changed, its still-remaining children move with it (invariant 2).
@@ -892,61 +906,49 @@ export function moveTask(db: Database.Database, input: MoveTaskInput, now: Date)
       db.prepare(`UPDATE tasks SET project_id = ? WHERE parent_id = ?`).run(newProjectId, row.id);
     }
 
-    if (enteringToday) {
-      // Today write: today_order only. sort_order (the home slot) is left
-      // completely untouched here — that's what lets a later unschedule
-      // snap back to it.
-      const todaySiblings = getTodaySiblingRows(db, listId).filter((s) => s.id !== row.id);
-      const beforeRow = input.beforeId ? todaySiblings.find((s) => s.id === input.beforeId) : undefined;
-      const afterRow = input.afterId ? todaySiblings.find((s) => s.id === input.afterId) : undefined;
-      let prevOrder = afterRow ? afterRow.today_order : null;
-      let nextOrderVal = beforeRow ? beforeRow.today_order : null;
+    // Today now inherits `sort_order` — there is exactly one order column,
+    // shared by both views, so entering/leaving/reordering within Today all
+    // go through the same home-sibling ordering below. `homeUnchanged`
+    // generalizes what used to be implicit: entering Today never touched
+    // `sort_order` (Today had its own column), so a drop that names neither
+    // a new position nor a new home must still leave the row exactly where
+    // it was — "a task's home never changes on schedule/unschedule" holds
+    // in both directions now, not just the snap-home one. `snapHome` stays
+    // the stronger, direction-specific rule for leaving Today: it ignores
+    // an explicit beforeId/afterId too, and takes precedence here.
+    const homeUnchanged =
+      !snapHome &&
+      input.beforeId === null &&
+      input.afterId === null &&
+      newProjectId === row.project_id &&
+      newParentId === row.parent_id;
+
+    if (!snapHome && !homeUnchanged) {
+      const homeSiblings = getHomeSiblingRows(db, listId, newProjectId, newParentId).filter(
+        (s) => s.id !== row.id,
+      );
+      const beforeRow = input.beforeId ? homeSiblings.find((s) => s.id === input.beforeId) : undefined;
+      const afterRow = input.afterId ? homeSiblings.find((s) => s.id === input.afterId) : undefined;
+      let prevOrder = afterRow ? afterRow.sort_order : null;
+      let nextOrderVal = beforeRow ? beforeRow.sort_order : null;
 
       if (prevOrder === null && nextOrderVal === null) {
-        prevOrder = todaySiblings[todaySiblings.length - 1]?.today_order ?? null;
+        prevOrder = homeSiblings[homeSiblings.length - 1]?.sort_order ?? null;
         nextOrderVal = null;
       } else if (needsRebalance(prevOrder, nextOrderVal)) {
-        rebalanceTodaySiblingGroup(db, listId, now);
-        const refreshed = getTodaySiblingRows(db, listId).filter((s) => s.id !== row.id);
-        const br = input.beforeId ? refreshed.find((s) => s.id === input.beforeId) : undefined;
-        const ar = input.afterId ? refreshed.find((s) => s.id === input.afterId) : undefined;
-        prevOrder = ar ? ar.today_order : null;
-        nextOrderVal = br ? br.today_order : null;
-      }
-      writeOrder(db, row.id, "today_order", nextOrder(prevOrder, nextOrderVal), now);
-    } else {
-      // Leaving/staying in the backlog: today_order always clears
-      // (invariant 5 — it's NULL iff bucket = 'backlog', unconditionally).
-      writeOrder(db, row.id, "today_order", null, now);
-
-      if (!snapHome) {
-        // A plain backlog reposition, a re-home into a different
-        // project/loose group, or an explicit re-home off Today.
-        const homeSiblings = getHomeSiblingRows(db, listId, newProjectId, newParentId).filter(
+        rebalanceHomeSiblingGroup(db, listId, newProjectId, newParentId, now);
+        const refreshed = getHomeSiblingRows(db, listId, newProjectId, newParentId).filter(
           (s) => s.id !== row.id,
         );
-        const beforeRow = input.beforeId ? homeSiblings.find((s) => s.id === input.beforeId) : undefined;
-        const afterRow = input.afterId ? homeSiblings.find((s) => s.id === input.afterId) : undefined;
-        let prevOrder = afterRow ? afterRow.sort_order : null;
-        let nextOrderVal = beforeRow ? beforeRow.sort_order : null;
-
-        if (prevOrder === null && nextOrderVal === null) {
-          prevOrder = homeSiblings[homeSiblings.length - 1]?.sort_order ?? null;
-          nextOrderVal = null;
-        } else if (needsRebalance(prevOrder, nextOrderVal)) {
-          rebalanceHomeSiblingGroup(db, listId, newProjectId, newParentId, now);
-          const refreshed = getHomeSiblingRows(db, listId, newProjectId, newParentId).filter(
-            (s) => s.id !== row.id,
-          );
-          const br = input.beforeId ? refreshed.find((s) => s.id === input.beforeId) : undefined;
-          const ar = input.afterId ? refreshed.find((s) => s.id === input.afterId) : undefined;
-          prevOrder = ar ? ar.sort_order : null;
-          nextOrderVal = br ? br.sort_order : null;
-        }
-        writeOrder(db, row.id, "sort_order", nextOrder(prevOrder, nextOrderVal), now);
+        const br = input.beforeId ? refreshed.find((s) => s.id === input.beforeId) : undefined;
+        const ar = input.afterId ? refreshed.find((s) => s.id === input.afterId) : undefined;
+        prevOrder = ar ? ar.sort_order : null;
+        nextOrderVal = br ? br.sort_order : null;
       }
-      // snapHome: sort_order is left exactly as it was — no write at all.
+      writeOrder(db, row.id, "sort_order", nextOrder(prevOrder, nextOrderVal), now);
     }
+    // snapHome / homeUnchanged: sort_order is left exactly as it was — no
+    // write at all.
 
     if (promoted.length > 0) {
       const topSiblings = getHomeSiblingRows(db, listId, oldProjectId, null).filter(
@@ -980,30 +982,69 @@ export function completeTask(
     const row = getTaskRow(db, id);
     if (!row) throw new Error("not_found: task not found");
 
+    const today = localDay(now);
+    const startOfTomorrowMs = startOfNextLocalDay(now);
     const ts = now.getTime();
     const completedIds: string[] = [];
+
+    // A completed row vanishes from the visible board immediately — but
+    // today.planned's ring must still count it if it was a
+    // TODAY_MEMBERSHIP_SQL member at the instant it completed. `day` is the
+    // only durable record getBoard reads for that (see its `completed`
+    // count); a MANUALLY scheduled row already has it stamped, but an
+    // AUTO-INCLUDED row (due today/overdue, never `bucket = 'today'`) has
+    // never had `day` written at all. Stamp it here, once, at completion —
+    // never `bucket`: this is a historical marker, not a reschedule.
+    // `isTodayMember` is evaluated against the row's pre-completion
+    // columns, so a dismissed-then-completed row is correctly not stamped.
+    const completeRow = (r: TaskRow): void => {
+      if (isTodayMember(r, today, startOfTomorrowMs) && r.day !== today) {
+        db.prepare(
+          `UPDATE tasks SET status = 'done', completed_at = ?, updated_at = ?, day = ? WHERE id = ?`,
+        ).run(ts, ts, today, r.id);
+      } else {
+        db.prepare(`UPDATE tasks SET status = 'done', completed_at = ?, updated_at = ? WHERE id = ?`).run(
+          ts,
+          ts,
+          r.id,
+        );
+      }
+      completedIds.push(r.id);
+    };
+
     if (row.status === "open") {
-      db.prepare(`UPDATE tasks SET status = 'done', completed_at = ?, updated_at = ? WHERE id = ?`).run(
-        ts,
-        ts,
-        id,
-      );
-      completedIds.push(id);
+      completeRow(row);
     }
 
     if (!row.parent_id) {
       const openChildren = getChildrenRows(db, id).filter((c) => c.status === "open");
       for (const child of openChildren) {
-        db.prepare(`UPDATE tasks SET status = 'done', completed_at = ?, updated_at = ? WHERE id = ?`).run(
-          ts,
-          ts,
-          child.id,
-        );
-        completedIds.push(child.id);
+        completeRow(child);
       }
     }
 
     return { listId: row.list_id, completedIds };
+  })();
+}
+
+/**
+ * The counterpart to `moveTask`'s dismissal stamp, for the case it can't
+ * express: a task that was never manually scheduled (`bucket = 'backlog'`)
+ * but renders in Today purely because it's due today or overdue — there is
+ * nothing to move, so this is a single-column stamp. Writes ONLY
+ * `today_dismissed_day` (plus `updated_at`); never touches `bucket`, `day`,
+ * or any positional column.
+ */
+export function dismissFromToday(db: Database.Database, id: string, now: Date): { listId: string } {
+  return db.transaction(() => {
+    const row = getTaskRow(db, id);
+    if (!row) throw new Error("not_found: task not found");
+    db.prepare(`UPDATE tasks SET today_dismissed_day = ?, updated_at = ? WHERE id = ?`).run(
+      localDay(now),
+      now.getTime(),
+      id,
+    );
+    return { listId: row.list_id };
   })();
 }
 
@@ -1330,7 +1371,7 @@ export function reorderTags(db: Database.Database, ids: string[]): TagDto[] {
   })();
 }
 
-export function setTaskTags(db: Database.Database, taskId: string, tagIds: string[], _now: Date): TaskDto {
+export function setTaskTags(db: Database.Database, taskId: string, tagIds: string[], now: Date): TaskDto {
   return db.transaction(() => {
     const row = getTaskRow(db, taskId);
     if (!row) throw new Error("not_found: task not found");
@@ -1347,8 +1388,17 @@ export function setTaskTags(db: Database.Database, taskId: string, tagIds: strin
     const insert = db.prepare(`INSERT INTO task_tags (task_id, tag_id) VALUES (?, ?)`);
     for (const tagId of uniqueIds) insert.run(taskId, tagId);
 
+    const today = localDay(now);
+    const startOfTomorrowMs = startOfNextLocalDay(now);
     return row.parent_id
-      ? taskRowToDto(row, [], { total: 0, done: 0 }, getTaskTags(db, taskId), buildTrail(db, row))
-      : buildTopLevelDto(db, row);
+      ? taskRowToDto(
+          row,
+          [],
+          { total: 0, done: 0 },
+          getTaskTags(db, taskId),
+          buildTrail(db, row),
+          isTodayMember(row, today, startOfTomorrowMs),
+        )
+      : buildTopLevelDto(db, row, today, startOfTomorrowMs);
   })();
 }

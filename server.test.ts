@@ -45,21 +45,23 @@ describe("server.ts rpc surface", () => {
       afterId: null,
     });
     let boardAfterMove = await getBoard(harness, listId);
-    expect(boardAfterMove.today.tasks.map((t: any) => t.id)).toContain(created.task.id);
+    let movedDto = boardAfterMove.backlog.tasks.find((t: any) => t.id === created.task.id);
+    expect(movedDto.bucket).toBe("today");
+    expect(movedDto.inToday).toBe(true);
 
     const completed = (await harness.callRpc("completeTask", { id: created.task.id })) as any;
     expect(completed.completedIds).toEqual([created.task.id]);
     let boardAfterComplete = await getBoard(harness, listId);
-    expect(boardAfterComplete.today.tasks.map((t: any) => t.id)).not.toContain(created.task.id);
+    expect(boardAfterComplete.backlog.tasks.map((t: any) => t.id)).not.toContain(created.task.id); // done, vanished
     expect(boardAfterComplete.today.completed).toBe(1);
 
     await harness.callRpc("restoreTasks", { ids: completed.completedIds });
     let boardAfterRestore = await getBoard(harness, listId);
-    expect(boardAfterRestore.today.tasks.map((t: any) => t.id)).toContain(created.task.id);
+    expect(boardAfterRestore.backlog.tasks.map((t: any) => t.id)).toContain(created.task.id);
 
     await harness.callRpc("deleteTask", { id: created.task.id });
     let boardAfterDelete = await getBoard(harness, listId);
-    expect(boardAfterDelete.today.tasks.map((t: any) => t.id)).not.toContain(created.task.id);
+    expect(boardAfterDelete.backlog.tasks.map((t: any) => t.id)).not.toContain(created.task.id);
   });
 
   it("rejects an empty title on createTask", async () => {
@@ -183,19 +185,20 @@ describe("server.ts rpc surface", () => {
       .run(staleId, listId);
 
     const board2 = await getBoard(harness, listId);
-    const row = board2.today.tasks.find((t: any) => t.id === staleId);
+    const row = board2.backlog.tasks.find((t: any) => t.id === staleId);
     expect(row).toBeDefined();
     expect(row.day).toBe(board2.today.day);
     expect(row.carriedCount).toBe(4);
-    // The Today counter and the Today selector must agree: the row that
-    // shows up in tasks is counted in planned.
+    // The Today counter and the Today membership flag must agree: the row
+    // that shows up as inToday is counted in planned.
+    expect(row.inToday).toBe(true);
     expect(board2.today.planned).toBeGreaterThan(0);
   });
 
-  // Regression: today.tasks and today.planned must be derived from the same
-  // predicate, so they can never disagree — including for subtasks, which
-  // planned counts but the top-level tasks array only nests.
-  it("today.tasks (including subtasks) can never disagree with today.planned/completed", async () => {
+  // Regression: today.planned/completed must be derived from the same
+  // predicate as inToday, so they can never disagree — including for
+  // subtasks, which planned counts but only nest under backlog.tasks.
+  it("today.planned/completed can never disagree with the count of inToday rows across backlog.tasks (including subtasks)", async () => {
     const { harness } = await setup();
     const board = await getBoard(harness);
     const listId = board.activeListId;
@@ -220,9 +223,11 @@ describe("server.ts rpc surface", () => {
     });
 
     const after = await getBoard(harness, listId);
-    const topLevelCount = after.today.tasks.length;
-    const subtaskCount = after.today.tasks.reduce((sum: number, t: any) => sum + t.subtasks.length, 0);
-    expect(after.today.planned).toBe(topLevelCount + subtaskCount);
+    const openInTodayCount = after.backlog.tasks.reduce(
+      (sum: number, t: any) => sum + (t.inToday ? 1 : 0) + t.subtasks.filter((s: any) => s.inToday).length,
+      0,
+    );
+    expect(after.today.planned).toBe(openInTodayCount);
     expect(after.today.completed).toBe(0);
   });
 
@@ -477,7 +482,8 @@ describe("server.ts rpc surface", () => {
       projectId: project.project.id,
     })) as any;
 
-    // Schedule it — the ghost stays filed under `project`.
+    // Schedule it — it stays filed under `project`, comprehensive Backlog
+    // means it's the same row, just now bucket='today'/inToday.
     await harness.callRpc("moveTask", {
       id: task.task.id,
       bucket: "today",
@@ -486,12 +492,11 @@ describe("server.ts rpc surface", () => {
       afterId: null,
     });
     let afterSchedule = await getBoard(harness, listId);
-    let todayRow = afterSchedule.today.tasks.find((t: any) => t.id === task.task.id);
-    expect(todayRow.trail.projectId).toBe(project.project.id);
-    expect(todayRow.trail.projectName).toBe("Q3 Launch");
-    let ghost = afterSchedule.backlog.tasks.find((t: any) => t.id === task.task.id);
-    expect(ghost).toBeDefined();
-    expect(ghost.bucket).toBe("today");
+    let scheduledRow = afterSchedule.backlog.tasks.find((t: any) => t.id === task.task.id);
+    expect(scheduledRow.bucket).toBe("today");
+    expect(scheduledRow.inToday).toBe(true);
+    expect(scheduledRow.trail.projectId).toBe(project.project.id);
+    expect(scheduledRow.trail.projectName).toBe("Q3 Launch");
 
     // Unschedule with no projectId: snaps home, stays in `project`.
     await harness.callRpc("moveTask", {
@@ -504,7 +509,8 @@ describe("server.ts rpc surface", () => {
     let afterSnapHome = await getBoard(harness, listId);
     let snapped = afterSnapHome.backlog.tasks.find((t: any) => t.id === task.task.id);
     expect(snapped.projectId).toBe(project.project.id);
-    expect(afterSnapHome.today.tasks.map((t: any) => t.id)).not.toContain(task.task.id);
+    expect(snapped.bucket).toBe("backlog");
+    expect(snapped.inToday).toBe(false);
 
     // Re-home to a different project.
     await harness.callRpc("moveTask", {
@@ -553,12 +559,12 @@ describe("server.ts rpc surface", () => {
     });
 
     const after = await getBoard(harness, listId);
-    expect(after.today.tasks.map((t: any) => t.id)).toEqual([child.task.id]);
-    expect(after.today.tasks[0].parentId).toBe(parent.task.id);
-    expect(after.today.tasks[0].trail.parentTitle).toBe("Rewrite the onboarding email");
-
     const parentRow = after.backlog.tasks.find((t: any) => t.id === parent.task.id);
     expect(parentRow.bucket).toBe("backlog"); // scheduling the subtask did not schedule the parent
+    const childRow = parentRow.subtasks.find((t: any) => t.id === child.task.id);
+    expect(childRow.bucket).toBe("today");
+    expect(childRow.inToday).toBe(true);
+    expect(childRow.trail.parentTitle).toBe("Rewrite the onboarding email");
   });
 
   it("today counts survive completion vanishing rows from the board", async () => {
@@ -588,6 +594,42 @@ describe("server.ts rpc surface", () => {
     const after = await getBoard(harness, listId);
     expect(after.today.planned).toBe(2);
     expect(after.today.completed).toBe(1);
-    expect(after.today.tasks.length).toBe(1);
+    const openInToday = after.backlog.tasks.filter((t: any) => t.inToday).length;
+    expect(openInToday).toBe(1); // t1 done and vanished; t2 still open and inToday
+  });
+
+  it("dismissFromToday stamps today_dismissed_day so an auto-included row stops rendering inToday, and publishes a board realtime signal", async () => {
+    const { harness } = await setup();
+    const board = await getBoard(harness);
+    const listId = board.activeListId;
+
+    const overdue = (await harness.callRpc("createTask", {
+      listId,
+      bucket: "backlog",
+      title: "overdue, never scheduled",
+      parentId: null,
+      dueAt: Date.now() - 1000 * 60 * 60 * 24 * 3,
+      hasDueTime: false,
+      position: "bottom",
+    })) as any;
+
+    const beforeDismiss = await getBoard(harness, listId);
+    const beforeDto = beforeDismiss.backlog.tasks.find((t: any) => t.id === overdue.task.id);
+    expect(beforeDto.inToday).toBe(true);
+
+    const before = harness.realtimeSignals.length;
+    const result = (await harness.callRpc("dismissFromToday", { id: overdue.task.id })) as any;
+    expect(result.ok).toBe(true);
+    const signals = harness.realtimeSignals.slice(before);
+    expect(signals.length).toBeGreaterThan(0);
+    expect(signals.at(-1)?.channel).toBe("board");
+    expect((signals.at(-1)?.payload as any).listId).toBe(listId);
+
+    const afterDismiss = await getBoard(harness, listId);
+    const afterDto = afterDismiss.backlog.tasks.find((t: any) => t.id === overdue.task.id);
+    expect(afterDto.inToday).toBe(false);
+    expect(afterDto.bucket).toBe("backlog"); // dismissFromToday never touches bucket
+
+    await expect(harness.callRpc("dismissFromToday", { id: "tsk_missing" })).rejects.toBeTruthy();
   });
 });

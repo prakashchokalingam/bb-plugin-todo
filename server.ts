@@ -53,7 +53,7 @@ export default async function plugin(bb: BbPluginApi) {
     async getArchive({ listId, limit, offset }) {
       const now = new Date();
       await ensureRollover(now);
-      return db.getArchive(conn, listId, limit, offset);
+      return db.getArchive(conn, listId, limit, offset, now);
     },
 
     createTask(input) {
@@ -78,6 +78,12 @@ export default async function plugin(bb: BbPluginApi) {
       const { listId, completedIds } = db.completeTask(conn, id, new Date());
       publish(listId);
       return { completedIds };
+    },
+
+    dismissFromToday({ id }) {
+      const { listId } = db.dismissFromToday(conn, id, new Date());
+      publish(listId);
+      return { ok: true as const };
     },
 
     restoreTasks({ ids }) {

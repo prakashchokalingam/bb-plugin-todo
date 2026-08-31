@@ -73,6 +73,14 @@ export interface TaskDto {
   /** NULL = loose (not filed into a project). */
   projectId: string | null;
   trail: TrailDto | null;
+  /**
+   * Computed server-side from the shared Today-membership predicate
+   * (`isTodayMember`/`TODAY_MEMBERSHIP_SQL` in lib/db.ts): true if manually
+   * scheduled (`bucket = 'today'`) OR due today/overdue and not dismissed
+   * for today. The one bit the client can't reconstruct on its own, since
+   * `today_dismissed_day` itself is never sent.
+   */
+  inToday: boolean;
 }
 
 export interface ListDto {
@@ -151,6 +159,7 @@ const taskDtoSchema: z.ZodType<TaskDto> = z.lazy(() =>
       tags: z.array(tagRefDtoSchema),
       projectId: idSchema.nullable(),
       trail: trailDtoSchema.nullable(),
+      inToday: z.boolean(),
     })
     .strict(),
 );
@@ -186,12 +195,15 @@ export const rpcContract = defineRpcContract({
       .object({
         lists: z.array(listDtoSchema),
         activeListId: idSchema,
+        // No `tasks` here — the Backlog is now comprehensive, so
+        // `backlog.tasks` already carries everything a Today row needs
+        // (via `inToday`); the client derives its own grouped Today view
+        // from that single tree instead of trusting a second traversal.
         today: z
           .object({
             day: z.string(),
             planned: z.number().int(),
             completed: z.number().int(),
-            tasks: z.array(taskDtoSchema),
           })
           .strict(),
         backlog: z
@@ -276,6 +288,14 @@ export const rpcContract = defineRpcContract({
   completeTask: {
     input: z.object({ id: idSchema }).strict(),
     output: z.object({ completedIds: z.array(idSchema) }).strict(),
+  },
+  // Counterpart to moveTask's today->backlog dismissal stamp, for a task
+  // that was never manually scheduled (bucket = 'backlog') but renders in
+  // Today purely because it's due today or overdue — there's nothing to
+  // move, so this is a single-column stamp of today_dismissed_day.
+  dismissFromToday: {
+    input: z.object({ id: idSchema }).strict(),
+    output: z.object({ ok: z.literal(true) }).strict(),
   },
   restoreTasks: {
     input: z.object({ ids: z.array(idSchema) }).strict(),

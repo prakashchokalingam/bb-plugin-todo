@@ -3,7 +3,7 @@ import { fileURLToPath } from "node:url";
 import Database from "better-sqlite3";
 import { beforeEach, describe, expect, it } from "vitest";
 import * as db from "./db.js";
-import { startOfNextLocalDay } from "./day.js";
+import { localDay, startOfNextLocalDay } from "./day.js";
 
 function freshDb(): Database.Database {
   const conn = new Database(":memory:");
@@ -268,7 +268,9 @@ describe("getBoard", () => {
     const board = db.getBoard(conn, listId, NOW);
     expect(board.today.planned).toBe(2); // parent + subtask, both day=today
     expect(board.today.completed).toBe(2);
-    expect(board.today.tasks).toEqual([]); // vanished from the visible list
+    // Both rows are done, so they vanish from the open backlog entirely —
+    // there's no separate today.tasks list to vanish from anymore.
+    expect(board.backlog.tasks.find((t) => t.id === parent.id)).toBeUndefined();
   });
 
   it("falls back to the first list when listId is null or unknown", () => {
@@ -735,23 +737,21 @@ describe("writeOrder structural guard", () => {
     }
   });
 
-  // Phase 1 note: the design doc calls for tightening this guard to assert
-  // ZERO writes to today_order anywhere in db.ts. That isn't safely
-  // achievable yet — `writeOrder`'s two remaining "today_order" call sites
-  // live inside `createTask` and `moveTask`, and `moveTask`'s body is
-  // Phase 2's to rewrite (it needs simultaneous surgery for the dismissal
-  // stamp in the same pass that removes this). Narrowing `writeOrder` or
-  // deleting these call sites here would either not type-check or silently
-  // break scheduling before Phase 2 lands its replacement. This tripwire
-  // pins the exact current count instead: Phase 2 must touch this test (and
-  // can't accidentally leave one behind) when it removes them.
-  it("(tripwire for Phase 2) pins the exact call sites still writing today_order, so the removal can't silently miss one", () => {
+  // Phase 2: today_order is abandoned. Today now inherits sort_order, so
+  // there is exactly one order column and writeOrder's `column` parameter
+  // is narrowed to the single literal type "sort_order" — nothing anywhere
+  // in this file can write today_order anymore, by construction. The
+  // column itself stays in the schema (see migration 13's comment and the
+  // PRAGMA check below) purely as a rollback escape hatch.
+  it("writeOrder never writes today_order anywhere in db.ts, and the abandoned column still exists in the schema", () => {
     const src = readFileSync(fileURLToPath(new URL("./db.ts", import.meta.url)), "utf8");
     const codeOnly = src.slice(src.indexOf("interface TaskRow"));
     const callSites = codeOnly.match(/writeOrder\([^):]*,\s*"today_order"/g) ?? [];
-    // createTask (1), moveTask's entering-Today branch (1), moveTask's
-    // leaving/staying-in-backlog branch (1), rebalanceTodaySiblingGroup (1).
-    expect(callSites.length).toBe(4);
+    expect(callSites.length).toBe(0);
+
+    const conn = freshDb();
+    const cols = conn.prepare(`PRAGMA table_info(tasks)`).all() as { name: string }[];
+    expect(cols.some((c) => c.name === "today_order")).toBe(true); // abandoned, not dropped
   });
 });
 
@@ -1053,7 +1053,7 @@ describe("invariants (docs/design/2026-08-27-projects.md)", () => {
     expect(childAfterParentScheduled.bucket).toBe("backlog"); // subtask not dragged along
   });
 
-  it("invariant 5: today_order IS NULL iff bucket = 'backlog'", () => {
+  it("invariant 5 (revised — Phase 2): today_order is abandoned, so it stays NULL forever now regardless of bucket, since nothing writes it anymore", () => {
     const task = create("t");
     let row = conn.prepare(`SELECT bucket, today_order FROM tasks WHERE id = ?`).get(task.id) as {
       bucket: string;
@@ -1068,7 +1068,7 @@ describe("invariants (docs/design/2026-08-27-projects.md)", () => {
       today_order: number | null;
     };
     expect(row.bucket).toBe("today");
-    expect(row.today_order).not.toBeNull();
+    expect(row.today_order).toBeNull(); // was `.not.toBeNull()` pre-Phase-2 — Today now shares sort_order instead
 
     db.moveTask(conn, { id: task.id, bucket: "backlog", parentId: null, beforeId: null, afterId: null }, NOW);
     row = conn.prepare(`SELECT bucket, today_order FROM tasks WHERE id = ?`).get(task.id) as {
@@ -1119,7 +1119,7 @@ describe("moveTask — projects and the drag matrix", () => {
     );
   }
 
-  it("project task -> Today: flags scheduled, keeps its project and home slot (ghost stays)", () => {
+  it("project task -> Today: flags scheduled, keeps its project and home slot (no reposition without an explicit drop target)", () => {
     const project = db.createProject(conn, { listId, name: "Q3", color: "blue" }, NOW);
     const task = create("t", { projectId: project.id });
     const before = conn.prepare(`SELECT sort_order FROM tasks WHERE id = ?`).get(task.id) as {
@@ -1129,35 +1129,56 @@ describe("moveTask — projects and the drag matrix", () => {
     db.moveTask(conn, { id: task.id, bucket: "today", parentId: null, beforeId: null, afterId: null }, NOW);
 
     const after = conn
-      .prepare(`SELECT bucket, sort_order, project_id, today_order FROM tasks WHERE id = ?`)
-      .get(task.id) as { bucket: string; sort_order: number; project_id: string | null; today_order: number | null };
+      .prepare(`SELECT bucket, sort_order, project_id, today_order, today_dismissed_day FROM tasks WHERE id = ?`)
+      .get(task.id) as {
+      bucket: string;
+      sort_order: number;
+      project_id: string | null;
+      today_order: number | null;
+      today_dismissed_day: string | null;
+    };
     expect(after.bucket).toBe("today");
     expect(after.project_id).toBe(project.id);
-    expect(after.sort_order).toBe(before.sort_order); // home slot untouched
-    expect(after.today_order).not.toBeNull();
+    expect(after.sort_order).toBe(before.sort_order); // home slot untouched — no beforeId/afterId given
+    expect(after.today_order).toBeNull(); // abandoned column, never written
+    expect(after.today_dismissed_day).toBeNull(); // entering Today clears any (nonexistent) prior dismissal
   });
 
-  it("Today row -> Backlog (anywhere): unschedule snaps home to its own slot, ignoring beforeId/afterId", () => {
+  it("Today row -> Backlog (anywhere): unschedule snaps home to its own slot, ignoring beforeId/afterId, and stamps today_dismissed_day", () => {
     const a = create("a");
     const b = create("b");
     const scheduled = create("scheduled");
-    const homeOrder = (
-      conn.prepare(`SELECT sort_order FROM tasks WHERE id = ?`).get(scheduled.id) as { sort_order: number }
-    ).sort_order;
+    const homeBefore = conn.prepare(`SELECT sort_order, project_id, parent_id FROM tasks WHERE id = ?`).get(
+      scheduled.id,
+    ) as { sort_order: number; project_id: string | null; parent_id: string | null };
 
     db.moveTask(conn, { id: scheduled.id, bucket: "today", parentId: null, beforeId: null, afterId: null }, NOW);
     // Unschedule, dropped "between a and b" — snap-home must ignore this.
     db.moveTask(conn, { id: scheduled.id, bucket: "backlog", parentId: null, beforeId: b.id, afterId: a.id }, NOW);
 
     const row = conn
-      .prepare(`SELECT bucket, sort_order, today_order FROM tasks WHERE id = ?`)
-      .get(scheduled.id) as { bucket: string; sort_order: number; today_order: number | null };
+      .prepare(
+        `SELECT bucket, sort_order, project_id, parent_id, today_order, today_dismissed_day FROM tasks WHERE id = ?`,
+      )
+      .get(scheduled.id) as {
+      bucket: string;
+      sort_order: number;
+      project_id: string | null;
+      parent_id: string | null;
+      today_order: number | null;
+      today_dismissed_day: string | null;
+    };
     expect(row.bucket).toBe("backlog");
-    expect(row.sort_order).toBe(homeOrder); // snapped home, not between a and b
+    expect(row.sort_order).toBe(homeBefore.sort_order); // snapped home, not between a and b
+    expect(row.project_id).toBe(homeBefore.project_id);
+    expect(row.parent_id).toBe(homeBefore.parent_id);
     expect(row.today_order).toBeNull();
+    // Stamped so an overdue-and-scheduled task can't boomerang straight
+    // back into Today via TODAY_MEMBERSHIP_SQL the instant bucket flips.
+    expect(row.today_dismissed_day).toBe(localDay(NOW));
   });
 
-  it("Today row -> a different project's header: unschedule AND re-home", () => {
+  it("Today row -> a different project's header: unschedule AND re-home, and still stamps today_dismissed_day", () => {
     const projectA = db.createProject(conn, { listId, name: "A", color: "blue" }, NOW);
     const projectB = db.createProject(conn, { listId, name: "B", color: "red" }, NOW);
     const task = create("t", { projectId: projectA.id });
@@ -1169,33 +1190,35 @@ describe("moveTask — projects and the drag matrix", () => {
       NOW,
     );
 
-    const row = conn.prepare(`SELECT bucket, project_id, today_order FROM tasks WHERE id = ?`).get(task.id) as {
+    const row = conn
+      .prepare(`SELECT bucket, project_id, today_order, today_dismissed_day FROM tasks WHERE id = ?`)
+      .get(task.id) as {
       bucket: string;
       project_id: string | null;
       today_order: number | null;
+      today_dismissed_day: string | null;
     };
     expect(row.bucket).toBe("backlog");
     expect(row.project_id).toBe(projectB.id);
     expect(row.today_order).toBeNull();
+    expect(row.today_dismissed_day).toBe(localDay(NOW));
   });
 
-  it("Today row -> Today: reorder writes today_order only, sort_order (home slot) untouched", () => {
+  it("Today row -> Today: reorder writes sort_order directly — Today shares the Backlog's order column now, so this is visible there too", () => {
     const a = create("a");
     const b = create("b");
     db.moveTask(conn, { id: a.id, bucket: "today", parentId: null, beforeId: null, afterId: null }, NOW);
     db.moveTask(conn, { id: b.id, bucket: "today", parentId: null, beforeId: null, afterId: null }, NOW);
-    const aHomeBefore = (conn.prepare(`SELECT sort_order FROM tasks WHERE id = ?`).get(a.id) as { sort_order: number })
-      .sort_order;
 
     db.moveTask(conn, { id: a.id, bucket: "today", parentId: null, beforeId: b.id, afterId: null }, NOW);
 
     const aAfter = conn.prepare(`SELECT sort_order, today_order FROM tasks WHERE id = ?`).get(a.id) as {
       sort_order: number;
-      today_order: number;
+      today_order: number | null;
     };
-    expect(aAfter.sort_order).toBe(aHomeBefore);
-    const bRow = conn.prepare(`SELECT today_order FROM tasks WHERE id = ?`).get(b.id) as { today_order: number };
-    expect(aAfter.today_order).toBeLessThan(bRow.today_order);
+    const bRow = conn.prepare(`SELECT sort_order FROM tasks WHERE id = ?`).get(b.id) as { sort_order: number };
+    expect(aAfter.sort_order).toBeLessThan(bRow.sort_order);
+    expect(aAfter.today_order).toBeNull(); // abandoned column, never written
   });
 
   it("project task -> another project: re-home writes sort_order only (today_order stays untouched/null)", () => {
@@ -1268,7 +1291,7 @@ describe("moveTask — projects and the drag matrix", () => {
   });
 });
 
-describe("getBoard — ghost rows and trail", () => {
+describe("Today dismissal — the boomerang fix", () => {
   let conn: Database.Database;
   let listId: string;
 
@@ -1278,14 +1301,227 @@ describe("getBoard — ghost rows and trail", () => {
     listId = (conn.prepare(`SELECT id FROM lists ORDER BY sort_order LIMIT 1`).get() as { id: string }).id;
   });
 
-  it("backlog.tasks includes a today-flagged top-level row (ghost) alongside genuine backlog rows, but backlog.total counts only true backlog rows", () => {
-    const project = db.createProject(conn, { listId, name: "Q3", color: "blue" }, NOW);
-    const backlogTask = db.createTask(
+  // Named regression test: a task that is BOTH overdue AND manually
+  // scheduled must not immediately re-satisfy TODAY_MEMBERSHIP_SQL once
+  // it's dragged back out to the Backlog — that's exactly the boomerang
+  // moveTask's dismissal stamp exists to prevent.
+  it("BOOMERANG: an overdue, manually-scheduled task moved today->backlog does not satisfy Today membership afterwards", () => {
+    const overdueMs = new Date(2026, 7, 10, 9, 0, 0).getTime();
+    const task = db.createTask(
+      conn,
+      {
+        listId,
+        bucket: "today",
+        title: "overdue and scheduled",
+        parentId: null,
+        dueAt: overdueMs,
+        hasDueTime: true,
+        position: "bottom",
+      },
+      NOW,
+    );
+
+    db.moveTask(conn, { id: task.id, bucket: "backlog", parentId: null, beforeId: null, afterId: null }, NOW);
+
+    const row = conn
+      .prepare(`SELECT bucket, day, due_at, today_dismissed_day FROM tasks WHERE id = ?`)
+      .get(task.id) as {
+      bucket: "backlog" | "today";
+      day: string | null;
+      due_at: number | null;
+      today_dismissed_day: string | null;
+    };
+    const today = localDay(NOW);
+    const startOfTomorrowMs = startOfNextLocalDay(NOW);
+    expect(db.isTodayMember(row, today, startOfTomorrowMs)).toBe(false);
+
+    // The board agrees: the row does not render as inToday.
+    const board = db.getBoard(conn, listId, NOW);
+    const dto = board.backlog.tasks.find((t) => t.id === task.id)!;
+    expect(dto.inToday).toBe(false);
+  });
+
+  it("entering Today clears an earlier dismissal", () => {
+    const overdueMs = new Date(2026, 7, 10, 9, 0, 0).getTime();
+    const task = db.createTask(
+      conn,
+      { listId, bucket: "backlog", title: "overdue", parentId: null, dueAt: overdueMs, hasDueTime: true, position: "bottom" },
+      NOW,
+    );
+    db.dismissFromToday(conn, task.id, NOW);
+    let row = conn.prepare(`SELECT today_dismissed_day FROM tasks WHERE id = ?`).get(task.id) as {
+      today_dismissed_day: string | null;
+    };
+    expect(row.today_dismissed_day).toBe(localDay(NOW));
+
+    db.moveTask(conn, { id: task.id, bucket: "today", parentId: null, beforeId: null, afterId: null }, NOW);
+    row = conn.prepare(`SELECT today_dismissed_day FROM tasks WHERE id = ?`).get(task.id) as {
+      today_dismissed_day: string | null;
+    };
+    expect(row.today_dismissed_day).toBeNull();
+  });
+});
+
+describe("dismissFromToday", () => {
+  let conn: Database.Database;
+  let listId: string;
+
+  beforeEach(() => {
+    conn = freshDb();
+    db.seed(conn, NOW);
+    listId = (conn.prepare(`SELECT id FROM lists ORDER BY sort_order LIMIT 1`).get() as { id: string }).id;
+  });
+
+  function createOverdue() {
+    return db.createTask(
       conn,
       {
         listId,
         bucket: "backlog",
-        title: "in backlog",
+        title: "auto-included",
+        parentId: null,
+        dueAt: new Date(2026, 7, 18, 9, 0, 0).getTime(),
+        hasDueTime: true,
+        position: "bottom",
+      },
+      NOW,
+    );
+  }
+
+  it("writes only today_dismissed_day and updated_at — no other column changes", () => {
+    const task = createOverdue();
+    const before = conn.prepare(`SELECT * FROM tasks WHERE id = ?`).get(task.id) as Record<string, unknown>;
+
+    db.dismissFromToday(conn, task.id, NOW);
+
+    const after = conn.prepare(`SELECT * FROM tasks WHERE id = ?`).get(task.id) as Record<string, unknown>;
+    for (const key of Object.keys(before)) {
+      if (key === "today_dismissed_day" || key === "updated_at") continue;
+      expect(after[key]).toEqual(before[key]);
+    }
+    expect(after.today_dismissed_day).toBe(localDay(NOW));
+  });
+
+  it("is self-expiring: a dismissal recorded yesterday no longer suppresses membership today", () => {
+    const task = createOverdue();
+    const yesterday = new Date(2026, 7, 19, 12, 0, 0);
+    db.dismissFromToday(conn, task.id, yesterday);
+
+    const board = db.getBoard(conn, listId, NOW); // NOW is 2026-08-20
+    const dto = board.backlog.tasks.find((t) => t.id === task.id)!;
+    expect(dto.inToday).toBe(true); // a prior day's dismissal is inert today
+  });
+
+  it("throws not_found for an unknown id", () => {
+    expect(() => db.dismissFromToday(conn, "tsk_missing", NOW)).toThrow(/not_found/);
+  });
+});
+
+describe("getBoard — ring survives the vanish", () => {
+  it("an auto-included (never manually scheduled) task still counts in today.planned after it completes and vanishes from the open backlog", () => {
+    const conn = freshDb();
+    db.seed(conn, NOW);
+    const listId = (conn.prepare(`SELECT id FROM lists ORDER BY sort_order LIMIT 1`).get() as { id: string }).id;
+    const overdue = db.createTask(
+      conn,
+      {
+        listId,
+        bucket: "backlog",
+        title: "overdue, never scheduled",
+        parentId: null,
+        dueAt: new Date(2026, 7, 18, 9, 0, 0).getTime(),
+        hasDueTime: true,
+        position: "bottom",
+      },
+      NOW,
+    );
+
+    const before = db.getBoard(conn, listId, NOW);
+    expect(before.backlog.tasks.find((t) => t.id === overdue.id)?.inToday).toBe(true);
+    expect(before.today.planned).toBe(1);
+    expect(before.today.completed).toBe(0);
+
+    db.completeTask(conn, overdue.id, NOW);
+
+    const dayRow = conn.prepare(`SELECT day FROM tasks WHERE id = ?`).get(overdue.id) as { day: string | null };
+    expect(dayRow.day).toBe(localDay(NOW)); // stamped at completion — never written before this
+
+    const after = db.getBoard(conn, listId, NOW);
+    expect(after.backlog.tasks.find((t) => t.id === overdue.id)).toBeUndefined(); // vanished (done, no longer open)
+    expect(after.today.completed).toBe(1);
+    expect(after.today.planned).toBe(1); // denominator survives the vanish
+  });
+});
+
+describe("TaskDto.inToday drift guard", () => {
+  it("board.backlog.tasks' inToday always matches isTodayMember recomputed independently from the raw columns", () => {
+    const conn = freshDb();
+    db.seed(conn, NOW);
+    const listId = (conn.prepare(`SELECT id FROM lists ORDER BY sort_order LIMIT 1`).get() as { id: string }).id;
+
+    const manual = db.createTask(
+      conn,
+      { listId, bucket: "today", title: "manual", parentId: null, dueAt: null, hasDueTime: false, position: "bottom" },
+      NOW,
+    );
+    const dismissedOverdue = db.createTask(
+      conn,
+      {
+        listId,
+        bucket: "backlog",
+        title: "overdue, dismissed today",
+        parentId: null,
+        dueAt: new Date(2026, 7, 18, 9, 0, 0).getTime(),
+        hasDueTime: true,
+        position: "bottom",
+      },
+      NOW,
+    );
+    db.dismissFromToday(conn, dismissedOverdue.id, NOW);
+    const plain = db.createTask(
+      conn,
+      { listId, bucket: "backlog", title: "plain", parentId: null, dueAt: null, hasDueTime: false, position: "bottom" },
+      NOW,
+    );
+
+    const board = db.getBoard(conn, listId, NOW);
+    const today = localDay(NOW);
+    const startOfTomorrowMs = startOfNextLocalDay(NOW);
+    for (const dto of board.backlog.tasks) {
+      const row = conn
+        .prepare(`SELECT bucket, day, due_at, today_dismissed_day FROM tasks WHERE id = ?`)
+        .get(dto.id) as {
+        bucket: "backlog" | "today";
+        day: string | null;
+        due_at: number | null;
+        today_dismissed_day: string | null;
+      };
+      expect(dto.inToday).toBe(db.isTodayMember(row, today, startOfTomorrowMs));
+    }
+    expect(board.backlog.tasks.find((t) => t.id === manual.id)?.inToday).toBe(true);
+    expect(board.backlog.tasks.find((t) => t.id === dismissedOverdue.id)?.inToday).toBe(false);
+    expect(board.backlog.tasks.find((t) => t.id === plain.id)?.inToday).toBe(false);
+  });
+});
+
+describe("getBoard — comprehensive backlog and trail", () => {
+  let conn: Database.Database;
+  let listId: string;
+
+  beforeEach(() => {
+    conn = freshDb();
+    db.seed(conn, NOW);
+    listId = (conn.prepare(`SELECT id FROM lists ORDER BY sort_order LIMIT 1`).get() as { id: string }).id;
+  });
+
+  it("backlog.tasks is comprehensive: a manually-scheduled task and an auto-included (due-today) task both appear exactly once, undimmed — no ghost concept", () => {
+    const project = db.createProject(conn, { listId, name: "Q3", color: "blue" }, NOW);
+    const plain = db.createTask(
+      conn,
+      {
+        listId,
+        bucket: "backlog",
+        title: "plain",
         parentId: null,
         dueAt: null,
         hasDueTime: false,
@@ -1309,16 +1545,36 @@ describe("getBoard — ghost rows and trail", () => {
       NOW,
     );
     db.moveTask(conn, { id: scheduled.id, bucket: "today", parentId: null, beforeId: null, afterId: null }, NOW);
+    const dueToday = db.createTask(
+      conn,
+      {
+        listId,
+        bucket: "backlog",
+        title: "auto-included",
+        parentId: null,
+        dueAt: new Date(2026, 7, 20, 9, 0, 0).getTime(),
+        hasDueTime: true,
+        position: "bottom",
+      },
+      NOW,
+    );
 
     const board = db.getBoard(conn, listId, NOW);
-    expect(board.backlog.tasks.map((t) => t.id).sort()).toEqual([backlogTask.id, scheduled.id].sort());
-    expect(board.backlog.total).toBe(1); // only the genuine backlog row
-    const ghost = board.backlog.tasks.find((t) => t.id === scheduled.id)!;
-    expect(ghost.bucket).toBe("today");
-    expect(board.today.tasks.map((t) => t.id)).toEqual([scheduled.id]);
+    const ids = board.backlog.tasks.map((t) => t.id);
+    expect(new Set(ids)).toEqual(new Set([plain.id, scheduled.id, dueToday.id]));
+    expect(ids.length).toBe(3); // exactly once each
+    expect(board.backlog.total).toBe(3); // every open top-level row — no ghost-vs-genuine split anymore
+
+    const scheduledDto = board.backlog.tasks.find((t) => t.id === scheduled.id)!;
+    expect(scheduledDto.bucket).toBe("today");
+    expect(scheduledDto.inToday).toBe(true);
+
+    const dueTodayDto = board.backlog.tasks.find((t) => t.id === dueToday.id)!;
+    expect(dueTodayDto.bucket).toBe("backlog"); // never manually scheduled
+    expect(dueTodayDto.inToday).toBe(true); // auto-included purely by due date
   });
 
-  it("today.tasks is flat: a subtask scheduled on its own appears as a standalone row (its unscheduled parent does not)", () => {
+  it("inToday is true for a subtask scheduled on its own, without scheduling its parent", () => {
     const parent = db.createTask(
       conn,
       { listId, bucket: "backlog", title: "parent", parentId: null, dueAt: null, hasDueTime: false, position: "bottom" },
@@ -1340,9 +1596,11 @@ describe("getBoard — ghost rows and trail", () => {
     db.moveTask(conn, { id: child.id, bucket: "today", parentId: parent.id, beforeId: null, afterId: null }, NOW);
 
     const board = db.getBoard(conn, listId, NOW);
-    expect(board.today.tasks.map((t) => t.id)).toEqual([child.id]);
-    expect(board.today.tasks[0].subtasks).toEqual([]);
-    expect(board.today.tasks[0].parentId).toBe(parent.id);
+    const parentDto = board.backlog.tasks.find((t) => t.id === parent.id)!;
+    expect(parentDto.inToday).toBe(false); // scheduling the subtask did not schedule the parent
+    const childDto = parentDto.subtasks.find((t) => t.id === child.id)!;
+    expect(childDto.inToday).toBe(true);
+    expect(childDto.bucket).toBe("today");
   });
 
   it("trail is null for a loose top-level task, and populated with project name/color and parent title otherwise", () => {
@@ -1385,7 +1643,8 @@ describe("getBoard — ghost rows and trail", () => {
     const looseDto = board.backlog.tasks.find((t) => t.id === loose.id)!;
     expect(looseDto.trail).toBeNull();
 
-    const childDto = board.today.tasks.find((t) => t.id === child.id)!;
+    const parentDto = board.backlog.tasks.find((t) => t.id === parent.id)!;
+    const childDto = parentDto.subtasks.find((t) => t.id === child.id)!;
     expect(childDto.trail).toEqual({
       projectId: project.id,
       projectName: "Q3 Launch",
@@ -1418,7 +1677,7 @@ describe("getArchive grouping", () => {
     db.completeTask(conn, dayOneTask.id, earlier);
     db.completeTask(conn, dayTwoTask.id, later);
 
-    const archive = db.getArchive(conn, listId, 100, 0);
+    const archive = db.getArchive(conn, listId, 100, 0, NOW);
     expect(archive.total).toBe(2);
     expect(archive.groups.map((g) => g.day)).toEqual(["2026-08-19", "2026-08-18"]);
     expect(archive.groups[0].tasks[0].id).toBe(dayTwoTask.id);
