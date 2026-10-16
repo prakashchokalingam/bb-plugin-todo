@@ -2,10 +2,12 @@
 // first argument; server.ts only wires these up to RPC methods and handles
 // bb-specific concerns (kv, realtime, background scheduling).
 import type Database from "better-sqlite3";
-import type { ListDto, ProjectDto, TagColor, TagDto, TagRefDto, TaskDto, TrailDto } from "../contract.js";
-import { localDay, startOfNextLocalDay } from "./day.js";
+import { IMAGE_LIMITS, type ImageDto, type ListDto, type ProjectDto, type TagColor, type TagDto, type TagRefDto, type TaskDto, type TrailDto } from "../contract.js";
+import { localDay, localDayDiff } from "./day.js";
 import { mintListId, mintProjectId, mintTagId, mintTaskId } from "./ids.js";
+import { imageDtoFromRow, type StagedImage } from "./images.js";
 import { needsRebalance, nextOrder } from "./order.js";
+import { normalizeTitle } from "./taskText.js";
 
 // Ship exactly these statements, in this order. APPEND-ONLY: never edit or
 // reorder a shipped statement, only add new ones at the end.
@@ -100,6 +102,199 @@ export const MIGRATIONS: string[] = [
   // backfill: default 0 (expanded) is already the correct starting state
   // for every existing project.
   `ALTER TABLE projects ADD COLUMN today_collapsed INTEGER NOT NULL DEFAULT 0;`,
+  // 18 — the today-as-view rename: `bucket` ('backlog'/'today') becomes
+  // `stage` ('pending'/'in_progress'), and its two satellite columns
+  // rename to match (`today_order` -> `in_progress_order`,
+  // `today_dismissed_day` -> `dismissed_day`). SQLite cannot ALTER a CHECK
+  // constraint in place, so this has to be a full table rebuild rather
+  // than a rename-in-place like migration 19 gets away with below.
+  //
+  // The single highest-risk part of this migration: `task_tags.task_id`
+  // carries `REFERENCES tasks(id) ON DELETE CASCADE` (migration 8), and
+  // this connection runs with `foreign_keys = ON` for the *entire*
+  // migration run — server.ts sets the pragma before calling
+  // `bb.storage.migrate`, and that runner wraps every statement in this
+  // array in one single `db.transaction()`. `PRAGMA foreign_keys` is a
+  // documented no-op while a transaction is open, so there is no point in
+  // this migration where it can be switched off — confirmed empirically
+  // (`db.pragma("foreign_keys = OFF")` mid-transaction leaves it reading
+  // back as 1). With foreign_keys on, a plain `DROP TABLE tasks` performs
+  // an implicit `DELETE FROM tasks` first and DOES run the cascade action
+  // on that implicit delete — so the naive "create tasks_new, copy in,
+  // drop tasks, rename" recipe would silently wipe every `task_tags` row
+  // the instant `DROP TABLE tasks` ran. Verified the same way: dropping a
+  // table with a live `ON DELETE CASCADE` child, under `foreign_keys =
+  // ON`, deletes every child row regardless of whether a transaction is
+  // open.
+  //
+  // The fix is to get `tasks` out from under `task_tags`'s FK *before*
+  // anything is dropped, then move the FK itself rather than the data
+  // under it:
+  //   1. `ALTER TABLE tasks RENAME TO tasks_old` — modern SQLite
+  //      (`legacy_alter_table = 0`, the default here) rewrites the
+  //      REFERENCES clause in every *other* table's schema when you
+  //      rename a table, so this retargets `task_tags`'s FK to
+  //      `tasks_old` without touching a single row.
+  //   2. Create the new `tasks` under its live final name — with nothing
+  //      pointed at it yet, so no cascade can fire against it.
+  //   3. Copy every row across, translating `bucket`/`today_order`/
+  //      `today_dismissed_day` to `stage`/`in_progress_order`/
+  //      `dismissed_day` (explicit column lists both sides, never
+  //      `SELECT *`).
+  //   4. Rebuild `task_tags` itself (its shape doesn't change, only what
+  //      its FK points at) so it targets the new `tasks`, not
+  //      `tasks_old`.
+  //   5. Only now is `tasks_old` unreferenced by anything, so
+  //      `DROP TABLE tasks_old` is a plain, cascade-free removal.
+  // See the "migration 18" describe block in db.test.ts for the
+  // regression test that builds a pre-18 fixture (with task_tags rows and
+  // subtasks) and asserts nothing is lost.
+  `
+    ALTER TABLE tasks RENAME TO tasks_old;
+
+    CREATE TABLE tasks (
+      id TEXT PRIMARY KEY,
+      list_id TEXT NOT NULL REFERENCES lists(id) ON DELETE CASCADE,
+      parent_id TEXT REFERENCES tasks(id) ON DELETE CASCADE,
+      title TEXT NOT NULL,
+      notes TEXT,
+      stage TEXT NOT NULL CHECK (stage IN ('pending','in_progress')),
+      day TEXT,
+      sort_order REAL NOT NULL,
+      due_at INTEGER,
+      has_due_time INTEGER NOT NULL DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','done')),
+      completed_at INTEGER,
+      carried_count INTEGER NOT NULL DEFAULT 0,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      project_id TEXT REFERENCES projects(id),
+      in_progress_order REAL,
+      dismissed_day TEXT
+    );
+
+    INSERT INTO tasks (
+      id, list_id, parent_id, title, notes, stage, day, sort_order, due_at,
+      has_due_time, status, completed_at, carried_count, created_at,
+      updated_at, project_id, in_progress_order, dismissed_day
+    )
+    SELECT
+      id, list_id, parent_id, title, notes,
+      CASE bucket WHEN 'today' THEN 'in_progress' ELSE 'pending' END,
+      day, sort_order, due_at, has_due_time, status, completed_at,
+      carried_count, created_at, updated_at, project_id, today_order,
+      today_dismissed_day
+    FROM tasks_old
+    -- Belt-and-suspenders: parent_id self-references this same table, and
+    -- SQLite checks an immediate (non-deferred) FK constraint at the end of
+    -- the statement, not per row -- verified empirically (a child row
+    -- scanned before its parent within one INSERT...SELECT still passes,
+    -- since every row is already present by the time the check runs). This
+    -- ORDER BY isn't required for that reason, but makes the safety
+    -- self-evident rather than resting on an unstated engine behavior, and
+    -- costs nothing. Subtasks are capped at one level (invariant 1 -- a
+    -- subtask can never itself be a parent), so a single top-level-first
+    -- pass is sufficient; this would need a depth-ordered pass if that cap
+    -- were ever lifted.
+    ORDER BY (parent_id IS NOT NULL);
+
+    CREATE TABLE task_tags_new (
+      task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+      tag_id  TEXT NOT NULL REFERENCES tags(id)  ON DELETE CASCADE,
+      PRIMARY KEY (task_id, tag_id)
+    );
+    INSERT INTO task_tags_new (task_id, tag_id) SELECT task_id, tag_id FROM task_tags;
+    DROP TABLE task_tags;
+    ALTER TABLE task_tags_new RENAME TO task_tags;
+
+    DROP TABLE tasks_old;
+
+    CREATE INDEX IF NOT EXISTS tasks_board_idx
+      ON tasks (list_id, status, stage, parent_id, sort_order);
+    CREATE INDEX IF NOT EXISTS tasks_archive_idx
+      ON tasks (list_id, status, completed_at DESC);
+    CREATE INDEX IF NOT EXISTS tasks_due_idx ON tasks (status, due_at);
+    CREATE INDEX IF NOT EXISTS tasks_parent_idx ON tasks (parent_id);
+    CREATE INDEX IF NOT EXISTS tasks_project_idx ON tasks (list_id, project_id, sort_order);
+    CREATE INDEX IF NOT EXISTS task_tags_tag_idx ON task_tags (tag_id);
+  `,
+  // 19 — the projects half of the same rename. No CHECK constraint on this
+  // column, so unlike migration 18 this can be a plain in-place rename;
+  // SQLite has supported ALTER TABLE ... RENAME COLUMN since 3.25.0.
+  `ALTER TABLE projects RENAME COLUMN today_collapsed TO in_progress_collapsed;`,
+  // 20 — "Today" is deleted entirely: In Progress membership is now SOLELY
+  // `stage = 'in_progress'`. A due date is just a due date and never pulls a
+  // task into In Progress. That retires `day` (which calendar day a row
+  // belonged to In Progress) and `dismissed_day` (the due-date-auto-include
+  // refusal stamp) — both meaningless once due dates can't cause membership
+  // — and replaces the old `carried_count` mechanic with `in_progress_since`
+  // (epoch ms, stamped the instant `stage` flips pending -> in_progress,
+  // cleared to NULL the instant it flips back — the counter resets on
+  // park, by design). `carriedDays` on the wire is derived from it at read
+  // time (`localDayDiff` in lib/day.ts) instead of being a durable counter.
+  //
+  // `carried_count` itself is deliberately KEPT (not dropped) for one
+  // release as a read-only escape hatch: nothing in this file reads or
+  // writes it after the one-time backfill below, but a rollback to
+  // pre-migration-20 code can still make sense of it.
+  //
+  // Unlike migration 18, nothing here touches a CHECK constraint (`stage`'s
+  // constraint is untouched), so this doesn't need migration 18's full
+  // table-rebuild recipe: SQLite has supported `ALTER TABLE ... DROP COLUMN`
+  // directly since 3.35.0 (this project's bundled better-sqlite3 ships
+  // 3.53.2), and none of `day`/`in_progress_order`/`dismissed_day` is part
+  // of an index, a UNIQUE/CHECK constraint, or a foreign key, so the direct
+  // drop applies cleanly — and, unlike a `DROP TABLE tasks` rebuild, can
+  // never trip migration 18's `task_tags ON DELETE CASCADE` hazard, since
+  // the `tasks` table itself is never dropped or recreated.
+  `
+    ALTER TABLE tasks ADD COLUMN in_progress_since INTEGER;
+
+    -- Backfill: preserve every existing "carried Nx" streak as
+    -- in_progress_since = now - N days, so a task already carried 6 times
+    -- reads as carried 6d immediately, with no reset. strftime('%s','now')
+    -- is already UTC epoch seconds, so multiplying by 1000 is a correct
+    -- epoch-ms "now" independent of server timezone.
+    UPDATE tasks
+    SET in_progress_since = CAST(strftime('%s','now') AS INTEGER) * 1000 - carried_count * 86400000
+    WHERE stage = 'in_progress' AND status = 'open';
+
+    ALTER TABLE tasks DROP COLUMN day;
+    ALTER TABLE tasks DROP COLUMN in_progress_order;
+    ALTER TABLE tasks DROP COLUMN dismissed_day;
+  `,
+  // 21 — image attachments. One row per file; the bytes live on disk under
+  // the plugin data dir (lib/images.ts), never in this database. The FK
+  // cascade means deleting a task, subtask, list, or the archive deletes its
+  // rows; trigger 24 turns every such delete into a durable cleanup entry.
+  `CREATE TABLE IF NOT EXISTS task_images (
+    id         TEXT PRIMARY KEY,
+    task_id    TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    file_name  TEXT NOT NULL UNIQUE,
+    mime       TEXT NOT NULL,
+    size       INTEGER NOT NULL,
+    created_at INTEGER NOT NULL
+  );`,
+  // 22
+  `CREATE INDEX IF NOT EXISTS task_images_task_idx ON task_images (task_id, created_at);`,
+  // 23 — the durable delete queue: files that must be removed from disk.
+  // A row stays until its unlink succeeds, so a crash or a failing unlink
+  // is retried (with backoff) after restart.
+  `CREATE TABLE IF NOT EXISTS image_cleanup (
+    file_name       TEXT PRIMARY KEY,
+    queued_at       INTEGER NOT NULL,
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at INTEGER NOT NULL DEFAULT 0,
+    last_error      TEXT
+  );`,
+  // 24 — transactional outbox: any delete of a task_images row, including
+  // FK cascades, queues its file in the same transaction.
+  `CREATE TRIGGER IF NOT EXISTS task_images_queue_cleanup
+    AFTER DELETE ON task_images
+  BEGIN
+    INSERT OR IGNORE INTO image_cleanup (file_name, queued_at, attempts, next_attempt_at)
+    VALUES (OLD.file_name, CAST(strftime('%s','now') AS INTEGER) * 1000, 0, 0);
+  END;`,
 ];
 
 interface ListRow {
@@ -115,19 +310,23 @@ interface TaskRow {
   parent_id: string | null;
   title: string;
   notes: string | null;
-  bucket: "backlog" | "today";
-  day: string | null;
+  stage: "pending" | "in_progress";
   sort_order: number;
   due_at: number | null;
   has_due_time: number;
   status: "open" | "done";
   completed_at: number | null;
+  /** Read-only escape hatch (migration 20) — nothing in this file writes it
+   * anymore. `carriedDays` on the wire is derived from `in_progress_since`
+   * instead. */
   carried_count: number;
   created_at: number;
   updated_at: number;
   project_id: string | null;
-  today_order: number | null;
-  today_dismissed_day: string | null;
+  /** Epoch ms stamped the instant `stage` flips pending -> in_progress;
+   * cleared to NULL the instant it flips back to pending. The counter
+   * resets on park by design — see migration 20. */
+  in_progress_since: number | null;
 }
 
 interface ProjectRow {
@@ -136,7 +335,7 @@ interface ProjectRow {
   name: string;
   color: TagColor;
   collapsed: number;
-  today_collapsed: number;
+  in_progress_collapsed: number;
   sort_order: number;
   created_at: number;
 }
@@ -150,58 +349,34 @@ interface TagRow {
 }
 
 // ---------------------------------------------------------------------------
-// Today membership — the one predicate
+// In Progress membership — the one predicate
 //
-// "This row belongs to Today" has exactly one definition, expressed twice —
-// once as SQL, once as plain TS — so both a query and a client-side
-// recomputation can use it without either drifting out of sync with the
-// other or with itself over time. Wired into every caller that needs to
-// know "is this Today": getBoard's backlog query (via `inToday` on the
-// DTO) and planned count, getProjectDtos's todayCount badge, moveTask's
-// dismissal stamp, and completeTask's ring-preserving day stamp.
+// "This row belongs to In Progress" has exactly one definition, expressed
+// twice — once as SQL, once as plain TS — so both a query and a
+// client-side recomputation can use it without either drifting out of sync
+// with the other or with itself over time. Wired into every caller that
+// needs to know "is this In Progress": getBoard's backlog query (via
+// `inProgress` on the DTO) and planned count, and getProjectDtos's
+// inProgressCount badge.
+//
+// "Today" is gone as a concept entirely (see
+// docs/design/2026-08-31-today-as-view.md and its follow-up phase): a due
+// date never pulls a task into In Progress, so membership has collapsed to
+// a single column check with no bound parameters and no due-date/dismissal
+// arithmetic at all.
 // ---------------------------------------------------------------------------
 
-/**
- * member = (bucket = 'today' AND day = today)                        -- manual
- *        OR (due_at IS NOT NULL AND due_at < startOfTomorrow          -- due today or overdue
- *            AND (today_dismissed_day IS NULL OR today_dismissed_day <> today))
- *
- * Positional `?` placeholders, matching every other query in this file (no
- * named-parameter binding is used anywhere else in db.ts). Bind order —
- * `today` is needed twice (the manual check and the dismissal check share
- * the same value but SQLite has no named-parameter reuse with `?`):
- *   1. today             — YYYY-MM-DD, `localDay(now)`
- *   2. startOfTomorrowMs — epoch ms, exclusive upper bound; always
- *                          `startOfNextLocalDay(now)` (lib/day.ts), never
- *                          UTC/ms-arithmetic
- *   3. today             — YYYY-MM-DD, same value as (1) again
- *
- * Wrapped in its own parens so a caller can safely `AND`/`OR` it into a
- * larger WHERE clause without operator-precedence surprises.
- */
-export const TODAY_MEMBERSHIP_SQL = `(
-    (bucket = 'today' AND day = ?)
-    OR (due_at IS NOT NULL AND due_at < ? AND (today_dismissed_day IS NULL OR today_dismissed_day <> ?))
-  )`;
+export const IN_PROGRESS_MEMBERSHIP_SQL = `stage = 'in_progress'`;
 
 /**
- * Pure TS twin of `TODAY_MEMBERSHIP_SQL`, operating on the raw row shape so
- * tests — and, later, client-side code that only has the wire `TaskDto` —
- * can recompute membership without a database round trip. The two must
- * agree by construction: db.test.ts's drift guard runs both against the
- * same hand-built rows and asserts identical membership sets.
+ * Pure TS twin of `IN_PROGRESS_MEMBERSHIP_SQL`, operating on the raw row
+ * shape so tests — and, later, client-side code that only has the wire
+ * `TaskDto` — can recompute membership without a database round trip. The
+ * two must agree by construction: db.test.ts's drift guard runs both
+ * against the same hand-built rows and asserts identical membership sets.
  */
-export function isTodayMember(
-  row: { bucket: "backlog" | "today"; day: string | null; due_at: number | null; today_dismissed_day: string | null },
-  todayStr: string,
-  startOfTomorrowMs: number,
-): boolean {
-  const manual = row.bucket === "today" && row.day === todayStr;
-  const auto =
-    row.due_at !== null &&
-    row.due_at < startOfTomorrowMs &&
-    (row.today_dismissed_day === null || row.today_dismissed_day !== todayStr);
-  return manual || auto;
+export function isInProgressMember(row: { stage: "pending" | "in_progress" }): boolean {
+  return row.stage === "in_progress";
 }
 
 /** Seeds `Work` (1000) then `Personal` (2000) — only when `lists` is empty. */
@@ -227,13 +402,24 @@ export function seed(db: Database.Database, now: Date): void {
 // Row -> DTO helpers
 // ---------------------------------------------------------------------------
 
+/** `carriedDays` is derived at read time from `in_progress_since`, never
+ * stored — a task never in progress (or freshly entered) reads 0; the
+ * counter resets to 0 the instant a park (stage -> pending) clears
+ * `in_progress_since` back to NULL (see migration 20 / `setTaskStage`). */
+function computeCarriedDays(inProgressSince: number | null, now: Date): number {
+  if (inProgressSince === null) return 0;
+  return Math.max(0, localDayDiff(inProgressSince, now));
+}
+
 function taskRowToDto(
   row: TaskRow,
   subtasks: TaskDto[],
   counts: { total: number; done: number },
   tags: TagRefDto[],
+  images: ImageDto[],
   trail: TrailDto | null,
-  inToday: boolean,
+  inProgress: boolean,
+  now: Date,
 ): TaskDto {
   return {
     id: row.id,
@@ -241,22 +427,22 @@ function taskRowToDto(
     parentId: row.parent_id,
     title: row.title,
     notes: row.notes,
-    bucket: row.bucket,
-    day: row.day,
+    stage: row.stage,
     sortOrder: row.sort_order,
     dueAt: row.due_at,
     hasDueTime: !!row.has_due_time,
     status: row.status,
     completedAt: row.completed_at,
-    carriedCount: row.carried_count,
+    carriedDays: computeCarriedDays(row.in_progress_since, now),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     subtasks,
     subtaskCounts: counts,
     tags,
+    images,
     projectId: row.project_id,
     trail,
-    inToday,
+    inProgress,
   };
 }
 
@@ -303,6 +489,51 @@ function getTaskTags(db: Database.Database, taskId: string): TagRefDto[] {
     )
     .all(taskId) as { id: string; name: string; color: TagColor }[];
   return rows.map((r) => ({ id: r.id, name: r.name, color: r.color }));
+}
+
+interface ImageRow {
+  id: string;
+  task_id: string;
+  file_name: string;
+  mime: string;
+  size: number;
+  created_at: number;
+}
+
+type ImageMap = Map<string, ImageDto[]>;
+
+/** One query for every image in a list; thread the result down like `TagMap`. */
+function loadImageMap(db: Database.Database, listId: string): ImageMap {
+  const rows = db
+    .prepare(
+      `SELECT i.* FROM task_images i
+       JOIN tasks t ON t.id = i.task_id
+       WHERE t.list_id = ?
+       ORDER BY i.created_at, i.rowid`,
+    )
+    .all(listId) as ImageRow[];
+  const map: ImageMap = new Map();
+  for (const r of rows) {
+    const list = map.get(r.task_id);
+    if (list) list.push(imageDtoFromRow(r));
+    else map.set(r.task_id, [imageDtoFromRow(r)]);
+  }
+  return map;
+}
+
+function getTaskImages(db: Database.Database, taskId: string): ImageDto[] {
+  const rows = db
+    .prepare(`SELECT * FROM task_images WHERE task_id = ? ORDER BY created_at, rowid`)
+    .all(taskId) as ImageRow[];
+  return rows.map(imageDtoFromRow);
+}
+
+/** File name and mime for the `image` route; undefined when the id is unknown. */
+export function getImageFile(db: Database.Database, id: string): { fileName: string; mime: string } | undefined {
+  const row = db.prepare(`SELECT file_name, mime FROM task_images WHERE id = ?`).get(id) as
+    | { file_name: string; mime: string }
+    | undefined;
+  return row ? { fileName: row.file_name, mime: row.mime } : undefined;
 }
 
 function getTaskRow(db: Database.Database, id: string): TaskRow | undefined {
@@ -356,9 +587,9 @@ function getChildrenRows(db: Database.Database, parentId: string): TaskRow[] {
 /**
  * `sort_order`'s scope: a task's "home" — its position within its project
  * (or the loose group, when `projectId` is null) under its parent. This is
- * independent of `bucket`: a scheduled row (flagged today, still filed)
- * keeps its home slot exactly where it was, so unscheduling it later can
- * snap it back there (see `moveTask`'s snap-home rule).
+ * independent of `stage`: a scheduled row (flagged in progress, still
+ * filed) keeps its home slot exactly where it was, so unscheduling it later
+ * can snap it back there (see `moveTask`'s snap-home rule).
  */
 function getHomeSiblingRows(
   db: Database.Database,
@@ -388,11 +619,11 @@ function getHomeSiblingRows(
 /**
  * The only code path allowed to write `sort_order` (risk mitigation from
  * the design doc, made structurally true — see the regression test in
- * db.test.ts that greps this file for stray writes). `today_order` is
- * abandoned, not dropped (Phase 2 of the today-as-view plan): the column
- * stays in the schema as a rollback escape hatch, but nothing in this file
- * writes it anymore — Today now inherits `sort_order`, the same single
- * order column the Backlog always used.
+ * db.test.ts that greps this file for stray writes). `in_progress_order`
+ * (the column this narrowed `column` parameter used to also accept) was
+ * abandoned in an earlier phase and is now DROPPED entirely by migration
+ * 20 — In Progress inherits `sort_order`, the same single order column the
+ * Backlog always used.
  */
 function writeOrder(db: Database.Database, id: string, column: "sort_order", value: number | null, now: Date): void {
   db.prepare(`UPDATE tasks SET ${column} = ?, updated_at = ? WHERE id = ?`).run(value, now.getTime(), id);
@@ -409,23 +640,45 @@ function rebalanceHomeSiblingGroup(
   siblings.forEach((s, i) => writeOrder(db, s.id, "sort_order", (i + 1) * 1000, now));
 }
 
+/**
+ * `in_progress_since`'s write rule, shared by moveTask's stage-flip branch
+ * and setTaskStage — the single place that decides what happens to the
+ * carried-days clock on a stage change:
+ *   - flipping pending -> in_progress stamps "now" (the clock starts);
+ *   - flipping in_progress -> pending clears it to NULL (the counter
+ *     RESETS on park, by explicit design — restarting a parked task starts
+ *     the carried-days count from 0 again, not from where it left off);
+ *   - no flip at all (already in the target stage, e.g. a plain reorder)
+ *     leaves whatever value is already there untouched.
+ */
+function nextInProgressSince(
+  wasInProgress: boolean,
+  enteringInProgress: boolean,
+  current: number | null,
+  now: Date,
+): number | null {
+  if (enteringInProgress && !wasInProgress) return now.getTime();
+  if (!enteringInProgress && wasInProgress) return null;
+  return current;
+}
+
 /** Builds a top-level TaskDto with its open subtasks nested and full counts.
  * `tagMap`/`projectMap` are `undefined` for the single-DTO mutation return
- * paths, which use targeted lookups instead of a whole-board map.
- * `today`/`startOfTomorrowMs` feed `isTodayMember` for `inToday` on both the
- * row and every nested subtask — each row's own membership, not the
- * parent's. */
+ * paths, which use targeted lookups instead of a whole-board map. `now`
+ * feeds `computeCarriedDays` for `carriedDays` on both the row and every
+ * nested subtask — each row's own clock, not the parent's. */
 function buildTopLevelDto(
   db: Database.Database,
   row: TaskRow,
-  today: string,
-  startOfTomorrowMs: number,
+  now: Date,
   tagMap?: TagMap,
   projectMap?: ProjectMap,
+  imageMap?: ImageMap,
 ): TaskDto {
   const children = getChildrenRows(db, row.id);
   const done = children.filter((c) => c.status === "done").length;
   const tagsFor = (id: string) => (tagMap ? (tagMap.get(id) ?? []) : getTaskTags(db, id));
+  const imagesFor = (id: string) => (imageMap ? (imageMap.get(id) ?? []) : getTaskImages(db, id));
   const subtasks = children
     .filter((c) => c.status === "open")
     .map((c) =>
@@ -434,8 +687,10 @@ function buildTopLevelDto(
         [],
         { total: 0, done: 0 },
         tagsFor(c.id),
+        imagesFor(c.id),
         buildTrail(db, c, projectMap),
-        isTodayMember(c, today, startOfTomorrowMs),
+        isInProgressMember(c),
+        now,
       ),
     );
   return taskRowToDto(
@@ -443,29 +698,31 @@ function buildTopLevelDto(
     subtasks,
     { total: children.length, done },
     tagsFor(row.id),
+    imagesFor(row.id),
     buildTrail(db, row, projectMap),
-    isTodayMember(row, today, startOfTomorrowMs),
+    isInProgressMember(row),
+    now,
   );
 }
 
 /**
- * Overdue = open, has a due date in the past. `bucket` narrows to one
+ * Overdue = open, has a due date in the past. `stage` narrows to one
  * section; omit it to count across the whole list (used for ListDto and the
  * cross-list total).
  */
 function countOverdue(
   db: Database.Database,
   listId: string,
-  bucket: "backlog" | "today" | null,
+  stage: "pending" | "in_progress" | null,
   now: Date,
 ): number {
   const ts = now.getTime();
-  if (bucket) {
+  if (stage) {
     const row = db
       .prepare(
-        `SELECT COUNT(*) AS c FROM tasks WHERE list_id = ? AND bucket = ? AND status = 'open' AND due_at IS NOT NULL AND due_at < ?`,
+        `SELECT COUNT(*) AS c FROM tasks WHERE list_id = ? AND stage = ? AND status = 'open' AND due_at IS NOT NULL AND due_at < ?`,
       )
-      .get(listId, bucket, ts) as { c: number };
+      .get(listId, stage, ts) as { c: number };
     return row.c;
   }
   const row = db
@@ -493,7 +750,10 @@ function getListDtos(db: Database.Database, now: Date): ListDto[] {
 // Projects — read helpers
 // ---------------------------------------------------------------------------
 
-function projectRowToDto(row: ProjectRow, counts: { open: number; today: number; overdue: number }): ProjectDto {
+function projectRowToDto(
+  row: ProjectRow,
+  counts: { open: number; inProgress: number; overdue: number },
+): ProjectDto {
   return {
     id: row.id,
     listId: row.list_id,
@@ -501,18 +761,16 @@ function projectRowToDto(row: ProjectRow, counts: { open: number; today: number;
     color: row.color,
     sortOrder: row.sort_order,
     collapsed: !!row.collapsed,
-    todayCollapsed: !!row.today_collapsed,
+    inProgressCollapsed: !!row.in_progress_collapsed,
     openCount: counts.open,
-    todayCount: counts.today,
+    inProgressCount: counts.inProgress,
     overdueCount: counts.overdue,
   };
 }
 
-/** Counts (open/today/overdue) span every task filed to the project,
+/** Counts (open/inProgress/overdue) span every task filed to the project,
  * top-level and subtasks alike — same convention as ListDto.openCount. */
 function getProjectDtos(db: Database.Database, listId: string, now: Date): ProjectDto[] {
-  const today = localDay(now);
-  const startOfTomorrowMs = startOfNextLocalDay(now);
   const ts = now.getTime();
   const rows = db
     .prepare(`SELECT * FROM projects WHERE list_id = ? ORDER BY sort_order`)
@@ -523,13 +781,14 @@ function getProjectDtos(db: Database.Database, listId: string, now: Date): Proje
         c: number;
       }
     ).c;
-    // The same union getBoard uses (manually scheduled OR due today/
-    // overdue and undismissed) — so a project's "N today" badge picks up
-    // an auto-included task too, not just one someone dragged in.
-    const todayCount = (
+    // The same predicate getBoard uses (stage = 'in_progress', full stop) —
+    // so a project's "N in progress" badge always agrees with the column.
+    const inProgressCount = (
       db
-        .prepare(`SELECT COUNT(*) AS c FROM tasks WHERE project_id = ? AND status = 'open' AND ${TODAY_MEMBERSHIP_SQL}`)
-        .get(p.id, today, startOfTomorrowMs, today) as { c: number }
+        .prepare(
+          `SELECT COUNT(*) AS c FROM tasks WHERE project_id = ? AND status = 'open' AND ${IN_PROGRESS_MEMBERSHIP_SQL}`,
+        )
+        .get(p.id) as { c: number }
     ).c;
     const overdue = (
       db
@@ -538,7 +797,7 @@ function getProjectDtos(db: Database.Database, listId: string, now: Date): Proje
         )
         .get(p.id, ts) as { c: number }
     ).c;
-    return projectRowToDto(p, { open, today: todayCount, overdue });
+    return projectRowToDto(p, { open, inProgress: inProgressCount, overdue });
   });
 }
 
@@ -549,7 +808,7 @@ function getProjectDtos(db: Database.Database, listId: string, now: Date): Proje
 export interface BoardResult {
   lists: ListDto[];
   activeListId: string;
-  today: { day: string; planned: number; completed: number };
+  inProgress: { planned: number; completed: number };
   backlog: { total: number; overdue: number; tasks: TaskDto[] };
   totalOverdue: number;
   serverNow: number;
@@ -560,49 +819,50 @@ export interface BoardResult {
 export function getBoard(db: Database.Database, listId: string | null, now: Date): BoardResult {
   const lists = getListDtos(db, now);
   const activeListId = listId && lists.some((l) => l.id === listId) ? listId : lists[0].id;
-  const today = localDay(now);
-  const startOfTomorrowMs = startOfNextLocalDay(now);
   const tagMap = loadTagMap(db);
   const projectMap = loadProjectMap(db, activeListId);
+  const imageMap = loadImageMap(db, activeListId);
 
   // The Backlog is now the complete, always-true list of every open
-  // top-level task — no bucket filter, no ghost-manufacturing clause.
-  // `inToday` (computed per-row inside buildTopLevelDto via the shared
-  // `isTodayMember` predicate) is what flags which of these rows also
-  // belong to the Today view; nothing is excluded from the Backlog itself
-  // anymore. This is also why `today.tasks` no longer exists on the wire —
-  // everything a Today row needs is already here, once per task, so the
-  // client derives its own grouped Today view from this single tree.
+  // top-level task — no stage filter, no ghost-manufacturing clause.
+  // `inProgress` (computed per-row inside buildTopLevelDto via the shared
+  // `isInProgressMember` predicate) is what flags which of these rows also
+  // belong to the In Progress view; nothing is excluded from the Backlog
+  // itself anymore. This is also why `backlog.tasks` no longer has an
+  // In Progress-side twin on the wire — everything an In Progress row
+  // needs is already here, once per task, so the client derives its own
+  // grouped In Progress view from this single tree.
   const topBacklog = db
     .prepare(`SELECT * FROM tasks WHERE list_id = ? AND parent_id IS NULL AND status = 'open' ORDER BY sort_order`)
     .all(activeListId) as TaskRow[];
-  const backlogTasks = topBacklog.map((r) =>
-    buildTopLevelDto(db, r, today, startOfTomorrowMs, tagMap, projectMap),
-  );
+  const backlogTasks = topBacklog.map((r) => buildTopLevelDto(db, r, now, tagMap, projectMap, imageMap));
   const backlogTotal = (
     db
       .prepare(`SELECT COUNT(*) AS c FROM tasks WHERE list_id = ? AND parent_id IS NULL AND status = 'open'`)
       .get(activeListId) as { c: number }
   ).c;
 
-  // today.completed counts rows historically stamped `day = today` at the
-  // moment they were completed (see completeTask) — that stamp is what
-  // keeps a vanished row counted even though it no longer satisfies
-  // TODAY_MEMBERSHIP_SQL (done rows aren't `status = 'open'`, so they'd
-  // never match it anyway). today.planned adds every currently-open row
-  // that *does* satisfy the predicate, so the two halves of the ring can
-  // never disagree with what's actually in play right now.
+  // inProgress.completed counts DONE rows whose `stage` is still
+  // 'in_progress' — completing a task never touches `stage` (see
+  // completeTask), so this stays durable through the vanish with no special
+  // stamping needed: a row that was in progress when it was completed is
+  // simply still `stage = 'in_progress'` forever after. inProgress.planned
+  // adds every currently-open row that satisfies the membership predicate,
+  // so the two halves of the ring can never disagree with what's actually
+  // in play right now.
   const completed = (
     db
-      .prepare(`SELECT COUNT(*) AS c FROM tasks WHERE list_id = ? AND day = ? AND status = 'done'`)
-      .get(activeListId, today) as { c: number }
+      .prepare(`SELECT COUNT(*) AS c FROM tasks WHERE list_id = ? AND status = 'done' AND stage = 'in_progress'`)
+      .get(activeListId) as { c: number }
   ).c;
-  const openToday = (
+  const openInProgress = (
     db
-      .prepare(`SELECT COUNT(*) AS c FROM tasks WHERE list_id = ? AND status = 'open' AND ${TODAY_MEMBERSHIP_SQL}`)
-      .get(activeListId, today, startOfTomorrowMs, today) as { c: number }
+      .prepare(
+        `SELECT COUNT(*) AS c FROM tasks WHERE list_id = ? AND status = 'open' AND ${IN_PROGRESS_MEMBERSHIP_SQL}`,
+      )
+      .get(activeListId) as { c: number }
   ).c;
-  const planned = completed + openToday;
+  const planned = completed + openInProgress;
 
   const backlogOverdue = countOverdue(db, activeListId, null, now);
   const totalOverdue = lists.reduce((sum, l) => sum + l.overdueCount, 0);
@@ -610,7 +870,7 @@ export function getBoard(db: Database.Database, listId: string | null, now: Date
   return {
     lists,
     activeListId,
-    today: { day: today, planned, completed },
+    inProgress: { planned, completed },
     backlog: { total: backlogTotal, overdue: backlogOverdue, tasks: backlogTasks },
     totalOverdue,
     serverNow: now.getTime(),
@@ -632,18 +892,17 @@ export function getArchive(
   offset: number,
   now: Date,
 ): ArchiveResult {
-  // `inToday` is part of every TaskDto now (the contract's `.strict()`
+  // `inProgress` is part of every TaskDto now (the contract's `.strict()`
   // schema requires it), so an archived row needs one too — computed with
   // the same shared predicate as everywhere else, even though it's largely
-  // incidental here (Today's own selection logic never reads from the
-  // archive). `getArchive`'s nesting and `buildTrail` are otherwise
+  // incidental here (In Progress's own selection logic never reads from
+  // the archive). `getArchive`'s nesting and `buildTrail` are otherwise
   // untouched: unlike the Backlog, an archived subtask's parent may not be
   // on the current page, so this traversal still has to build its own tree
   // rather than delegate to a single comprehensive list.
-  const today = localDay(now);
-  const startOfTomorrowMs = startOfNextLocalDay(now);
   const tagMap = loadTagMap(db);
   const projectMap = loadProjectMap(db, listId);
+  const imageMap = loadImageMap(db, listId);
   const doneRows = db
     .prepare(`SELECT * FROM tasks WHERE list_id = ? AND status = 'done' ORDER BY completed_at DESC`)
     .all(listId) as TaskRow[];
@@ -669,8 +928,10 @@ export function getArchive(
         [],
         { total: 0, done: 0 },
         tagMap.get(r.id) ?? [],
+        imageMap.get(r.id) ?? [],
         buildTrail(db, r, projectMap),
-        isTodayMember(r, today, startOfTomorrowMs),
+        isInProgressMember(r),
+        now,
       );
     }
     const children = getChildrenRows(db, r.id);
@@ -684,8 +945,10 @@ export function getArchive(
           [],
           { total: 0, done: 0 },
           tagMap.get(c.id) ?? [],
+          imageMap.get(c.id) ?? [],
           buildTrail(db, c, projectMap),
-          isTodayMember(c, today, startOfTomorrowMs),
+          isInProgressMember(c),
+          now,
         ),
       );
     return taskRowToDto(
@@ -693,8 +956,10 @@ export function getArchive(
       nested,
       { total: children.length, done },
       tagMap.get(r.id) ?? [],
+      imageMap.get(r.id) ?? [],
       buildTrail(db, r, projectMap),
-      isTodayMember(r, today, startOfTomorrowMs),
+      isInProgressMember(r),
+      now,
     );
   };
 
@@ -719,7 +984,7 @@ export function getArchive(
 
 export interface CreateTaskInput {
   listId: string;
-  bucket: "backlog" | "today";
+  stage: "pending" | "in_progress";
   title: string;
   parentId: string | null;
   dueAt: number | null;
@@ -727,11 +992,36 @@ export interface CreateTaskInput {
   position: "top" | "bottom";
   /** Omitted or `null` = loose. Ignored (mirrors the parent's) for a subtask. */
   projectId?: string | null;
+  /** Files already written by `ImageStore.stage`; their rows join this transaction. */
+  images?: StagedImage[];
+}
+
+/**
+ * Inserts rows for staged files. Caller owns the transaction. Throws (so the
+ * transaction rolls back and the caller discards the files) when the task is
+ * gone or would exceed the per-task cap.
+ */
+function insertTaskImages(db: Database.Database, taskId: string, staged: readonly StagedImage[], now: Date): void {
+  if (staged.length === 0) return;
+  const { c } = db.prepare(`SELECT COUNT(*) AS c FROM task_images WHERE task_id = ?`).get(taskId) as { c: number };
+  if (c + staged.length > IMAGE_LIMITS.maxPerTask) {
+    throw new Error(`invalid_input: a task can have at most ${IMAGE_LIMITS.maxPerTask} images`);
+  }
+  const insert = db.prepare(
+    `INSERT INTO task_images (id, task_id, file_name, mime, size, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
+  );
+  for (const img of staged) insert.run(img.id, taskId, img.fileName, img.mime, img.size, now.getTime());
+}
+
+/** Removes only rows that belong to `taskId`; unknown ids are ignored (idempotent). */
+function deleteTaskImages(db: Database.Database, taskId: string, imageIds: readonly string[]): void {
+  const del = db.prepare(`DELETE FROM task_images WHERE id = ? AND task_id = ?`);
+  for (const id of imageIds) del.run(id, taskId);
 }
 
 export function createTask(db: Database.Database, input: CreateTaskInput, now: Date): TaskDto {
   return db.transaction(() => {
-    const title = input.title.trim();
+    const title = normalizeTitle(input.title);
     if (!title) throw new Error("invalid_input: title must not be empty");
 
     let parentRow: TaskRow | null = null;
@@ -743,8 +1033,15 @@ export function createTask(db: Database.Database, input: CreateTaskInput, now: D
     }
 
     const listId = parentRow ? parentRow.list_id : input.listId;
-    const bucket = parentRow ? parentRow.bucket : input.bucket;
-    const day = parentRow ? parentRow.day : bucket === "today" ? localDay(now) : null;
+    const stage = parentRow ? parentRow.stage : input.stage;
+    // A subtask mirrors its parent's carried-days clock exactly the way it
+    // mirrors `stage` (invariant 4); a fresh top-level task created directly
+    // into In Progress starts its own clock now.
+    const inProgressSince = parentRow
+      ? parentRow.in_progress_since
+      : stage === "in_progress"
+        ? now.getTime()
+        : null;
     const parentId = parentRow ? parentRow.id : null;
 
     // Invariant 2: a subtask's project_id always mirrors its parent's,
@@ -770,13 +1067,14 @@ export function createTask(db: Database.Database, input: CreateTaskInput, now: D
     const id = mintTaskId();
     const ts = now.getTime();
     db.prepare(
-      `INSERT INTO tasks (id, list_id, parent_id, title, notes, bucket, day, sort_order, due_at, has_due_time, status, completed_at, carried_count, project_id, created_at, updated_at)
+      `INSERT INTO tasks (id, list_id, parent_id, title, notes, stage, in_progress_since, sort_order, due_at, has_due_time, status, completed_at, carried_count, project_id, created_at, updated_at)
        VALUES (?, ?, ?, ?, NULL, ?, ?, 0, ?, ?, 'open', NULL, 0, ?, ?, ?)`,
-    ).run(id, listId, parentId, title, bucket, day, input.dueAt, input.hasDueTime ? 1 : 0, projectId, ts, ts);
+    ).run(id, listId, parentId, title, stage, inProgressSince, input.dueAt, input.hasDueTime ? 1 : 0, projectId, ts, ts);
 
     writeOrder(db, id, "sort_order", homeOrder, now);
+    insertTaskImages(db, id, input.images ?? [], now);
 
-    return buildTopLevelDto(db, getTaskRow(db, id) as TaskRow, localDay(now), startOfNextLocalDay(now));
+    return buildTopLevelDto(db, getTaskRow(db, id) as TaskRow, now);
   })();
 }
 
@@ -786,6 +1084,9 @@ export interface UpdateTaskInput {
   notes?: string | null;
   dueAt?: number | null;
   hasDueTime?: boolean;
+  /** Staged files to attach (see `ImageStore.stage`). Applied after removals. */
+  addImages?: StagedImage[];
+  removeImageIds?: string[];
 }
 
 export function updateTask(db: Database.Database, input: UpdateTaskInput, now: Date): TaskDto {
@@ -795,7 +1096,7 @@ export function updateTask(db: Database.Database, input: UpdateTaskInput, now: D
 
     let title = row.title;
     if (input.title !== undefined) {
-      title = input.title.trim();
+      title = normalizeTitle(input.title);
       if (!title) throw new Error("invalid_input: title must not be empty");
     }
     const notes = input.notes !== undefined ? input.notes : row.notes;
@@ -806,26 +1107,28 @@ export function updateTask(db: Database.Database, input: UpdateTaskInput, now: D
     db.prepare(
       `UPDATE tasks SET title = ?, notes = ?, due_at = ?, has_due_time = ?, updated_at = ? WHERE id = ?`,
     ).run(title, notes, dueAt, hasDueTime ? 1 : 0, ts, input.id);
+    deleteTaskImages(db, input.id, input.removeImageIds ?? []);
+    insertTaskImages(db, input.id, input.addImages ?? [], now);
 
     const updated = getTaskRow(db, input.id) as TaskRow;
-    const today = localDay(now);
-    const startOfTomorrowMs = startOfNextLocalDay(now);
     return updated.parent_id
       ? taskRowToDto(
           updated,
           [],
           { total: 0, done: 0 },
           getTaskTags(db, updated.id),
+          getTaskImages(db, updated.id),
           buildTrail(db, updated),
-          isTodayMember(updated, today, startOfTomorrowMs),
+          isInProgressMember(updated),
+          now,
         )
-      : buildTopLevelDto(db, updated, today, startOfTomorrowMs);
+      : buildTopLevelDto(db, updated, now);
   })();
 }
 
 export interface MoveTaskInput {
   id: string;
-  bucket: "backlog" | "today";
+  stage: "pending" | "in_progress";
   parentId: string | null;
   beforeId: string | null;
   afterId: string | null;
@@ -857,8 +1160,7 @@ export function moveTask(db: Database.Database, input: MoveTaskInput, now: Date)
     }
 
     const listId = row.list_id;
-    const newBucket = input.bucket;
-    const newDay = newBucket === "today" ? localDay(now) : null;
+    const newStage = input.stage;
     const newParentId = parentRow ? parentRow.id : null;
 
     // Invariant 2: a subtask's project_id always mirrors its parent's,
@@ -880,36 +1182,26 @@ export function moveTask(db: Database.Database, input: MoveTaskInput, now: Date)
 
     // Making `row` a subtask promotes its own children to top-level
     // siblings placed immediately after row's old spot, in their existing
-    // order — unrelated to Today: their own bucket/day/today_order are
-    // left exactly as they were (invariant 4).
+    // order — unrelated to In Progress: their own stage/in_progress_since
+    // are left exactly as they were (invariant 4).
     const promoted = newParentId ? getChildrenRows(db, row.id) : [];
 
-    const wasToday = row.bucket === "today";
-    const enteringToday = newBucket === "today";
-    // Snap-home: dropping a Today row into the Backlog "anywhere" does not
-    // reposition it — it returns to the home slot it never actually left.
-    // Only a drop that explicitly names a *different* project re-homes it.
+    const wasInProgress = row.stage === "in_progress";
+    const enteringInProgress = newStage === "in_progress";
+    // Snap-home: dropping an In Progress row into the Backlog "anywhere"
+    // does not reposition it — it returns to the home slot it never
+    // actually left. Only a drop that explicitly names a *different*
+    // project re-homes it.
     const reHome =
-      wasToday && !enteringToday && input.projectId !== undefined && input.projectId !== row.project_id;
-    const snapHome = wasToday && !enteringToday && !reHome;
+      wasInProgress && !enteringInProgress && input.projectId !== undefined && input.projectId !== row.project_id;
+    const snapHome = wasInProgress && !enteringInProgress && !reHome;
 
-    // Today membership is a flag on the row, not a separate place —
-    // `today_dismissed_day` is the one thing a bare `bucket` flip can't
-    // express: an explicit "take this out of Today" for a row that is (or
-    // remains) auto-included by its own due date. Stamped the instant a row
-    // leaves Today for the Backlog — this is what stops a manually
-    // scheduled *and* overdue task from boomeranging straight back in via
-    // TODAY_MEMBERSHIP_SQL the moment its `bucket` flips away from 'today'.
-    // Unconditional and harmless when the row has no due date at all.
-    // Cleared the instant a row (re-)enters Today: a prior dismissal from
-    // some earlier day is stale the moment the row is deliberately
-    // scheduled again.
-    const nextDismissedDay = enteringToday ? null : wasToday ? localDay(now) : row.today_dismissed_day;
+    const newInProgressSince = nextInProgressSince(wasInProgress, enteringInProgress, row.in_progress_since, now);
 
     const ts = now.getTime();
     db.prepare(
-      `UPDATE tasks SET bucket = ?, day = ?, parent_id = ?, project_id = ?, today_dismissed_day = ?, updated_at = ? WHERE id = ?`,
-    ).run(newBucket, newDay, newParentId, newProjectId, nextDismissedDay, ts, row.id);
+      `UPDATE tasks SET stage = ?, in_progress_since = ?, parent_id = ?, project_id = ?, updated_at = ? WHERE id = ?`,
+    ).run(newStage, newInProgressSince, newParentId, newProjectId, ts, row.id);
 
     // If row remains (or becomes) a top-level parent and its project
     // changed, its still-remaining children move with it (invariant 2).
@@ -919,16 +1211,17 @@ export function moveTask(db: Database.Database, input: MoveTaskInput, now: Date)
       db.prepare(`UPDATE tasks SET project_id = ? WHERE parent_id = ?`).run(newProjectId, row.id);
     }
 
-    // Today now inherits `sort_order` — there is exactly one order column,
-    // shared by both views, so entering/leaving/reordering within Today all
-    // go through the same home-sibling ordering below. `homeUnchanged`
-    // generalizes what used to be implicit: entering Today never touched
-    // `sort_order` (Today had its own column), so a drop that names neither
-    // a new position nor a new home must still leave the row exactly where
-    // it was — "a task's home never changes on schedule/unschedule" holds
-    // in both directions now, not just the snap-home one. `snapHome` stays
-    // the stronger, direction-specific rule for leaving Today: it ignores
-    // an explicit beforeId/afterId too, and takes precedence here.
+    // In Progress now inherits `sort_order` — there is exactly one order
+    // column, shared by both views, so entering/leaving/reordering within
+    // In Progress all go through the same home-sibling ordering below.
+    // `homeUnchanged` generalizes what used to be implicit: entering
+    // In Progress never touched `sort_order` (In Progress had its own
+    // column), so a drop that names neither a new position nor a new home
+    // must still leave the row exactly where it was — "a task's home never
+    // changes on schedule/unschedule" holds in both directions now, not
+    // just the snap-home one. `snapHome` stays the stronger,
+    // direction-specific rule for leaving In Progress: it ignores an
+    // explicit beforeId/afterId too, and takes precedence here.
     const homeUnchanged =
       !snapHome &&
       input.beforeId === null &&
@@ -995,33 +1288,22 @@ export function completeTask(
     const row = getTaskRow(db, id);
     if (!row) throw new Error("not_found: task not found");
 
-    const today = localDay(now);
-    const startOfTomorrowMs = startOfNextLocalDay(now);
     const ts = now.getTime();
     const completedIds: string[] = [];
 
-    // A completed row vanishes from the visible board immediately — but
-    // today.planned's ring must still count it if it was a
-    // TODAY_MEMBERSHIP_SQL member at the instant it completed. `day` is the
-    // only durable record getBoard reads for that (see its `completed`
-    // count); a MANUALLY scheduled row already has it stamped, but an
-    // AUTO-INCLUDED row (due today/overdue, never `bucket = 'today'`) has
-    // never had `day` written at all. Stamp it here, once, at completion —
-    // never `bucket`: this is a historical marker, not a reschedule.
-    // `isTodayMember` is evaluated against the row's pre-completion
-    // columns, so a dismissed-then-completed row is correctly not stamped.
+    // A completed row vanishes from the visible board immediately, but
+    // inProgress.planned's ring must still count it if it was in progress
+    // at the moment it completed. Unlike the old due-date-driven membership,
+    // this now needs no special stamping at all: `completeTask` never
+    // touches `stage`, so a row that was `stage = 'in_progress'` when it
+    // completed simply stays `stage = 'in_progress'` forever after, and
+    // getBoard's `completed` count reads that directly.
     const completeRow = (r: TaskRow): void => {
-      if (isTodayMember(r, today, startOfTomorrowMs) && r.day !== today) {
-        db.prepare(
-          `UPDATE tasks SET status = 'done', completed_at = ?, updated_at = ?, day = ? WHERE id = ?`,
-        ).run(ts, ts, today, r.id);
-      } else {
-        db.prepare(`UPDATE tasks SET status = 'done', completed_at = ?, updated_at = ? WHERE id = ?`).run(
-          ts,
-          ts,
-          r.id,
-        );
-      }
+      db.prepare(`UPDATE tasks SET status = 'done', completed_at = ?, updated_at = ? WHERE id = ?`).run(
+        ts,
+        ts,
+        r.id,
+      );
       completedIds.push(r.id);
     };
 
@@ -1041,22 +1323,55 @@ export function completeTask(
 }
 
 /**
- * The counterpart to `moveTask`'s dismissal stamp, for the case it can't
- * express: a task that was never manually scheduled (`bucket = 'backlog'`)
- * but renders in Today purely because it's due today or overdue — there is
- * nothing to move, so this is a single-column stamp. Writes ONLY
- * `today_dismissed_day` (plus `updated_at`); never touches `bucket`, `day`,
- * or any positional column.
+ * The one-click stage toggle in both directions. Unlike `moveTask`, this has
+ * no `beforeId`/`afterId`: there is no drop position to honor, only a
+ * direct "set the stage" request.
+ *
+ *   - `"in_progress"`: stamps `in_progress_since` to now (starting or
+ *     restarting the carried-days clock — see `nextInProgressSince`) and —
+ *     since there's no explicit drop position to snap to — places the row
+ *     at the top of its existing home-sibling group, the same "top" idiom
+ *     `createTask`'s `position: "top"` uses (In Progress inherits
+ *     `sort_order`, so "top of In Progress" is "top of its home group").
+ *     Subtask behavior mirrors a subtask's own row here too: a subtask's
+ *     stage is independent of its parent's (moveTask never cascades a
+ *     stage flip onto children either — see its "invariant 4" comment),
+ *     so this only ever touches the single row named by `id`.
+ *   - `"pending"`: clears `in_progress_since` back to NULL — the
+ *     carried-days counter RESETS on park, by design. Leaves `sort_order`
+ *     untouched — same snap-home rationale as moveTask's
+ *     leaving-In-Progress branch: the row returns to (or simply stays at)
+ *     its home slot rather than being repositioned.
  */
-export function dismissFromToday(db: Database.Database, id: string, now: Date): { listId: string } {
+export function setTaskStage(
+  db: Database.Database,
+  id: string,
+  stage: "pending" | "in_progress",
+  now: Date,
+): { listId: string } {
   return db.transaction(() => {
     const row = getTaskRow(db, id);
     if (!row) throw new Error("not_found: task not found");
-    db.prepare(`UPDATE tasks SET today_dismissed_day = ?, updated_at = ? WHERE id = ?`).run(
-      localDay(now),
-      now.getTime(),
-      id,
+
+    const wasInProgress = row.stage === "in_progress";
+    const enteringInProgress = stage === "in_progress";
+    const inProgressSince = nextInProgressSince(wasInProgress, enteringInProgress, row.in_progress_since, now);
+    const ts = now.getTime();
+
+    db.prepare(`UPDATE tasks SET stage = ?, in_progress_since = ?, updated_at = ? WHERE id = ?`).run(
+      stage,
+      inProgressSince,
+      ts,
+      row.id,
     );
+
+    if (enteringInProgress) {
+      const siblings = getHomeSiblingRows(db, row.list_id, row.project_id, row.parent_id).filter(
+        (s) => s.id !== row.id,
+      );
+      writeOrder(db, row.id, "sort_order", nextOrder(null, siblings[0]?.sort_order ?? null), now);
+    }
+
     return { listId: row.list_id };
   })();
 }
@@ -1170,7 +1485,7 @@ export function createProject(
     db.prepare(
       `INSERT INTO projects (id, list_id, name, color, collapsed, sort_order, created_at) VALUES (?, ?, ?, ?, 0, ?, ?)`,
     ).run(id, input.listId, name, input.color, sortOrder, now.getTime());
-    return projectRowToDto(getProjectRow(db, id) as ProjectRow, { open: 0, today: 0, overdue: 0 });
+    return projectRowToDto(getProjectRow(db, id) as ProjectRow, { open: 0, inProgress: 0, overdue: 0 });
   })();
 }
 
@@ -1194,7 +1509,11 @@ export function updateProject(
     const counts = getProjectDtos(db, row.list_id, now).find((p) => p.id === row.id);
     return projectRowToDto(
       { ...row, name, color },
-      { open: counts?.openCount ?? 0, today: counts?.todayCount ?? 0, overdue: counts?.overdueCount ?? 0 },
+      {
+        open: counts?.openCount ?? 0,
+        inProgress: counts?.inProgressCount ?? 0,
+        overdue: counts?.overdueCount ?? 0,
+      },
     );
   })();
 }
@@ -1232,22 +1551,23 @@ export function reorderProjects(db: Database.Database, listId: string, ids: stri
 }
 
 /**
- * Collapse state is per-column (migration 17): the Backlog and Today
+ * Collapse state is per-column (migration 17): the Backlog and In Progress
  * columns render the same `ProjectDto`, so `column` says which of the two
- * independent bits — `collapsed` (backlog) or `today_collapsed` (today) —
- * this call touches. Exactly one column is ever written; the other is left
- * untouched, so collapsing a project in one view never affects the other.
+ * independent bits — `collapsed` (backlog) or `in_progress_collapsed`
+ * (in progress) — this call touches. Exactly one column is ever written;
+ * the other is left untouched, so collapsing a project in one view never
+ * affects the other.
  */
 export function setProjectCollapsed(
   db: Database.Database,
   id: string,
   collapsed: boolean,
-  column: "backlog" | "today",
+  column: "backlog" | "in_progress",
 ): { listId: string } {
   return db.transaction(() => {
     const row = getProjectRow(db, id);
     if (!row) throw new Error("not_found: project not found");
-    const sqlColumn = column === "backlog" ? "collapsed" : "today_collapsed";
+    const sqlColumn = column === "backlog" ? "collapsed" : "in_progress_collapsed";
     db.prepare(`UPDATE projects SET ${sqlColumn} = ? WHERE id = ?`).run(collapsed ? 1 : 0, id);
     return { listId: row.list_id };
   })();
@@ -1414,17 +1734,17 @@ export function setTaskTags(db: Database.Database, taskId: string, tagIds: strin
     const insert = db.prepare(`INSERT INTO task_tags (task_id, tag_id) VALUES (?, ?)`);
     for (const tagId of uniqueIds) insert.run(taskId, tagId);
 
-    const today = localDay(now);
-    const startOfTomorrowMs = startOfNextLocalDay(now);
     return row.parent_id
       ? taskRowToDto(
           row,
           [],
           { total: 0, done: 0 },
           getTaskTags(db, taskId),
+          getTaskImages(db, taskId),
           buildTrail(db, row),
-          isTodayMember(row, today, startOfTomorrowMs),
+          isInProgressMember(row),
+          now,
         )
-      : buildTopLevelDto(db, row, today, startOfTomorrowMs);
+      : buildTopLevelDto(db, row, now);
   })();
 }

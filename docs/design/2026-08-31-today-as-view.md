@@ -1,6 +1,6 @@
 # Backlog as source of truth, Today as a filtered lens — design
 
-Status: approved 2026-08-31
+Status: superseded by docs/design/2026-09-01-two-blocks.md
 Date: 2026-08-31
 
 ## Problem

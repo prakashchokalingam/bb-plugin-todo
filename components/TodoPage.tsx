@@ -1,14 +1,15 @@
 // The Todo board page: active-list resolution from `subPath`, the single
 // DndContext for the whole page (tab reorder + both task columns), the one
-// shared `useNow` interval, and the Backlog/Today columns + Archive
+// shared `useNow` interval, and the Backlog/In Progress columns + Archive
 // overlay.
 //
-// Phase 4 (the-todo-plugin-feels-stateful-valley.md): Backlog and Today are
-// now two columns side by side over the SAME comprehensive task tree
-// (`board.backlog.tasks`) rather than two stacked sections fed by two
-// separate server-provided lists. Today's grouped view is derived locally,
-// once per render, by `lib/todayView.ts`'s `selectTodayView` — there is no
-// `board.today.tasks` anymore (see `hooks/useBoard.ts`'s `BoardData`).
+// Phase 4 (the-todo-plugin-feels-stateful-valley.md): Backlog and In
+// Progress are now two columns side by side over the SAME comprehensive
+// task tree (`board.backlog.tasks`) rather than two stacked sections fed by
+// two separate server-provided lists. In Progress's grouped view is derived
+// locally, once per render, by `lib/inProgressView.ts`'s
+// `selectInProgressView` — there is no `board.inProgress.tasks` anymore
+// (see `hooks/useBoard.ts`'s `BoardData`).
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   DndContext,
@@ -31,15 +32,17 @@ import type { BoardData } from "@/hooks/useBoard";
 import { useBoard } from "@/hooks/useBoard";
 import { useNow } from "@/hooks/useNow";
 import { formatDue } from "@/lib/humanize";
+import { cn } from "@/lib/utils";
 import { useBoardCommand } from "@/lib/board-bus";
 import { useCompleteWithUndo } from "@/hooks/useCompleteWithUndo";
-import { selectTodayView } from "@/lib/todayView";
+import { usePanelCollapse } from "@/hooks/usePanelCollapse";
+import { selectInProgressView } from "@/lib/inProgressView";
 import {
   applyMoveToBoard,
   computeProjectReorder,
   computeTaskMove,
   findTaskInBoard,
-  type Bucket,
+  type Column,
   type ComputeMoveResult,
   type DragBoardTasks,
   type DragTaskRef,
@@ -50,22 +53,25 @@ import { Icon } from "@/components/ui/icon";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { TabStrip } from "@/components/TabStrip";
 import { Section, type BoardActions, type SectionProjectGroup } from "@/components/Section";
+import type { ImageUpload } from "@/components/AddTaskRow";
+import { CollapsedRail } from "@/components/CollapsedRail";
 import ArchivePanel from "@/components/ArchivePanel";
+import { firstLine } from "@/lib/taskText";
 import TagManagerDialog from "@/components/TagManagerDialog";
 
-const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-const MONTHS = [
-  "Jan", "Feb", "Mar", "Apr", "May", "Jun",
-  "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-];
-
-function formatDayHeading(day: string): string {
-  const [y, m, d] = day.split("-").map(Number);
-  const dt = new Date(y, (m ?? 1) - 1, d ?? 1);
-  return `${WEEKDAYS[dt.getDay()]} ${d} ${MONTHS[(m ?? 1) - 1]}`;
-}
-
 const DEFAULT_TICK_MS = 60_000;
+
+/**
+ * Strips keys whose value is `undefined` from an RPC payload right before
+ * it's sent. Contract fields marked `.optional()` (e.g. `moveTask`'s
+ * `projectId`) mean "key absent" — the plugin SDK's JSON validator rejects a
+ * literal `undefined` value, so a payload built by spreading/conditionally
+ * assigning optional fields must be sanitized here as a last line of
+ * defence, even when the object was already built to omit them upstream.
+ */
+function stripUndefined<T extends object>(obj: T): T {
+  return Object.fromEntries(Object.entries(obj).filter(([, v]) => v !== undefined)) as T;
+}
 
 /**
  * Folds `applyMoveToBoard`'s pure task-tree projection into a full
@@ -77,19 +83,20 @@ const DEFAULT_TICK_MS = 60_000;
  * open backlog row (there are never any other kind — completed rows leave
  * the board immediately per SPEC.md rule 3) is right here in `tasks`.
  *
- * `today.planned`/`today.completed` are deliberately left untouched. Before
- * Phase 4 there was a `today.tasks` array this component could diff against
- * to derive a `planned` delta; since Phase 2 dropped that array from the
- * wire, there is nothing local to diff anymore, and `today.completed` was
- * already never derivable locally (it counts already-archived rows this
- * view never holds). Both scalars settle on the next refetch — the Today
- * *view* itself (grouping, membership, which rows render) still updates
- * immediately, because `selectTodayView` re-derives it from `inToday`, which
- * this function DOES patch via `applyMoveToBoard`.
+ * `inProgress.planned`/`inProgress.completed` are deliberately left
+ * untouched. Before Phase 4 there was a `inProgress.tasks` array this
+ * component could diff against to derive a `planned` delta; since Phase 2
+ * dropped that array from the wire, there is nothing local to diff anymore,
+ * and `inProgress.completed` was already never derivable locally (it counts
+ * already-archived rows this view never holds). Both scalars settle on the
+ * next refetch — the In Progress *view* itself (grouping, membership, which
+ * rows render) still updates immediately, because `selectInProgressView`
+ * re-derives it from `inProgress`, which this function DOES patch via
+ * `applyMoveToBoard`.
  */
 function applyOptimisticBoard(board: BoardData, outcome: ComputeMoveResult, now: number): BoardData {
   const prevTasks: DragBoardTasks = { backlog: board.backlog.tasks };
-  const nextTasks = applyMoveToBoard(prevTasks, outcome, board.today.day);
+  const nextTasks = applyMoveToBoard(prevTasks, outcome);
 
   const backlogOverdue = [
     ...nextTasks.backlog,
@@ -130,7 +137,8 @@ function applyTaskTagsToBoard(board: BoardData, taskId: string, tags: TagRefDto[
 
 /** Every top-level task plus its subtasks, flattened, for tick-interval
  * scanning. `board.backlog.tasks` is the one comprehensive tree since Phase
- * 2 — Today renders a filtered view over these same rows, not a second set. */
+ * 2 — In Progress renders a filtered view over these same rows, not a
+ * second set. */
 function flattenTasks(board: BoardData): TaskDto[] {
   const all: TaskDto[] = [];
   for (const t of board.backlog.tasks) {
@@ -140,12 +148,12 @@ function flattenTasks(board: BoardData): TaskDto[] {
 }
 
 /** The dnd-kit wiring only turns component state into plain `lib/drag`
- * inputs; the actual before/after/nest/bucket/dismiss decision lives there
+ * inputs; the actual before/after/nest/stage/dismiss decision lives there
  * so it can be unit-tested without a DOM or a real drag gesture (see
  * `lib/drag.test.ts`). */
 type ActiveDragData =
   | { kind: "list"; listId: string }
-  | { kind: "task"; taskId: string; parentId: string | null; bucket: "backlog" | "today" }
+  | { kind: "task"; taskId: string; parentId: string | null; stage: "pending" | "in_progress" }
   | { kind: "project"; projectId: string };
 
 /** What a droppable/sortable's `data.current` looks like when it's the
@@ -159,26 +167,26 @@ type ActiveDragData =
  * carries no `column`, since project reordering never needs one.
  */
 type OverData =
-  | { kind: "task"; taskId: string; parentId: string | null; bucket: "backlog" | "today" }
-  | { kind: "project"; projectId: string; column?: Bucket }
-  | { kind: "section"; column: Bucket };
+  | { kind: "task"; taskId: string; parentId: string | null; stage: "pending" | "in_progress" }
+  | { kind: "project"; projectId: string; column?: Column }
+  | { kind: "section"; column: Column };
 
 /** Which column's rendered DOM instance a task drag id belongs to — mirrors
- * `TaskRow.tsx`'s `taskDragId` encoding (`"today:<id>"` vs the bare id)
- * exactly, since that's the only place a task's per-column identity is
+ * `TaskRow.tsx`'s `taskDragId` encoding (`"in_progress:<id>"` vs the bare
+ * id) exactly, since that's the only place a task's per-column identity is
  * recorded once the drag is underway; the dnd-kit `data` payload itself
  * (`ActiveDragData`/`OverData`'s "task" variant) intentionally carries only
- * the task's real, server-stored `bucket`, not which column's copy was
+ * the task's real, server-stored `stage`, not which column's copy was
  * grabbed. */
-function columnFromDragId(id: string | number): Bucket {
-  return String(id).startsWith("today:") ? "today" : "backlog";
+function columnFromDragId(id: string | number): Column {
+  return String(id).startsWith("in_progress:") ? "in_progress" : "backlog";
 }
 
 /** Flashes and scrolls a Backlog row (a project header or a task) into view —
- * the click-through target of a Today row's trail line. Best-effort: jsdom
- * (unit tests) has no `scrollIntoView` implementation, and a source row that
- * has scrolled out of the DOM (virtualization) simply isn't found — neither
- * case is worth surfacing an error for. */
+ * the click-through target of an In Progress row's trail line. Best-effort:
+ * jsdom (unit tests) has no `scrollIntoView` implementation, and a source
+ * row that has scrolled out of the DOM (virtualization) simply isn't found
+ * — neither case is worth surfacing an error for. */
 function flashRow(selector: string) {
   const el = document.querySelector<HTMLElement>(selector);
   if (!el) return;
@@ -196,6 +204,13 @@ export interface TodoPageProps {
 export function TodoPage({ subPath }: TodoPageProps) {
   const navigate = useBbNavigate();
   const rpc = useRpc<typeof rpcContract>();
+  // `openUrl` (HTTP/HTTPS only) arrives with newer hosts than the pinned SDK
+  // types describe, so look it up at call time. Returning false lets the
+  // anchor fall back to its own `target="_blank"` navigation.
+  const openUrl = (url: string): boolean => {
+    const open = (navigate as { openUrl?: (url: string) => unknown }).openUrl;
+    return typeof open === "function" && open.call(navigate, url) === true;
+  };
   const activeListParam = subPath.length > 0 ? subPath : null;
   const { board, loading, error, refetch, setOptimisticBoard, patchBoard } =
     useBoard(activeListParam);
@@ -240,14 +255,22 @@ export function TodoPage({ subPath }: TodoPageProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [now, board]);
 
-  // The grouped Today view, derived once per render from the SAME
-  // comprehensive Backlog tree the Backlog column renders (`lib/todayView`).
-  // Called unconditionally, before the `!board` guard below, so this stays a
-  // valid hook call on every render regardless of loading state.
-  const todayView = useMemo(
-    () => selectTodayView(board?.backlog.tasks ?? [], board?.projects ?? []),
+  // The grouped In Progress view, derived once per render from the SAME
+  // comprehensive Backlog tree the Backlog column renders
+  // (`lib/inProgressView`). Called unconditionally, before the `!board`
+  // guard below, so this stays a valid hook call on every render regardless
+  // of loading state.
+  const inProgressView = useMemo(
+    () => selectInProgressView(board?.backlog.tasks ?? [], board?.projects ?? []),
     [board?.backlog.tasks, board?.projects],
   );
+
+  // Phase 4 panel collapse (`hooks/usePanelCollapse.ts`) — keyed by the
+  // resolved active list id once the board has loaded, falling back to the
+  // `subPath`/"default" before it has (mirrors `inProgressView` above:
+  // called unconditionally, before the `!board` guard below, so this stays a
+  // valid hook call on every render regardless of loading state).
+  const panelCollapse = usePanelCollapse(board?.activeListId ?? activeListParam ?? "default");
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
@@ -321,8 +344,8 @@ export function TodoPage({ subPath }: TodoPageProps) {
     const activeRef: DragTaskRef = {
       taskId: activeData.taskId,
       parentId: activeData.parentId,
-      bucket: activeData.bucket,
-      inToday: activeTask?.inToday ?? false,
+      stage: activeData.stage,
+      inProgress: activeTask?.inProgress ?? false,
       column: activeColumn,
     };
     const target: DropTarget =
@@ -344,7 +367,7 @@ export function TodoPage({ subPath }: TodoPageProps) {
     // Apply the outcome to local state immediately, before the RPC resolves,
     // so the row is already in its destination by the time dnd-kit's drop
     // animation would otherwise play the `DragOverlay` back to its old spot
-    // (the "goes to the right bucket but the animation flies back" bug).
+    // (the "goes to the right stage but the animation flies back" bug).
     // `dropAnimation={null}` below removes that animation outright; this is
     // the other half — making sure there's nothing wrong-looking underneath
     // it regardless.
@@ -353,17 +376,17 @@ export function TodoPage({ subPath }: TodoPageProps) {
 
     if (outcome.kind === "dismiss") {
       void rpc
-        .call("dismissFromToday", { id: outcome.id })
+        .call("setTaskStage", { id: outcome.id, stage: "pending" })
         .then(() => refetch())
         .catch((err) => {
           setOptimisticBoard(preDropBoard);
-          toast.error(err instanceof Error ? err.message : "Couldn't remove task from Today.");
+          toast.error(err instanceof Error ? err.message : "Couldn't remove task from In Progress.");
         });
       return;
     }
 
     void rpc
-      .call("moveTask", outcome.move)
+      .call("moveTask", stripUndefined(outcome.move))
       .then(() => refetch())
       .catch((err) => {
         // Never leave the UI showing a move the server rejected: snap back
@@ -384,6 +407,48 @@ export function TodoPage({ subPath }: TodoPageProps) {
 
   const activeListId = board.activeListId;
 
+  /**
+   * Shared body for the ▶ Start / ◀ Park row buttons: optimistic stage flip
+   * + `setTaskStage` RPC + rollback-on-failure, following the exact same
+   * shape as `handleDragEnd`'s drop handling (`preDropBoard` snapshot,
+   * `applyOptimisticBoard` projection, `setOptimisticBoard` to apply/undo,
+   * `toast.error` on failure) — never a second, bespoke optimistic-update
+   * pattern.
+   *
+   * A `const` arrow function (not a hoisted `function` declaration), like
+   * every other helper below — see the comment further down on why that
+   * matters for `board`'s non-null narrowing.
+   *
+   * The local projection quietly patches `stage`/`day`/`inProgress` in
+   * place (parent/project/position all unchanged — see
+   * `applyMoveToBoard`'s "no relocate" branch) rather than also
+   * reproducing `setTaskStage`'s server-side "move to top of its
+   * home-sibling group" reposition on entering In Progress: that's a
+   * cosmetic ordering detail the immediate `refetch()` on success settles
+   * within one round trip, not worth a second local-projection code path
+   * for.
+   */
+  const setTaskStageAction = (id: string, stage: "pending" | "in_progress") => {
+    const task = findTaskInBoard({ backlog: board.backlog.tasks }, id);
+    if (!task) return;
+    const preDropBoard = board;
+    const move: MoveTaskInput = { id, stage, parentId: task.parentId, beforeId: null, afterId: null };
+    setOptimisticBoard(applyOptimisticBoard(board, { kind: "move", move }, now));
+    void rpc
+      .call("setTaskStage", { id, stage })
+      .then(() => refetch())
+      .catch((err) => {
+        setOptimisticBoard(preDropBoard);
+        toast.error(
+          err instanceof Error
+            ? err.message
+            : stage === "in_progress"
+              ? "Couldn't start task."
+              : "Couldn't park task.",
+        );
+      });
+  };
+
   const actions: BoardActions = {
     now,
     overId,
@@ -397,18 +462,26 @@ export function TodoPage({ subPath }: TodoPageProps) {
     onDeleteTask: (id) => {
       void rpc.call("deleteTask", { id }).then(() => refetch());
     },
-    onCreateTask: ({ bucket, parentId, title }) => {
-      void rpc
-        .call("createTask", {
-          listId: activeListId,
-          bucket,
-          title,
-          parentId,
-          dueAt: null,
-          hasDueTime: false,
-          position: "bottom",
-        })
-        .then(() => refetch());
+    onUpdateTask: async (id, patch) => {
+      // Rejections reach the editor, which stays open and shows the message.
+      await rpc.call("updateTask", { id, ...patch });
+      await refetch();
+    },
+    onCreateTask: ({ stage, parentId, title, images }) => {
+      const call = rpc.call("createTask", {
+        listId: activeListId,
+        stage,
+        title,
+        parentId,
+        dueAt: null,
+        hasDueTime: false,
+        position: "bottom",
+        ...(images ? { images } : {}),
+      });
+      // With images the add-row waits, so a failure keeps the user's text
+      // and images and shows the error there.
+      if (images) return call.then(() => refetch());
+      void call.then(() => refetch());
     },
     tagCatalog: board.tags,
     onSetTaskTags: (task, tagIds) => {
@@ -466,6 +539,12 @@ export function TodoPage({ subPath }: TodoPageProps) {
       void refetch();
       return tag;
     },
+    // ▶ Start / ◀ Park — the one-click stage toggle (`setTaskStage` in both
+    // directions), a plain, single-RPC stage flip with no routing — see
+    // `BoardActions.onStartTask`/`onParkTask`'s doc comments.
+    onStartTask: (id) => setTaskStageAction(id, "in_progress"),
+    onParkTask: (id) => setTaskStageAction(id, "pending"),
+    onOpenUrl: openUrl,
   };
 
   // `const` arrow functions (not hoisted `function` declarations) placed
@@ -487,12 +566,12 @@ export function TodoPage({ subPath }: TodoPageProps) {
   });
 
   // Collapse state is per-column (ProjectDto.collapsed for backlog,
-  // .todayCollapsed for today) — `column` says which field this call reads
-  // and writes, so toggling a project's chevron in one column never
-  // touches the other's collapse state, even though both columns render
-  // the same ProjectDto at once.
-  const toggleProjectCollapsed = (project: ProjectDto, column: Bucket) => {
-    const field = column === "backlog" ? "collapsed" : "todayCollapsed";
+  // .inProgressCollapsed for in_progress) — `column` says which field this
+  // call reads and writes, so toggling a project's chevron in one column
+  // never touches the other's collapse state, even though both columns
+  // render the same ProjectDto at once.
+  const toggleProjectCollapsed = (project: ProjectDto, column: Column) => {
+    const field = column === "backlog" ? "collapsed" : "inProgressCollapsed";
     const next = !project[field];
     patchBoard((current) => patchProjectLocal(current, project.id, { [field]: next }));
     void rpc.call("setProjectCollapsed", { id: project.id, collapsed: next, column }).catch((err) => {
@@ -549,19 +628,20 @@ export function TodoPage({ subPath }: TodoPageProps) {
       });
   };
 
-  const addTaskToProject = (projectId: string, title: string) => {
-    void rpc
-      .call("createTask", {
-        listId: activeListId,
-        bucket: "backlog",
-        title,
-        parentId: null,
-        dueAt: null,
-        hasDueTime: false,
-        position: "bottom",
-        projectId,
-      })
-      .then(() => refetch());
+  const addTaskToProject = (projectId: string, title: string, images?: ImageUpload[]) => {
+    const call = rpc.call("createTask", {
+      listId: activeListId,
+      stage: "pending",
+      title,
+      parentId: null,
+      dueAt: null,
+      hasDueTime: false,
+      position: "bottom",
+      projectId,
+      ...(images ? { images } : {}),
+    });
+    if (images) return call.then(() => refetch());
+    void call.then(() => refetch());
   };
 
   /** The Backlog add-row's `#Name` entry point (design doc "Creating a
@@ -580,53 +660,6 @@ export function TodoPage({ subPath }: TodoPageProps) {
       });
   };
 
-  /**
-   * Fired by a row's today marker: remove the task from Today. Routed off
-   * `task.bucket`, exactly like the design doc's "two write paths" (Data
-   * plan section): a manually-scheduled task (`bucket === 'today'`) flips
-   * back via the existing `moveTask` snap-home transition (parent/project
-   * unchanged, beforeId/afterId both omitted so it lands back in its
-   * untouched slot rather than being repositioned); an auto-included task
-   * (`bucket === 'backlog'`, `inToday` true purely from its due date) has no
-   * `bucket` flag to clear, so it goes through `dismissFromToday` instead —
-   * the same "dismiss" outcome `computeTaskMove` produces for the drag
-   * gesture that does the same thing, so both paths funnel through the same
-   * `applyOptimisticBoard` projection.
-   */
-  const removeFromToday = (id: string) => {
-    const task = findTaskInBoard({ backlog: board.backlog.tasks }, id);
-    if (!task) return;
-    const preDropBoard = board;
-
-    if (task.bucket === "today") {
-      const move: MoveTaskInput = {
-        id,
-        bucket: "backlog",
-        parentId: task.parentId,
-        beforeId: null,
-        afterId: null,
-      };
-      setOptimisticBoard(applyOptimisticBoard(board, { kind: "move", move }, now));
-      void rpc
-        .call("moveTask", move)
-        .then(() => refetch())
-        .catch((err) => {
-          setOptimisticBoard(preDropBoard);
-          toast.error(err instanceof Error ? err.message : "Couldn't remove task from Today.");
-        });
-      return;
-    }
-
-    setOptimisticBoard(applyOptimisticBoard(board, { kind: "dismiss", id }, now));
-    void rpc
-      .call("dismissFromToday", { id })
-      .then(() => refetch())
-      .catch((err) => {
-        setOptimisticBoard(preDropBoard);
-        toast.error(err instanceof Error ? err.message : "Couldn't remove task from Today.");
-      });
-  };
-
   /** The trail line's click-through: scroll the Backlog to the project's
    * header row, or to the parent task's own row, and flash it. */
   const navigateToProject = (projectId: string) => {
@@ -641,10 +674,11 @@ export function TodoPage({ subPath }: TodoPageProps) {
     project,
     tasks: board.backlog.tasks.filter((t) => t.projectId === project.id),
   }));
-  const todayProjectGroups: SectionProjectGroup[] = todayView.projects.map((g) => ({
+  const inProgressProjectGroups: SectionProjectGroup[] = inProgressView.projects.map((g) => ({
     project: g.project,
     tasks: g.tasks,
     orphanSubtasks: g.orphanSubtasks,
+    rows: g.rows,
   }));
 
   const activeTask =
@@ -695,61 +729,107 @@ export function TodoPage({ subPath }: TodoPageProps) {
           cramped to read.
 
           Narrow (below `@3xl`): the existing single-column stacked
-          fallback, but with Today FIRST (`order-1`/`order-2`, flipped back
-          to Backlog-left/Today-right at `@3xl`) — "when space is scarce,
-          execution beats planning." The whole page's own `overflow-hidden`
-          (above) hands scrolling to this inner region instead, so the two
-          columns can each scroll independently once they're side by side.
+          fallback, but with In Progress FIRST (`order-1`/`order-2`, flipped
+          back to Backlog-left/In-Progress-right at `@3xl`) — "when space is
+          scarce, execution beats planning." The whole page's own
+          `overflow-hidden` (above) hands scrolling to this inner region
+          instead, so the two columns can each scroll independently once
+          they're side by side.
 
-          Wide (>= `@3xl`): Backlog left, Today right, each `min-w-0
+          Wide (>= `@3xl`): Backlog left, In Progress right, each `min-w-0
           flex-1` and each its own `overflow-y-auto` region — scrolling one
           never moves the other.
         */}
         <div className="@container min-h-0 flex-1">
           <div className="flex h-full min-h-0 flex-col gap-y-8 overflow-y-auto @3xl:flex-row @3xl:gap-x-6 @3xl:gap-y-0 @3xl:overflow-visible">
-            <div className="order-2 flex min-w-0 flex-1 flex-col @3xl:order-1 @3xl:min-h-0 @3xl:overflow-y-auto">
-              <Section
-                column="backlog"
-                heading="BACKLOG"
-                count={board.backlog.total}
-                ringValue={board.backlog.overdue}
-                ringTotal={board.backlog.total}
-                ringTone="destructive"
-                ringLabel={`${board.backlog.overdue} overdue`}
-                actions={actions}
-                addPlaceholder="add to backlog · #Name for a new project"
-                projectGroups={backlogProjectGroups}
-                looseTasks={looseBacklogTasks}
-                onToggleProjectCollapsed={toggleProjectCollapsed}
-                onRenameProject={renameProject}
-                onChangeProjectColor={changeProjectColor}
-                onDeleteProject={deleteProject}
-                onAddTaskToProject={addTaskToProject}
-                onCreateProject={createProjectInline}
-                onRemoveFromToday={removeFromToday}
-                onNavigateToProject={navigateToProject}
-                onNavigateToParent={navigateToParent}
-              />
+            {/*
+              Phase 4 panel collapse: each wrapper is `flex-1` (equal share)
+              while its panel is expanded, same as before. A COLLAPSED panel
+              instead renders `CollapsedRail` in place of `Section` and drops
+              to a fixed `@3xl:w-9` / `@3xl:flex-none` — which is also what
+              hands the other, still-`flex-1` wrapper the freed space, i.e.
+              "the other panel takes full width" falls straight out of flexbox
+              rather than needing its own special-cased width. Below `@3xl`
+              (already-stacked) both wrappers stay exactly as they were —
+              `CollapsedRail` renders its own full-width one-line bar shape
+              there instead of a rail; see its doc comment.
+            */}
+            <div
+              className={cn(
+                "order-2 flex min-w-0 flex-col @3xl:order-1",
+                panelCollapse.isCollapsed("backlog")
+                  ? "@3xl:w-9 @3xl:flex-none"
+                  : "flex-1 @3xl:min-h-0 @3xl:flex-1 @3xl:overflow-y-auto",
+              )}
+            >
+              {panelCollapse.isCollapsed("backlog") ? (
+                <CollapsedRail
+                  column="backlog"
+                  heading="BACKLOG"
+                  count={board.backlog.total}
+                  onExpand={() => panelCollapse.toggle("backlog")}
+                />
+              ) : (
+                <Section
+                  column="backlog"
+                  heading="BACKLOG"
+                  count={board.backlog.total}
+                  ringValue={board.backlog.overdue}
+                  ringTotal={board.backlog.total}
+                  ringTone="destructive"
+                  ringLabel={`${board.backlog.overdue} overdue`}
+                  actions={actions}
+                  addPlaceholder="add to backlog · #Name for a new project"
+                  projectGroups={backlogProjectGroups}
+                  looseTasks={looseBacklogTasks}
+                  onToggleProjectCollapsed={toggleProjectCollapsed}
+                  onRenameProject={renameProject}
+                  onChangeProjectColor={changeProjectColor}
+                  onDeleteProject={deleteProject}
+                  onAddTaskToProject={addTaskToProject}
+                  onCreateProject={createProjectInline}
+                  onNavigateToProject={navigateToProject}
+                  onNavigateToParent={navigateToParent}
+                  onCollapse={() => panelCollapse.toggle("backlog")}
+                />
+              )}
             </div>
 
-            <div className="order-1 flex min-w-0 flex-1 flex-col @3xl:order-2 @3xl:min-h-0 @3xl:overflow-y-auto">
-              <Section
-                column="today"
-                heading={`TODAY · ${formatDayHeading(board.today.day)}`}
-                ringValue={board.today.completed}
-                ringTotal={board.today.planned}
-                ringTone="primary"
-                ringLabel={`${board.today.completed}/${board.today.planned} done`}
-                actions={actions}
-                addPlaceholder="add to today"
-                projectGroups={todayProjectGroups}
-                looseTasks={todayView.looseTasks}
-                looseOrphanSubtasks={todayView.looseOrphanSubtasks}
-                onToggleProjectCollapsed={toggleProjectCollapsed}
-                onRemoveFromToday={removeFromToday}
-                onNavigateToProject={navigateToProject}
-                onNavigateToParent={navigateToParent}
-              />
+            <div
+              className={cn(
+                "order-1 flex min-w-0 flex-col @3xl:order-2",
+                panelCollapse.isCollapsed("in_progress")
+                  ? "@3xl:w-9 @3xl:flex-none"
+                  : "flex-1 @3xl:min-h-0 @3xl:flex-1 @3xl:overflow-y-auto",
+              )}
+            >
+              {panelCollapse.isCollapsed("in_progress") ? (
+                <CollapsedRail
+                  column="in_progress"
+                  heading="IN PROGRESS"
+                  count={Math.max(board.inProgress.planned - board.inProgress.completed, 0)}
+                  onExpand={() => panelCollapse.toggle("in_progress")}
+                />
+              ) : (
+                <Section
+                  column="in_progress"
+                  heading="IN PROGRESS"
+                  ringValue={board.inProgress.completed}
+                  ringTotal={board.inProgress.planned}
+                  ringTone="primary"
+                  ringLabel={`${board.inProgress.completed}/${board.inProgress.planned} done`}
+                  actions={actions}
+                  addPlaceholder="add to in progress"
+                  projectGroups={inProgressProjectGroups}
+                  looseTasks={inProgressView.looseTasks}
+                  looseOrphanSubtasks={inProgressView.looseOrphanSubtasks}
+                  looseRows={inProgressView.looseRows}
+                  onToggleProjectCollapsed={toggleProjectCollapsed}
+                  onNavigateToProject={navigateToProject}
+                  onNavigateToParent={navigateToParent}
+                  onCollapse={() => panelCollapse.toggle("in_progress")}
+                />
+              )}
             </div>
           </div>
         </div>
@@ -758,7 +838,7 @@ export function TodoPage({ subPath }: TodoPageProps) {
           {activeTask ? (
             <div className="flex min-h-8 items-center gap-2 rounded-md border border-border bg-card px-2 py-1 text-sm shadow-md">
               <Icon name="DragDropVertical" className="size-3.5 text-muted-foreground" aria-hidden="true" />
-              <span className="truncate">{activeTask.title}</span>
+              <span className="truncate">{firstLine(activeTask.title)}</span>
             </div>
           ) : activeList ? (
             <div className="rounded-md border border-border bg-card px-3 py-1 text-sm shadow-md">
@@ -777,6 +857,7 @@ export function TodoPage({ subPath }: TodoPageProps) {
         open={archiveOpen}
         onOpenChange={setArchiveOpen}
         onChanged={refetch}
+        onOpenUrl={openUrl}
       />
 
       {/* Mounted exactly once here (never inside TagPicker/TaskRow) — a

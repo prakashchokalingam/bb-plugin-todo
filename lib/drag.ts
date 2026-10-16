@@ -1,50 +1,58 @@
-// Pure drag→moveTask mapping for the board's single DndContext (backlog↔today,
-// reorder, nest-as-subtask, promote-a-subtask, project filing, project
-// reordering, dismissing an auto-included task). No React, no dnd-kit
-// runtime import — only plain data in, plain data out, so every one of the
-// drag matrix's behaviours (and their edges) can be asserted directly
+// Pure drag→moveTask mapping for the board's single DndContext (backlog↔in
+// progress, reorder, nest-as-subtask, promote-a-subtask, project filing,
+// project reordering, dismissing an auto-included task). No React, no
+// dnd-kit runtime import — only plain data in, plain data out, so every one
+// of the drag matrix's behaviours (and their edges) can be asserted directly
 // without a DOM or a real drag gesture.
 //
 // Phase 3 model (the-todo-plugin-feels-stateful-valley.md, "Drag matrix"):
-// Backlog is the one comprehensive task tree (`DragBoardTasks.backlog`);
-// Today is a filtered, column-scoped VIEW over the exact same rows, not a
+// Backlog is the one comprehensive task tree (`DragBoardTasks.backlog`); In
+// Progress is a filtered, column-scoped VIEW over the exact same rows, not a
 // second list. A task can render — and be dragged from, or dropped onto —
-// EITHER column at once (every `inToday` row does, always, since Backlog
+// EITHER column at once (every `inProgress` row does, always, since Backlog
 // never hides anything). `computeTaskMove` never nulls `parentId` on a move
-// into Today — that was the bug the whole feature was originally named
+// into In Progress — that was the bug the whole feature was originally named
 // after (see the "CENTRAL FIX" tests in drag.test.ts) — and that invariant
 // is still the most important thing in this file. What changed in Phase 3
 // is *how* "which column" is known: since the same task id can be the drop
 // target from either column's rendered instance, "which column" can no
-// longer be read off the task's own `bucket` field (an auto-included task's
-// `bucket` stays `'backlog'` even while it renders, and is draggable,
-// inside the Today column). Both the dragged row (`DragTaskRef.column`) and
+// longer be read off the task's own `stage` field (an auto-included task's
+// `stage` stays `'pending'` even while it renders, and is draggable, inside
+// the In Progress column). Both the dragged row (`DragTaskRef.column`) and
 // the drop target (`DropTarget`'s `column`) now carry that fact explicitly,
 // supplied by the caller from whichever column's DOM instance was actually
 // touched.
 import type { TaskDto } from "@/contract";
 
-export type Bucket = "backlog" | "today";
+export type Stage = "pending" | "in_progress";
+
+/** Which of the two board columns a drag source or drop target belongs to.
+ * Distinct from `Stage`: the Backlog column holds every task regardless of
+ * `stage`, so its column value is `"backlog"`, not `"pending"` — the one
+ * place the two vocabularies deliberately diverge. Matches
+ * `setProjectCollapsed`'s `column` argument in `contract.ts` exactly. */
+export type Column = "backlog" | "in_progress";
 
 /**
  * The task actually being dragged.
  *
- * `bucket` is the task's real, server-stored bucket (`'backlog' | 'today'`)
- * — the thing `moveTask` reads and writes. `inToday` mirrors `TaskDto`'s
- * field: whether the row currently satisfies Today membership at all
- * (manually scheduled OR auto-included by due date). `column` is neither of
- * those: it's which column's rendered row the pointer/keyboard grabbed —
- * necessary because an auto-included task (`bucket: "backlog"`, `inToday:
- * true`) renders in both columns simultaneously, and dragging its *Today*
- * instance out means something different (dismiss) from dragging its
- * *Backlog* instance to reorder it (ordinary reorder, not a dismissal).
+ * `stage` is the task's real, server-stored stage (`'pending' |
+ * 'in_progress'`) — the thing `moveTask` reads and writes. `inProgress`
+ * mirrors `TaskDto`'s field: whether the row currently satisfies In
+ * Progress membership at all (manually scheduled OR auto-included by due
+ * date). `column` is neither of those: it's which column's rendered row the
+ * pointer/keyboard grabbed — necessary because an auto-included task
+ * (`stage: "pending"`, `inProgress: true`) renders in both columns
+ * simultaneously, and dragging its *In Progress* instance out means
+ * something different (dismiss) from dragging its *Backlog* instance to
+ * reorder it (ordinary reorder, not a dismissal).
  */
 export interface DragTaskRef {
   taskId: string;
   parentId: string | null;
-  bucket: Bucket;
-  inToday: boolean;
-  column: Bucket;
+  stage: Stage;
+  inProgress: boolean;
+  column: Column;
 }
 
 /**
@@ -56,25 +64,25 @@ export interface DragTaskRef {
  * task should end up. `"project"` is a drop directly on a project's header
  * or body — the one gesture that explicitly re-homes a task into a
  * *different* project (as opposed to landing "anywhere" in a column, which
- * snaps home instead for a task leaving Today — see the "section"/"backlog"
- * branch of `computeTaskMove`).
+ * snaps home instead for a task leaving In Progress — see the
+ * "section"/"backlog" branch of `computeTaskMove`).
  */
 export type DropTarget =
-  | { kind: "section"; column: Bucket }
-  | { kind: "task"; taskId: string; column: Bucket }
-  | { kind: "project"; projectId: string; column: Bucket }
+  | { kind: "section"; column: Column }
+  | { kind: "task"; taskId: string; column: Column }
+  | { kind: "project"; projectId: string; column: Column }
   | null;
 
 /**
  * `backlog` is the ONE canonical task tree for the whole board (mirrors
- * `getBoard`'s wire shape since Phase 2 — `today.tasks` no longer exists).
- * Every open task lives here exactly once, in its real home position
- * (`project_id`/`parent_id`/`sort_order`), whether or not it currently
- * counts as "in Today". The grouped Today *view* is derived downstream
- * (`lib/todayView.ts`, Phase 3b) by filtering this same tree on `inToday` —
- * there is no second tree for this module to keep in sync, which is what
- * makes Phase 2's "one canonical tree per board load" guarantee hold all
- * the way through drag-and-drop.
+ * `getBoard`'s wire shape since Phase 2 — `inProgress.tasks` no longer
+ * exists). Every open task lives here exactly once, in its real home
+ * position (`project_id`/`parent_id`/`sort_order`), whether or not it
+ * currently counts as "in In Progress". The grouped In Progress *view* is
+ * derived downstream (`lib/inProgressView.ts`, Phase 3b) by filtering this
+ * same tree on `inProgress` — there is no second tree for this module to
+ * keep in sync, which is what makes Phase 2's "one canonical tree per board
+ * load" guarantee hold all the way through drag-and-drop.
  */
 export interface DragBoardTasks {
   backlog: TaskDto[];
@@ -88,7 +96,7 @@ export interface DragRect {
 
 export interface MoveTaskInput {
   id: string;
-  bucket: Bucket;
+  stage: Stage;
   parentId: string | null;
   beforeId: string | null;
   afterId: string | null;
@@ -104,14 +112,15 @@ export type DropZone = "before" | "after" | "nest";
  *
  * A discriminated union, not a sentinel on `MoveTaskInput`, on purpose:
  * `MoveTaskInput` is a wire shape forwarded verbatim to the `moveTask` RPC,
- * and an auto-included task leaving Today has nothing for `moveTask` to do
- * at all (there's no `bucket` flag to clear — `inToday` for such a row is
- * pure due-date derivation). Bolting a `dismiss: true` flag onto
- * `MoveTaskInput` would mean either every RPC caller has to remember to
- * strip it before the network call, or the server has to learn to ignore an
- * input shape it was never meant to see. A `kind` discriminant instead
- * forces every caller to `switch`/narrow before touching either payload, and
- * TypeScript flags a caller that forgets the new `"dismiss"` arm.
+ * and an auto-included task leaving In Progress has nothing for `moveTask`
+ * to do at all (there's no `stage` flag to clear — `inProgress` for such a
+ * row is pure due-date derivation; it goes through `setTaskStage` instead).
+ * Bolting a `dismiss: true` flag onto `MoveTaskInput` would mean either
+ * every RPC caller has to remember to strip it before the network call, or
+ * the server has to learn to ignore an input shape it was never meant to
+ * see. A `kind` discriminant instead forces every caller to `switch`/narrow
+ * before touching either payload, and TypeScript flags a caller that
+ * forgets the new `"dismiss"` arm.
  *
  * `null` keeps its pre-Phase-3 meaning unchanged: the drop was a genuine
  * no-op (nothing to move, nothing to dismiss) — dropped on nothing, on
@@ -164,9 +173,10 @@ export type DropZoneKind = "section" | "project" | "task";
  * Column-scoped droppable-id scheme for `components/TodoPage.tsx`'s
  * dnd-kit `id`s (Phase 4). Before Phase 3, "project prj_1" or the Backlog
  * section body were each rendered in exactly one place, so a bare kind+id
- * was unambiguous. Since Today now renders the *same* project groups (and
- * every `inToday` task) side by side with the Backlog, a droppable id needs
- * a column segment to say which rendered copy was actually dropped on.
+ * was unambiguous. Since In Progress now renders the *same* project groups
+ * (and every `inProgress` task) side by side with the Backlog, a droppable
+ * id needs a column segment to say which rendered copy was actually
+ * dropped on.
  *
  * Format: `"<kind>:<column>:<targetId>"`, always three `:`-joined segments.
  * `targetId` is the empty string for `"section"` (there is exactly one
@@ -175,9 +185,9 @@ export type DropZoneKind = "section" | "project" | "task";
  * generated ids (see `lib/db.ts`) that never contain `:`, so the split is
  * unambiguous.
  *
- *   dropZoneId("section", "today")               -> "section:today:"
- *   dropZoneId("project", "backlog", "prj_1")     -> "project:backlog:prj_1"
- *   dropZoneId("task", "today", "tsk_9")          -> "task:today:tsk_9"
+ *   dropZoneId("section", "in_progress")               -> "section:in_progress:"
+ *   dropZoneId("project", "backlog", "prj_1")           -> "project:backlog:prj_1"
+ *   dropZoneId("task", "in_progress", "tsk_9")          -> "task:in_progress:tsk_9"
  *
  * A task's own *drag source* id (what dnd-kit reports as `active.id` while
  * it's being picked up, as opposed to a drop target) is a separate,
@@ -187,9 +197,9 @@ export type DropZoneKind = "section" | "project" | "task";
  * TARGETS: section bodies, project headers/bodies, and (if a caller prefers
  * one scheme end to end) task rows too.
  */
-export function dropZoneId(kind: "section", column: Bucket): string;
-export function dropZoneId(kind: "project" | "task", column: Bucket, targetId: string): string;
-export function dropZoneId(kind: DropZoneKind, column: Bucket, targetId = ""): string {
+export function dropZoneId(kind: "section", column: Column): string;
+export function dropZoneId(kind: "project" | "task", column: Column, targetId: string): string;
+export function dropZoneId(kind: DropZoneKind, column: Column, targetId = ""): string {
   return `${kind}:${column}:${targetId}`;
 }
 
@@ -199,12 +209,12 @@ export function dropZoneId(kind: DropZoneKind, column: Bucket, targetId = ""): s
  * should not feed through this parser). */
 export function parseDropZoneId(
   id: string,
-): { kind: DropZoneKind; column: Bucket; targetId: string } | null {
+): { kind: DropZoneKind; column: Column; targetId: string } | null {
   const parts = id.split(":");
   if (parts.length !== 3) return null;
   const [kind, column, targetId] = parts;
   if (kind !== "section" && kind !== "project" && kind !== "task") return null;
-  if (column !== "backlog" && column !== "today") return null;
+  if (column !== "backlog" && column !== "in_progress") return null;
   return { kind, column, targetId };
 }
 
@@ -215,16 +225,17 @@ export function parseDropZoneId(
  * is used to compute `beforeId`/`afterId`, so it can never appear as its own
  * neighbour.
  *
- * The one cross-cutting rule, checked first: a drag whose SOURCE was the
- * Today column (`active.column === "today"`) landing in the Backlog column
- * (`target.column === "backlog"`) is "leaving Today" — matrix rows "Today
- * row -> Backlog". Everything else (including reordering an `inToday` row
- * from its *Backlog* instance, which must NOT count as leaving Today) falls
- * through to the ordinary, column-agnostic placement logic below, which
- * simply stamps the destination `bucket` from `target.column` and computes
- * order from the task's real home sibling group in `tasks.backlog` — the
- * only sibling group that exists post-Phase-2, whether the row is landing
- * in the Backlog or in Today.
+ * The one cross-cutting rule, checked first: a drag whose SOURCE was the In
+ * Progress column (`active.column === "in_progress"`) landing in the
+ * Backlog column (`target.column === "backlog"`) is "leaving In Progress" —
+ * matrix rows "In Progress row -> Backlog". Everything else (including
+ * reordering an `inProgress` row from its *Backlog* instance, which must
+ * NOT count as leaving In Progress) falls through to the ordinary,
+ * column-agnostic placement logic below, which simply stamps the
+ * destination `stage` from `target.column` and computes order from the
+ * task's real home sibling group in `tasks.backlog` — the only sibling
+ * group that exists post-Phase-2, whether the row is landing in the
+ * Backlog or in In Progress.
  */
 export function computeTaskMove(
   active: DragTaskRef,
@@ -236,46 +247,48 @@ export function computeTaskMove(
   if (target === null) return null;
 
   const destColumn = target.column;
-  const leavingToday = active.column === "today" && destColumn === "backlog";
+  const leavingInProgress = active.column === "in_progress" && destColumn === "backlog";
 
-  if (leavingToday) {
-    if (active.bucket === "backlog") {
-      // Drag matrix: "Today row -> Backlog, auto-included only
-      // (bucket === 'backlog' && inToday)". There is no `bucket` flag to
-      // clear — `inToday` for this row is entirely due-date-derived — so
-      // there is nothing for `moveTask` to express. (A drop directly on a
-      // *different* project's header, `target.kind === "project"`, could in
-      // principle both re-file AND dismiss in one gesture, but that combined
-      // move isn't in the matrix and two RPCs don't fit one
+  if (leavingInProgress) {
+    if (active.stage === "pending") {
+      // Drag matrix: "In Progress row -> Backlog, auto-included only
+      // (stage === 'pending' && inProgress)". There is no `stage` flag to
+      // clear — `inProgress` for this row is entirely due-date-derived —
+      // so there is nothing for `moveTask` to express. (A drop directly on
+      // a *different* project's header, `target.kind === "project"`, could
+      // in principle both re-file AND dismiss in one gesture, but that
+      // combined move isn't in the matrix and two RPCs don't fit one
       // `ComputeMoveResult`; dismissing is the safe, always-correct subset,
       // and re-filing from the Backlog column already works today.)
       return { kind: "dismiss", id: active.taskId };
     }
-    // active.bucket === "today": the existing snap-home rule — dropping a
-    // scheduled row "anywhere" in the Backlog column unschedules it without
-    // moving it (position is deliberately not computed; `moveTask`'s
-    // snapHome branch ignores beforeId/afterId regardless). Only an explicit
-    // drop on a *different* project's header/body (`target.kind ===
-    // "project"`) re-homes it instead — handled by falling through to the
-    // ordinary "project" branch below, which forces `bucket: "backlog"` via
-    // `destColumn` same as this branch would have.
+    // active.stage === "in_progress": the existing snap-home rule —
+    // dropping a scheduled row "anywhere" in the Backlog column
+    // unschedules it without moving it (position is deliberately not
+    // computed; `moveTask`'s snapHome branch ignores beforeId/afterId
+    // regardless). Only an explicit drop on a *different* project's
+    // header/body (`target.kind === "project"`) re-homes it instead —
+    // handled by falling through to the ordinary "project" branch below,
+    // which forces `stage: "pending"` via `destColumn` same as this branch
+    // would have.
     if (target.kind !== "project") {
       return {
         kind: "move",
-        move: { id: active.taskId, bucket: "backlog", parentId: active.parentId, beforeId: null, afterId: null },
+        move: { id: active.taskId, stage: "pending", parentId: active.parentId, beforeId: null, afterId: null },
       };
     }
   }
 
   if (target.kind === "project") {
     // Drag matrix: "project task -> another project", "loose task ->
-    // project body", "Today project A -> project B" — all converge on the
-    // same shape: top-level, explicit projectId, appended at the end of
-    // that project's home group (the only sibling group there is). `bucket`
-    // is always `destColumn`: staying in Today (re-homing across two Today
-    // project groups) keeps `bucket: "today"`; landing on a Backlog-column
-    // project header — including the `leavingToday` fallthrough above —
-    // yields `bucket: "backlog"`.
+    // project body", "In Progress project A -> project B" — all converge
+    // on the same shape: top-level, explicit projectId, appended at the
+    // end of that project's home group (the only sibling group there is).
+    // `stage` is always derived from `destColumn`: staying in In Progress
+    // (re-homing across two In Progress project groups) keeps `stage:
+    // "in_progress"`; landing on a Backlog-column project header —
+    // including the `leavingInProgress` fallthrough above — yields `stage:
+    // "pending"`.
     const homeSiblings = tasks.backlog
       .filter((t) => (t.projectId ?? null) === target.projectId && t.id !== active.taskId)
       .map((t) => t.id);
@@ -283,7 +296,7 @@ export function computeTaskMove(
       kind: "move",
       move: {
         id: active.taskId,
-        bucket: destColumn,
+        stage: destColumn === "in_progress" ? "in_progress" : "pending",
         parentId: null,
         projectId: target.projectId,
         beforeId: null,
@@ -293,22 +306,24 @@ export function computeTaskMove(
   }
 
   if (target.kind === "section") {
-    if (destColumn === "today") {
-      // Drag matrix: "Backlog row -> Today column, no specific target row".
-      // Flag scheduled; NO order write. A subtask keeps its parent (CENTRAL
-      // FIX), a project task stays parentless; `projectId` is omitted
-      // entirely (moveTask's "omit = unchanged") and beforeId/afterId are
-      // both null, which is exactly `lib/db.ts`'s `homeUnchanged` condition
-      // — the row must stay exactly where it is in its home group.
+    if (destColumn === "in_progress") {
+      // Drag matrix: "Backlog row -> In Progress column, no specific
+      // target row". Flag scheduled; NO order write. A subtask keeps its
+      // parent (CENTRAL FIX), a project task stays parentless; `projectId`
+      // is omitted entirely (moveTask's "omit = unchanged") and
+      // beforeId/afterId are both null, which is exactly `lib/db.ts`'s
+      // `homeUnchanged` condition — the row must stay exactly where it is
+      // in its home group.
       return {
         kind: "move",
-        move: { id: active.taskId, bucket: "today", parentId: active.parentId, beforeId: null, afterId: null },
+        move: { id: active.taskId, stage: "in_progress", parentId: active.parentId, beforeId: null, afterId: null },
       };
     }
 
-    // destColumn === "backlog", and not `leavingToday` (that case already
-    // returned above) — an ordinary Backlog-column task dropped on the
-    // generic section body: "project task -> loose area: project_id = NULL".
+    // destColumn === "backlog", and not `leavingInProgress` (that case
+    // already returned above) — an ordinary Backlog-column task dropped on
+    // the generic section body: "project task -> loose area: project_id =
+    // NULL".
     const ids = tasks.backlog
       .filter((t) => (t.projectId ?? null) === null)
       .map((t) => t.id)
@@ -317,7 +332,7 @@ export function computeTaskMove(
       kind: "move",
       move: {
         id: active.taskId,
-        bucket: "backlog",
+        stage: "pending",
         parentId: null,
         projectId: null,
         beforeId: null,
@@ -341,7 +356,7 @@ export function computeTaskMove(
       kind: "move",
       move: {
         id: active.taskId,
-        bucket: destColumn,
+        stage: destColumn === "in_progress" ? "in_progress" : "pending",
         parentId: overTask.id,
         beforeId: null,
         afterId: siblingIds.length > 0 ? siblingIds[siblingIds.length - 1] : null,
@@ -349,24 +364,24 @@ export function computeTaskMove(
     };
   }
 
-  if (destColumn === "today") {
-    // Matrix rows "Backlog row -> Today, near a specific row" and "Today
-    // row -> Today: reorder" / "a subtask reordering among its own
-    // siblings" (when already in Today). CENTRAL FIX still applies here:
-    // `parentId` is always the DRAGGED task's own parentId — never adopted
-    // from `overTask` — and `projectId` is always omitted. This mirrors
-    // `lib/db.ts`'s `moveTask` precisely: when entering/staying in Today,
-    // `newProjectId`/`newParentId` are the row's own *unchanged* home
-    // (project omitted, parentId equal to what it already was), and the
-    // server's `getHomeSiblingRows` lookup for `beforeId`/`afterId` is
-    // scoped to THAT home group — not whatever group `overTask` happens to
-    // belong to. So the sibling group used for order interpolation here is
-    // the dragged task's own home siblings, and `overTask` only supplies a
-    // usable position if it's actually a member of that group; otherwise
-    // there is no meaningful reference and this degrades to the
-    // no-specific-row case (flagged, no order write) rather than sending a
-    // beforeId/afterId the server's home-scoped lookup would silently
-    // ignore anyway.
+  if (destColumn === "in_progress") {
+    // Matrix rows "Backlog row -> In Progress, near a specific row" and "In
+    // Progress row -> In Progress: reorder" / "a subtask reordering among
+    // its own siblings" (when already in In Progress). CENTRAL FIX still
+    // applies here: `parentId` is always the DRAGGED task's own parentId —
+    // never adopted from `overTask` — and `projectId` is always omitted.
+    // This mirrors `lib/db.ts`'s `moveTask` precisely: when
+    // entering/staying in In Progress, `newProjectId`/`newParentId` are the
+    // row's own *unchanged* home (project omitted, parentId equal to what
+    // it already was), and the server's `getHomeSiblingRows` lookup for
+    // `beforeId`/`afterId` is scoped to THAT home group — not whatever
+    // group `overTask` happens to belong to. So the sibling group used for
+    // order interpolation here is the dragged task's own home siblings,
+    // and `overTask` only supplies a usable position if it's actually a
+    // member of that group; otherwise there is no meaningful reference and
+    // this degrades to the no-specific-row case (flagged, no order write)
+    // rather than sending a beforeId/afterId the server's home-scoped
+    // lookup would silently ignore anyway.
     const activeProjectId = findTaskInBoard(tasks, active.taskId)?.projectId ?? null;
     const homeGroupIds =
       active.parentId !== null
@@ -378,7 +393,7 @@ export function computeTaskMove(
     if (idx === -1) {
       return {
         kind: "move",
-        move: { id: active.taskId, bucket: "today", parentId: active.parentId, beforeId: null, afterId: null },
+        move: { id: active.taskId, stage: "in_progress", parentId: active.parentId, beforeId: null, afterId: null },
       };
     }
     if (zone === "before") {
@@ -386,7 +401,7 @@ export function computeTaskMove(
         kind: "move",
         move: {
           id: active.taskId,
-          bucket: "today",
+          stage: "in_progress",
           parentId: active.parentId,
           beforeId: overTask.id,
           afterId: idx > 0 ? filtered[idx - 1] : null,
@@ -397,7 +412,7 @@ export function computeTaskMove(
       kind: "move",
       move: {
         id: active.taskId,
-        bucket: "today",
+        stage: "in_progress",
         parentId: active.parentId,
         beforeId: idx < filtered.length - 1 ? filtered[idx + 1] : null,
         afterId: overTask.id,
@@ -410,7 +425,7 @@ export function computeTaskMove(
   // rule 2) promotes/re-homes the dragged task to `overTask`'s own home
   // group — its project (top-level) or its parent's subtasks. This is the
   // one case where the target row's OWN home, not the dragged task's, wins:
-  // unlike entering Today (a flag, never a relocation), landing among
+  // unlike entering In Progress (a flag, never a relocation), landing among
   // ordinary Backlog rows always means "place me here."
   const groupIds =
     overTask.parentId === null
@@ -431,9 +446,13 @@ export function computeTaskMove(
       kind: "move",
       move: {
         id: active.taskId,
-        bucket: destColumn,
+        stage: "pending",
         parentId: overTask.parentId,
-        projectId: destProjectId,
+        // `projectId: undefined` is not the same as omitting the key: the
+        // moveTask contract declares it `.optional()`, which means "key
+        // absent", and the RPC layer's JSON validator rejects a literal
+        // `undefined` value. Spread it in only when actually set.
+        ...(destProjectId !== undefined ? { projectId: destProjectId } : {}),
         beforeId: overTask.id,
         afterId: idx > 0 ? filtered[idx - 1] : null,
       },
@@ -443,9 +462,9 @@ export function computeTaskMove(
     kind: "move",
     move: {
       id: active.taskId,
-      bucket: destColumn,
+      stage: "pending",
       parentId: overTask.parentId,
-      projectId: destProjectId,
+      ...(destProjectId !== undefined ? { projectId: destProjectId } : {}),
       beforeId: idx < filtered.length - 1 ? filtered[idx + 1] : null,
       afterId: overTask.id,
     },
@@ -457,8 +476,8 @@ export function computeTaskMove(
  * project drag never touches tasks, so it's a plain id-array reorder for
  * the `reorderProjects` RPC — mirroring dnd-kit's `arrayMove` without a
  * dnd-kit import (this module's no-runtime-import rule). Project headers are
- * only ever draggable in the Backlog column (Today's are read-only labels —
- * SPEC), so this never needs a `column` discriminator.
+ * only ever draggable in the Backlog column (In Progress's are read-only
+ * labels — SPEC), so this never needs a `column` discriminator.
  */
 export function computeProjectReorder(
   activeProjectId: string,
@@ -484,16 +503,14 @@ export function computeProjectReorder(
 // RPC resolves, so the row is already sitting in its destination by the time
 // dnd-kit's drop animation would otherwise play (see
 // `components/TodoPage.tsx`'s `handleDragEnd` for why that ordering matters:
-// the fly-back-then-refetch UX bug). It only needs to get BUCKET, PARENT,
-// PROJECT and `inToday` right — `sortOrder` is not reproduced faithfully,
+// the fly-back-then-refetch UX bug). It only needs to get STAGE, PARENT,
+// PROJECT and `inProgress` right — `sortOrder` is not reproduced faithfully,
 // since only the server (via `lib/db.ts`'s `moveTask`) knows the real
 // gap-filling math; the follow-up `getBoard` refetch is authoritative and
-// will settle the exact order. Recomputing real Today membership from
-// `dueAt`/`today_dismissed_day` is explicitly NOT this function's job —
-// `inToday` is set to exactly what the move implies (true entering/staying
-// in Today, false leaving it or being dismissed from it), and the refetch
-// corrects anything more subtle (e.g. an auto-included task that's still
-// due today after being "moved" within the Backlog).
+// will settle the exact order. `inProgress` is set to exactly what the move
+// implies (true entering/staying in In Progress, false leaving it) — trivial
+// now that membership is solely `stage`-based, so this can never disagree
+// with the refetch the way the old due-date-derived membership could.
 
 function insertBySiblingIds(
   list: TaskDto[],
@@ -515,8 +532,8 @@ function insertBySiblingIds(
 
 /** A task's home location within the `backlog` tree: itself, plus the id of
  * the parent it's nested under (`null` = top-level). Since Phase 2 this is
- * the ONLY location a task has — there is no separate Today tree to keep in
- * sync. */
+ * the ONLY location a task has — there is no separate In Progress tree to
+ * keep in sync. */
 interface HomeLocation {
   task: TaskDto;
   parentId: string | null;
@@ -599,35 +616,37 @@ function patchHome(
  * `outcome: null` is a no-op and returns `tasks` unchanged. A task id not
  * present in `tasks.backlog` is also a no-op — the refetch will reconcile.
  *
- * Mirrors `lib/db.ts`'s `moveTask`/`dismissFromToday`:
- * - A "dismiss" outcome patches only `inToday: false` on the row — exactly
- *   what `dismissFromToday` does server-side (it never touches `bucket`,
- *   `day`, `parent_id`, or `project_id`).
- * - Entering Today (or the snap-home "leaving Today anywhere" case) with no
- *   real re-home (`beforeId`/`afterId` both null, parent/project unchanged)
- *   patches `bucket`/`day`/`inToday` in place, matching `lib/db.ts`'s
- *   `homeUnchanged`/`snapHome` guards: no `sort_order` write, so the row
- *   must not move position in the array either.
+ * Mirrors `lib/db.ts`'s `moveTask`/`setTaskStage`:
+ * - A "dismiss" outcome patches only `inProgress: false` on the row —
+ *   exactly what flipping stage to `pending` via `setTaskStage` does
+ *   server-side for an auto-included row (it never touches `stage`,
+ *   `parent_id`, or `project_id`). Dead in practice now that In Progress
+ *   membership is solely `stage`-based (a `stage: "pending"` row can never
+ *   be `inProgress: true`, so `computeTaskMove` can no longer produce this
+ *   outcome) — kept only so an already-in-flight or hand-built "dismiss"
+ *   result still applies harmlessly rather than throwing.
+ * - Entering In Progress (or the snap-home "leaving In Progress anywhere"
+ *   case) with no real re-home (`beforeId`/`afterId` both null,
+ *   parent/project unchanged) patches `stage`/`inProgress` in place,
+ *   matching `lib/db.ts`'s `homeUnchanged`/`snapHome` guards: no
+ *   `sort_order` write, so the row must not move position in the array
+ *   either.
  * - A real re-home/re-parent (parent or project actually changing, or an
  *   explicit `beforeId`/`afterId`) relocates the entry within the tree and,
  *   per SPEC.md rule 2, promotes a newly-nested task's own subtasks to
  *   top-level siblings (subtasks are exactly one level deep).
- * - Per invariant 4, scheduling a parent never drags its subtasks into
- *   Today; a project/parent change, however, still mirrors onto any
+ * - Per invariant 4, scheduling a parent never drags its subtasks into In
+ *   Progress; a project/parent change, however, still mirrors onto any
  *   remaining real subtasks (invariant 2: a subtask's project always
  *   mirrors its parent's).
  */
-export function applyMoveToBoard(
-  tasks: DragBoardTasks,
-  outcome: ComputeMoveResult,
-  today?: string | null,
-): DragBoardTasks {
+export function applyMoveToBoard(tasks: DragBoardTasks, outcome: ComputeMoveResult): DragBoardTasks {
   if (!outcome) return tasks;
 
   if (outcome.kind === "dismiss") {
     const home = findHome(tasks, outcome.id);
     if (!home) return tasks;
-    return patchHome(tasks, outcome.id, home.parentId, { inToday: false });
+    return patchHome(tasks, outcome.id, home.parentId, { inProgress: false });
   }
 
   const move = outcome.move;
@@ -646,14 +665,15 @@ export function applyMoveToBoard(
         ? move.projectId
         : currentProjectId;
 
-  const destBucket = move.bucket;
-  const enteringToday = destBucket === "today";
+  const destStage = move.stage;
+  const enteringInProgress = destStage === "in_progress";
 
   const homeChanged = newParentId !== currentParentId || newProjectId !== currentProjectId;
   // Only a real reposition/re-home relocates the entry within the tree —
-  // entering Today, or leaving it via snap-home (parent/project unchanged,
-  // beforeId/afterId both null by construction — see computeTaskMove),
-  // leaves the tree's structure alone; only bucket/day/inToday are patched.
+  // entering In Progress, or leaving it via snap-home (parent/project
+  // unchanged, beforeId/afterId both null by construction — see
+  // computeTaskMove), leaves the tree's structure alone; only
+  // stage/day/inProgress are patched.
   const shouldRelocate = homeChanged || move.beforeId !== null || move.afterId !== null;
 
   // A task with parent_id set can never itself have subtasks (depth cap),
@@ -663,13 +683,11 @@ export function applyMoveToBoard(
   const nestingNow = newParentId !== null;
   const promoted: TaskDto[] = nestingNow ? moving.subtasks.map((s) => ({ ...s, parentId: null })) : [];
   // A relocating parent's still-remaining real subtasks mirror its new
-  // project (invariant 2); their own bucket/day/inToday are untouched
+  // project (invariant 2); their own stage/day/inProgress are untouched
   // (invariant 4).
   const carriedSubtasks: TaskDto[] = nestingNow
     ? []
     : moving.subtasks.map((s) => ({ ...s, projectId: newProjectId }));
-
-  const destDay = enteringToday ? (today ?? moving.day ?? null) : null;
 
   let working: DragBoardTasks = tasks;
 
@@ -679,25 +697,23 @@ export function applyMoveToBoard(
       ...moving,
       parentId: newParentId,
       projectId: newProjectId,
-      bucket: destBucket,
-      day: destDay,
-      inToday: enteringToday,
+      stage: destStage,
+      inProgress: enteringInProgress,
       subtasks: nestingNow ? [] : carriedSubtasks,
       subtaskCounts: nestingNow ? { total: 0, done: 0 } : moving.subtaskCounts,
     };
     working = insertIntoHome(working, movedTask, newParentId, move.beforeId, move.afterId);
     if (promoted.length > 0) {
       // Splice the promoted ex-children in as top-level siblings; their own
-      // bucket/day/project/inToday are left exactly as they were (lib/db.ts
+      // stage/project/inProgress are left exactly as they were (lib/db.ts
       // leaves their sort_order alone too, beyond the gap-filling this
       // approximates away — the refetch settles the exact order).
       working = { ...working, backlog: [...working.backlog, ...promoted] };
     }
   } else {
     working = patchHome(working, move.id, currentParentId, {
-      bucket: destBucket,
-      day: destDay,
-      inToday: enteringToday,
+      stage: destStage,
+      inProgress: enteringInProgress,
     });
   }
 

@@ -10,6 +10,7 @@ import { TagChip } from "./TagChip";
 import { TagChips } from "./TagChips";
 import { ColorSwatchPicker } from "./ColorSwatchPicker";
 import { TrailLine } from "./TrailLine";
+import { ParentGroupHeader } from "./ParentGroupHeader";
 import { ProjectHeader } from "./ProjectHeader";
 import { ProjectGroup } from "./ProjectGroup";
 import { TaskRow } from "./TaskRow";
@@ -242,22 +243,22 @@ function makeTask(overrides: Partial<TaskDto> & { id: string }): TaskDto {
     parentId: null,
     title: overrides.id,
     notes: null,
-    bucket: "backlog",
-    day: null,
+    stage: "pending",
     sortOrder: 1000,
     dueAt: null,
     hasDueTime: false,
     status: "open",
     completedAt: null,
-    carriedCount: 0,
+    carriedDays: 0,
     createdAt: 0,
     updatedAt: 0,
     subtasks: [],
     subtaskCounts: { total: 0, done: 0 },
     tags: [],
+    images: [],
     projectId: null,
     trail: null,
-    inToday: false,
+    inProgress: false,
     ...overrides,
   };
 }
@@ -269,9 +270,9 @@ function makeProject(overrides: Partial<ProjectDto> & { id: string }): ProjectDt
     color: "teal",
     sortOrder: 1000,
     collapsed: false,
-    todayCollapsed: false,
+    inProgressCollapsed: false,
     openCount: 0,
-    todayCount: 0,
+    inProgressCount: 0,
     overdueCount: 0,
     ...overrides,
   };
@@ -283,20 +284,33 @@ function makeActions(overrides: Partial<BoardActions> = {}): BoardActions {
     overId: null,
     onToggleComplete: vi.fn(),
     onRenameTask: vi.fn(),
+    onUpdateTask: vi.fn().mockResolvedValue(undefined),
     onSetDue: vi.fn(),
     onDeleteTask: vi.fn(),
     onCreateTask: vi.fn(),
     tagCatalog: [],
     onSetTaskTags: vi.fn(),
     onCreateTag: vi.fn(),
+    onStartTask: vi.fn(),
+    onParkTask: vi.fn(),
     ...overrides,
   };
 }
 
 /** TaskRow/ProjectGroup use dnd-kit's `useSortable`/`useDroppable`, which
- * need a live DndContext provider to resolve refs/listeners. */
+ * need a live DndContext provider to resolve refs/listeners. Every raw
+ * `<DndContext>` in this file (including this helper's own) is also
+ * wrapped in a `TooltipProvider`: TaskRow's ▶/◀ stage-toggle button (added
+ * alongside the one-click stage toggle feature) renders a Radix `Tooltip`,
+ * which throws if mounted outside one — `TodoPage` supplies that context at
+ * the real app's root, so every standalone leaf render that can reach a
+ * TaskRow needs the same. */
 function renderWithDnd(ui: React.ReactElement) {
-  return render(<DndContext>{ui}</DndContext>);
+  return render(
+    <TooltipProvider>
+      <DndContext>{ui}</DndContext>
+    </TooltipProvider>,
+  );
 }
 
 describe("TrailLine", () => {
@@ -462,10 +476,10 @@ describe("TrailLine", () => {
 });
 
 describe("ProjectHeader", () => {
-  it("renders counts as 'N open · M today'", () => {
+  it("renders counts as 'N open · M in progress'", () => {
     render(
       <ProjectHeader
-        project={makeProject({ id: "prj_1", openCount: 4, todayCount: 1 })}
+        project={makeProject({ id: "prj_1", openCount: 4, inProgressCount: 1 })}
         onToggleCollapsed={() => {}}
         onRename={() => {}}
         onChangeColor={() => {}}
@@ -473,13 +487,13 @@ describe("ProjectHeader", () => {
         onAddTask={() => {}}
       />,
     );
-    expect(screen.getByText("4 open · 1 today")).toBeTruthy();
+    expect(screen.getByText("4 open · 1 in progress")).toBeTruthy();
   });
 
-  it("omits the today segment when todayCount is 0", () => {
+  it("omits the in-progress segment when inProgressCount is 0", () => {
     render(
       <ProjectHeader
-        project={makeProject({ id: "prj_1", openCount: 3, todayCount: 0 })}
+        project={makeProject({ id: "prj_1", openCount: 3, inProgressCount: 0 })}
         onToggleCollapsed={() => {}}
         onRename={() => {}}
         onChangeColor={() => {}}
@@ -488,7 +502,7 @@ describe("ProjectHeader", () => {
       />,
     );
     expect(screen.getByText("3 open")).toBeTruthy();
-    expect(screen.queryByText(/today/)).toBeNull();
+    expect(screen.queryByText(/in progress/)).toBeNull();
   });
 
   it("fires onToggleCollapsed when the chevron is clicked", () => {
@@ -563,16 +577,16 @@ describe("ProjectHeader", () => {
     expect(onDelete).toHaveBeenCalledTimes(1);
   });
 
-  it("variant='today' renders a read-only label: no colour picker, rename, add, or menu", () => {
+  it("variant='in_progress' renders a read-only label: no colour picker, rename, add, or menu", () => {
     render(
       <ProjectHeader
-        project={makeProject({ id: "prj_1", name: "Q3 Launch", openCount: 3, todayCount: 2 })}
-        variant="today"
+        project={makeProject({ id: "prj_1", name: "Q3 Launch", openCount: 3, inProgressCount: 2 })}
+        variant="in_progress"
         onToggleCollapsed={() => {}}
       />,
     );
     expect(screen.getByText("Q3 Launch")).toBeTruthy();
-    expect(screen.getByText("3 open · 2 today")).toBeTruthy();
+    expect(screen.getByText("3 open · 2 in progress")).toBeTruthy();
     expect(screen.queryByLabelText('Change color for project "Q3 Launch"')).toBeNull();
     expect(screen.queryByLabelText('Add task to "Q3 Launch"')).toBeNull();
     expect(screen.queryByLabelText('More actions for project "Q3 Launch"')).toBeNull();
@@ -581,12 +595,12 @@ describe("ProjectHeader", () => {
     expect(screen.queryByLabelText("Rename project Q3 Launch")).toBeNull();
   });
 
-  it("variant='today' still lets collapse work", () => {
+  it("variant='in_progress' still lets collapse work", () => {
     const onToggleCollapsed = vi.fn();
     render(
       <ProjectHeader
         project={makeProject({ id: "prj_1", collapsed: false })}
-        variant="today"
+        variant="in_progress"
         onToggleCollapsed={onToggleCollapsed}
       />,
     );
@@ -609,6 +623,7 @@ describe("ProjectHeader", () => {
 describe("ProjectGroup", () => {
   it("collapsed renders the header only — no body, no add-row", () => {
     render(
+      <TooltipProvider>
       <DndContext>
         <ProjectGroup
           project={makeProject({ id: "prj_1", collapsed: true, openCount: 2 })}
@@ -620,7 +635,8 @@ describe("ProjectGroup", () => {
           onDeleteProject={() => {}}
           onAddTaskToProject={() => {}}
         />
-      </DndContext>,
+      </DndContext>
+      </TooltipProvider>,
     );
     expect(screen.getByText("Q3 Launch")).toBeTruthy();
     expect(screen.queryByText("Draft the copy")).toBeNull();
@@ -629,6 +645,7 @@ describe("ProjectGroup", () => {
 
   it("empty (expanded) project shows the header and only its add-row", () => {
     render(
+      <TooltipProvider>
       <DndContext>
         <ProjectGroup
           project={makeProject({ id: "prj_1", collapsed: false, openCount: 0 })}
@@ -640,25 +657,26 @@ describe("ProjectGroup", () => {
           onDeleteProject={() => {}}
           onAddTaskToProject={() => {}}
         />
-      </DndContext>,
+      </DndContext>
+      </TooltipProvider>,
     );
     expect(screen.getByText("Q3 Launch")).toBeTruthy();
     expect(screen.getByPlaceholderText("add to Q3 Launch")).toBeTruthy();
   });
 
-  it("renders every task as a normal row, marking only the inToday ones", () => {
+  it("renders every task as a normal row, marking only the inProgress ones", () => {
     render(
+      <TooltipProvider>
       <DndContext>
         <ProjectGroup
           project={makeProject({ id: "prj_1", collapsed: false, openCount: 2 })}
           tasks={[
-            makeTask({ id: "tsk_1", title: "Draft the copy", bucket: "backlog" }),
+            makeTask({ id: "tsk_1", title: "Draft the copy", stage: "pending" }),
             makeTask({
               id: "tsk_2",
               title: "Get legal sign-off",
-              bucket: "today",
-              day: "2026-08-27",
-              inToday: true,
+              stage: "in_progress",
+              inProgress: true,
             }),
           ]}
           actions={makeActions()}
@@ -668,29 +686,38 @@ describe("ProjectGroup", () => {
           onDeleteProject={() => {}}
           onAddTaskToProject={() => {}}
         />
-      </DndContext>,
+      </DndContext>
+      </TooltipProvider>,
     );
     expect(screen.getByText("Draft the copy")).toBeTruthy();
     expect(screen.getByText("Get legal sign-off")).toBeTruthy();
     // Both rows keep a real, interactive checkbox — no ghost swap.
     expect(screen.getAllByRole("checkbox")).toHaveLength(2);
-    expect(screen.getByLabelText('Remove "Get legal sign-off" from Today')).toBeTruthy();
-    expect(screen.queryByLabelText('Remove "Draft the copy" from Today')).toBeNull();
+    // No more "Remove from In Progress" marker button — membership is
+    // signalled by column alone now. Instead, each row's own ▶/◀ stage
+    // toggle carries the accessible name, keyed off stage/inProgress via
+    // `taskDragId`'s `inProgressColumn` (both rows render in this same
+    // Backlog `ProjectGroup`, so both read "Move to In Progress").
+    expect(
+      screen.getAllByRole("button", { name: "Move to In Progress" }),
+    ).toHaveLength(2);
   });
 
-  it("variant='today' hides rename/colour/delete/add and skips the drag handle", () => {
+  it("variant='in_progress' hides rename/colour/delete/add and skips the drag handle", () => {
     render(
+      <TooltipProvider>
       <DndContext>
         <ProjectGroup
           project={makeProject({ id: "prj_1", collapsed: false })}
-          variant="today"
+          variant="in_progress"
           tasks={[
-            makeTask({ id: "tsk_1", title: "Get legal sign-off", bucket: "today", inToday: true }),
+            makeTask({ id: "tsk_1", title: "Get legal sign-off", stage: "in_progress", inProgress: true }),
           ]}
           actions={makeActions()}
           onToggleCollapsed={() => {}}
         />
-      </DndContext>,
+      </DndContext>
+      </TooltipProvider>,
     );
     expect(screen.getByText("Q3 Launch")).toBeTruthy();
     expect(screen.queryByLabelText('Add task to "Q3 Launch"')).toBeNull();
@@ -699,17 +726,19 @@ describe("ProjectGroup", () => {
     expect(screen.queryByPlaceholderText(/add to/)).toBeNull();
   });
 
-  it("variant='today' renders nothing when there are no tasks or orphan subtasks", () => {
+  it("variant='in_progress' renders nothing when there are no tasks or orphan subtasks", () => {
     render(
+      <TooltipProvider>
       <DndContext>
         <ProjectGroup
           project={makeProject({ id: "prj_1", collapsed: false })}
-          variant="today"
+          variant="in_progress"
           tasks={[]}
           actions={makeActions()}
           onToggleCollapsed={() => {}}
         />
-      </DndContext>,
+      </DndContext>
+      </TooltipProvider>,
     );
     // No project content at all — only dnd-kit's own hidden a11y scaffolding
     // (DndContext's live region/instructions) is present.
@@ -717,8 +746,9 @@ describe("ProjectGroup", () => {
     expect(document.querySelector("[data-project-id]")).toBeNull();
   });
 
-  it("variant='today' still renders an empty project's header in the Backlog (unaffected)", () => {
+  it("variant='in_progress' still renders an empty project's header in the Backlog (unaffected)", () => {
     render(
+      <TooltipProvider>
       <DndContext>
         <ProjectGroup
           project={makeProject({ id: "prj_1", collapsed: false })}
@@ -730,13 +760,14 @@ describe("ProjectGroup", () => {
           onDeleteProject={() => {}}
           onAddTaskToProject={() => {}}
         />
-      </DndContext>,
+      </DndContext>
+      </TooltipProvider>,
     );
     expect(screen.getByText("Q3 Launch")).toBeTruthy();
     expect(screen.getByPlaceholderText("add to Q3 Launch")).toBeTruthy();
   });
 
-  it("variant='today' renders orphanSubtasks standalone, after the nested tasks, with a trail", () => {
+  it("variant='in_progress' renders orphanSubtasks standalone, after the nested tasks, with a trail", () => {
     const trail: TrailDto = {
       projectId: "prj_1",
       projectName: "Q3 Launch",
@@ -745,27 +776,29 @@ describe("ProjectGroup", () => {
       parentTitle: "Rewrite the onboarding email",
     };
     render(
+      <TooltipProvider>
       <DndContext>
         <ProjectGroup
           project={makeProject({ id: "prj_1", collapsed: false })}
-          variant="today"
+          variant="in_progress"
           tasks={[
-            makeTask({ id: "tsk_nested", title: "Q3 planning doc", bucket: "today", inToday: true }),
+            makeTask({ id: "tsk_nested", title: "Q3 planning doc", stage: "in_progress", inProgress: true }),
           ]}
           orphanSubtasks={[
             makeTask({
               id: "tsk_orphan",
               title: "Get legal sign-off",
               parentId: "tsk_parent",
-              bucket: "today",
-              inToday: true,
+              stage: "in_progress",
+              inProgress: true,
               trail,
             }),
           ]}
           actions={makeActions()}
           onToggleCollapsed={() => {}}
         />
-      </DndContext>,
+      </DndContext>
+      </TooltipProvider>,
     );
     expect(screen.getByText("Q3 planning doc")).toBeTruthy();
     expect(screen.getByText("Get legal sign-off")).toBeTruthy();
@@ -780,6 +813,7 @@ describe("ProjectGroup", () => {
   it("forwards a new-task title to onAddTaskToProject with the project id", () => {
     const onAddTaskToProject = vi.fn();
     render(
+      <TooltipProvider>
       <DndContext>
         <ProjectGroup
           project={makeProject({ id: "prj_1", collapsed: false })}
@@ -791,7 +825,8 @@ describe("ProjectGroup", () => {
           onDeleteProject={() => {}}
           onAddTaskToProject={onAddTaskToProject}
         />
-      </DndContext>,
+      </DndContext>
+      </TooltipProvider>,
     );
     const input = screen.getByPlaceholderText("add to Q3 Launch");
     fireEvent.change(input, { target: { value: "New task" } });
@@ -807,7 +842,8 @@ describe("ProjectGroup", () => {
     function Harness() {
       const [collapsed, setCollapsed] = useState(true);
       return (
-        <DndContext>
+        <TooltipProvider>
+      <DndContext>
           <ProjectGroup
             project={makeProject({ id: "prj_1", collapsed, openCount: 1 })}
             tasks={[makeTask({ id: "tsk_1", title: "Draft the copy" })]}
@@ -819,6 +855,7 @@ describe("ProjectGroup", () => {
             onAddTaskToProject={() => {}}
           />
         </DndContext>
+      </TooltipProvider>
       );
     }
     render(<Harness />);
@@ -833,6 +870,7 @@ describe("ProjectGroup", () => {
 
   it("the header's '+' refocuses the add-row when the project is already expanded", () => {
     render(
+      <TooltipProvider>
       <DndContext>
         <ProjectGroup
           project={makeProject({ id: "prj_1", collapsed: false, openCount: 1 })}
@@ -844,7 +882,8 @@ describe("ProjectGroup", () => {
           onDeleteProject={() => {}}
           onAddTaskToProject={() => {}}
         />
-      </DndContext>,
+      </DndContext>
+      </TooltipProvider>,
     );
 
     const input = screen.getByPlaceholderText("add to Q3 Launch");
@@ -856,24 +895,25 @@ describe("ProjectGroup", () => {
     expect(document.activeElement).toBe(screen.getByPlaceholderText("add to Q3 Launch"));
   });
 
-  // Regression for the reported bug: the Backlog and Today columns render
-  // the SAME project (and, for a task that's inToday, the same task) at
-  // once — a task visible in both columns is exactly the shape `taskDragId`
-  // exists for (see the design doc's "Why taskDragId's dual-id mechanism
-  // survived ghost removal"). Collapse state used to be a single server
-  // column shared by both renders, so toggling the chevron in one column's
-  // instance silently toggled the other's too. This harness renders both
-  // instances of one project side by side, each with its own collapse
-  // field (`collapsed` for backlog, `todayCollapsed` for today), and proves
-  // they're now independent.
-  it("collapsing a project in the Today column leaves the Backlog column's same project expanded, and vice versa", () => {
+  // Regression for the reported bug: the Backlog and In Progress columns
+  // render the SAME project (and, for a task that's inProgress, the same
+  // task) at once — a task visible in both columns is exactly the shape
+  // `taskDragId` exists for (see the design doc's "Why taskDragId's
+  // dual-id mechanism survived ghost removal"). Collapse state used to be a
+  // single server column shared by both renders, so toggling the chevron
+  // in one column's instance silently toggled the other's too. This
+  // harness renders both instances of one project side by side, each with
+  // its own collapse field (`collapsed` for backlog, `inProgressCollapsed`
+  // for in_progress), and proves they're now independent.
+  it("collapsing a project in the In Progress column leaves the Backlog column's same project expanded, and vice versa", () => {
     function Harness() {
       const [collapsed, setCollapsed] = useState(false);
-      const [todayCollapsed, setTodayCollapsed] = useState(false);
-      const project = makeProject({ id: "prj_1", collapsed, todayCollapsed, openCount: 1, todayCount: 1 });
-      const task = makeTask({ id: "tsk_1", title: "Shared task", bucket: "today", inToday: true });
+      const [inProgressCollapsed, setInProgressCollapsed] = useState(false);
+      const project = makeProject({ id: "prj_1", collapsed, inProgressCollapsed, openCount: 1, inProgressCount: 1 });
+      const task = makeTask({ id: "tsk_1", title: "Shared task", stage: "in_progress", inProgress: true });
       return (
-        <DndContext>
+        <TooltipProvider>
+      <DndContext>
           <div data-testid="backlog-column">
             <ProjectGroup
               project={project}
@@ -887,48 +927,138 @@ describe("ProjectGroup", () => {
               onAddTaskToProject={() => {}}
             />
           </div>
-          <div data-testid="today-column">
+          <div data-testid="in_progress-column">
             <ProjectGroup
               project={project}
               tasks={[task]}
               actions={makeActions()}
-              variant="today"
-              onToggleCollapsed={() => setTodayCollapsed((c) => !c)}
+              variant="in_progress"
+              onToggleCollapsed={() => setInProgressCollapsed((c) => !c)}
             />
           </div>
         </DndContext>
+      </TooltipProvider>
       );
     }
     render(<Harness />);
 
     const backlogColumn = screen.getByTestId("backlog-column");
-    const todayColumn = screen.getByTestId("today-column");
+    const inProgressColumn = screen.getByTestId("in_progress-column");
 
     // Both columns start expanded — the shared task's title is visible twice.
     expect(screen.getAllByText("Shared task")).toHaveLength(2);
 
-    // Collapse Today only.
-    fireEvent.click(within(todayColumn).getByLabelText('Collapse "Q3 Launch"'));
-    // Today's row is gone; the Backlog's identical row is untouched.
-    expect(within(todayColumn).queryByText("Shared task")).toBeNull();
+    // Collapse In Progress only.
+    fireEvent.click(within(inProgressColumn).getByLabelText('Collapse "Q3 Launch"'));
+    // In Progress's row is gone; the Backlog's identical row is untouched.
+    expect(within(inProgressColumn).queryByText("Shared task")).toBeNull();
     expect(within(backlogColumn).getByText("Shared task")).toBeTruthy();
     expect(within(backlogColumn).getByLabelText('Collapse "Q3 Launch"')).toBeTruthy(); // still expanded
 
-    // Re-expand Today, then collapse Backlog instead — the mirror case.
-    fireEvent.click(within(todayColumn).getByLabelText('Expand "Q3 Launch"'));
+    // Re-expand In Progress, then collapse Backlog instead — the mirror case.
+    fireEvent.click(within(inProgressColumn).getByLabelText('Expand "Q3 Launch"'));
     fireEvent.click(within(backlogColumn).getByLabelText('Collapse "Q3 Launch"'));
     expect(within(backlogColumn).queryByText("Shared task")).toBeNull();
-    expect(within(todayColumn).getByText("Shared task")).toBeTruthy();
+    expect(within(inProgressColumn).getByText("Shared task")).toBeTruthy();
+  });
+
+  // Feature: parent-task grouping inside In Progress project cards. `rows`
+  // (built by `lib/inProgressView`'s `selectInProgressView`) is the ONLY
+  // thing that switches `ProjectGroup` into this rendering — passing it
+  // renders a bare `TaskRow` per `"task"` row and a `ParentGroupHeader` +
+  // indented children per `"parentGroup"` row, replacing tag subgrouping.
+  it("variant='in_progress' with rows renders a plain TaskRow for a 'task' row and a ParentGroupHeader + indented children for a 'parentGroup' row", () => {
+    const qualifying = makeTask({
+      id: "tsk_qualifying",
+      title: "Get legal sign-off",
+      stage: "in_progress",
+      inProgress: true,
+      tags: [{ id: "tag_urgent", name: "urgent", color: "red" }],
+    });
+    const child = makeTask({
+      id: "tsk_child",
+      title: "Q3 planning doc",
+      stage: "in_progress",
+      inProgress: true,
+    });
+    render(
+      <TooltipProvider>
+        <DndContext>
+          <ProjectGroup
+            project={makeProject({ id: "prj_1", collapsed: false })}
+            variant="in_progress"
+            tasks={[qualifying]}
+            rows={[
+              { kind: "task", task: qualifying },
+              {
+                kind: "parentGroup",
+                parentId: "tsk_parent",
+                parentTitle: "Non-qualifying parent",
+                tasks: [child],
+              },
+            ]}
+            actions={makeActions()}
+            onToggleCollapsed={() => {}}
+          />
+        </DndContext>
+      </TooltipProvider>,
+    );
+    // Tags still render inline on the task row regardless of grouping.
+    expect(screen.getByText("urgent")).toBeTruthy();
+    expect(screen.getByText("Get legal sign-off")).toBeTruthy();
+    // The parentGroup's header names the parent, and its child renders below it.
+    expect(screen.getByText("Non-qualifying parent")).toBeTruthy();
+    expect(screen.getByText("Q3 planning doc")).toBeTruthy();
+    // No tag-subgroup count text ("· N") anywhere — that header is gone.
+    expect(screen.queryByText(/^· \d+$/)).toBeNull();
+  });
+
+  // The Backlog must NEVER group by parent task — `rows` is simply never
+  // passed for `variant="backlog"` (see `TodoPage.tsx`'s
+  // `backlogProjectGroups`, which never sets it), so even a task that DOES
+  // carry a tag still renders through the original flat task list, with no
+  // tag-subgroup or parent-group header anywhere in the DOM.
+  it("variant='backlog' (rows omitted) never renders a tag-subgroup or parent-group header, even for a tagged task", () => {
+    const task = makeTask({
+      id: "tsk_1",
+      title: "Draft the copy",
+      tags: [{ id: "tag_urgent", name: "urgent", color: "red" }],
+    });
+    render(
+      <TooltipProvider>
+        <DndContext>
+          <ProjectGroup
+            project={makeProject({ id: "prj_1", collapsed: false })}
+            tasks={[task]}
+            actions={makeActions()}
+            onToggleCollapsed={() => {}}
+            onRenameProject={() => {}}
+            onChangeProjectColor={() => {}}
+            onDeleteProject={() => {}}
+            onAddTaskToProject={() => {}}
+          />
+        </DndContext>
+      </TooltipProvider>,
+    );
+    expect(screen.getByText("Draft the copy")).toBeTruthy();
+    // "urgent" still renders exactly once — from the row's own `TagChips`
+    // chip, unaffected by any of this. A SECOND "urgent" would mean a
+    // subgroup header rendered too, which the Backlog must never do; there
+    // is no "· N" count text anywhere (only a subgroup header renders
+    // one), and no "Untagged" bucket either.
+    expect(screen.getAllByText("urgent")).toHaveLength(1);
+    expect(screen.queryByText(/^· \d+$/)).toBeNull();
+    expect(screen.queryByText("Untagged")).toBeNull();
   });
 });
 
-describe("TaskRow — the Today marker (ghost rows deleted)", () => {
-  it("an inToday row keeps a real, interactive checkbox — never a ghost swap", () => {
+describe("TaskRow — In Progress membership is column-only (ghost rows and the old marker are both gone)", () => {
+  it("an inProgress row keeps a real, interactive checkbox — never a ghost swap", () => {
     const task = makeTask({
       id: "tsk_1",
       title: "Get legal sign-off",
-      bucket: "today",
-      inToday: true,
+      stage: "in_progress",
+      inProgress: true,
     });
     renderWithDnd(<TaskRow task={task} actions={makeActions()} />);
     expect(screen.getByRole("checkbox")).toBeTruthy();
@@ -937,66 +1067,117 @@ describe("TaskRow — the Today marker (ghost rows deleted)", () => {
     expect(row?.className).not.toContain("opacity-60");
   });
 
-  it("shows a manual marker ('· today') for a manually scheduled row (bucket='today')", () => {
+  it("renders no '· in progress' chip and no 'Remove from In Progress' control — membership is signalled by column alone", () => {
     const task = makeTask({
       id: "tsk_1",
       title: "Get legal sign-off",
-      bucket: "today",
-      inToday: true,
+      stage: "in_progress",
+      inProgress: true,
     });
     renderWithDnd(<TaskRow task={task} actions={makeActions()} />);
-    expect(screen.getByLabelText('Remove "Get legal sign-off" from Today')).toBeTruthy();
-    expect(screen.getAllByText("· today").length).toBeGreaterThan(0);
+    expect(screen.queryByText(/in progress/)).toBeNull();
+    expect(screen.queryByLabelText(/Remove .* from In Progress/)).toBeNull();
   });
 
-  it("shows an auto marker ('⌁ today') for an auto-included row (bucket='backlog', due today/overdue)", () => {
+  it("never renders the old '⌁ due today' auto-included marker for an overdue pending task — due dates no longer auto-include", () => {
     const task = makeTask({
       id: "tsk_1",
       title: "Renew the domain",
-      bucket: "backlog",
-      dueAt: 1,
-      inToday: true,
+      stage: "pending",
+      dueAt: NOON - 14 * HOUR,
     });
-    renderWithDnd(<TaskRow task={task} actions={makeActions()} />);
-    expect(screen.getByLabelText('Remove "Renew the domain" from Today')).toBeTruthy();
-    expect(screen.getAllByText("⌁ today").length).toBeGreaterThan(0);
-    expect(screen.queryAllByText("· today")).toHaveLength(0);
+    renderWithDnd(<TaskRow task={task} actions={makeActions({ now: NOON })} />);
+    expect(screen.queryByText(/due today/)).toBeNull();
+    expect(screen.queryByText("⌁")).toBeNull();
+    // The due-date text itself must still render — only the dead auto-marker
+    // branch is gone.
+    expect(screen.getByText("14 hours late")).toBeTruthy();
   });
 
-  it("shows both the marker AND the carried badge at once — no longer either/or", () => {
+  it("shows the carried badge on its own now that the marker is gone", () => {
     const task = makeTask({
       id: "tsk_1",
       title: "Get legal sign-off",
-      bucket: "today",
-      inToday: true,
-      carriedCount: 2,
+      stage: "in_progress",
+      inProgress: true,
+      carriedDays: 2,
     });
     renderWithDnd(<TaskRow task={task} actions={makeActions()} />);
-    expect(screen.getByLabelText('Remove "Get legal sign-off" from Today')).toBeTruthy();
-    expect(screen.getByText("carried 2×")).toBeTruthy();
+    expect(screen.getByText("carried 2d")).toBeTruthy();
   });
 
-  it("clicking the marker calls onRemoveFromToday with the task id", () => {
-    const onRemoveFromToday = vi.fn();
+  it("hides the carried badge when carriedDays is 0", () => {
     const task = makeTask({
       id: "tsk_1",
       title: "Get legal sign-off",
-      bucket: "today",
-      inToday: true,
+      stage: "in_progress",
+      inProgress: true,
+      carriedDays: 0,
     });
-    renderWithDnd(
-      <TaskRow task={task} actions={makeActions()} onRemoveFromToday={onRemoveFromToday} />,
-    );
-    fireEvent.click(screen.getByLabelText('Remove "Get legal sign-off" from Today'));
-    expect(onRemoveFromToday).toHaveBeenCalledWith("tsk_1");
+    renderWithDnd(<TaskRow task={task} actions={makeActions()} />);
+    expect(screen.queryByText(/^carried /)).toBeNull();
   });
 
-  it("a row not in Today shows no marker", () => {
-    const task = makeTask({ id: "tsk_1", title: "Ship the invoice fix", inToday: false });
+  it("a row not in In Progress renders no membership text either", () => {
+    const task = makeTask({ id: "tsk_1", title: "Ship the invoice fix", inProgress: false });
     renderWithDnd(<TaskRow task={task} actions={makeActions()} />);
     expect(screen.getByRole("checkbox")).toBeTruthy();
-    expect(screen.queryByText(/today/)).toBeNull();
-    expect(screen.queryByLabelText(/Remove .* from Today/)).toBeNull();
+    expect(screen.queryByText(/in progress/)).toBeNull();
+  });
+
+  // Phase 3: the ▶/◀ stage toggle is the primary way to move work between
+  // the two blocks now, so it must be discoverable without hovering —
+  // unlike the calendar/tag/menu icons it sits beside, it used to be
+  // `opacity-0 group-hover:opacity-100`. Assert it's present and clickable
+  // with no hover/focus simulated at all.
+  describe("the ▶/◀ stage toggle", () => {
+    it("is always visible (no hover needed) on a Backlog-column row, labeled 'Move to In Progress'", () => {
+      const task = makeTask({ id: "tsk_1", title: "Draft the copy", stage: "pending" });
+      renderWithDnd(<TaskRow task={task} actions={makeActions()} inProgressColumn={false} />);
+      const button = screen.getByRole("button", { name: "Move to In Progress" });
+      expect(button).toBeTruthy();
+      expect(button.className).not.toContain("opacity-0");
+      expect(button.getAttribute("title")).toBe("Move to In Progress");
+    });
+
+    it("is always visible (no hover needed) on an In Progress-column row, labeled 'Move to Backlog'", () => {
+      const task = makeTask({
+        id: "tsk_1",
+        title: "Get legal sign-off",
+        stage: "in_progress",
+        inProgress: true,
+      });
+      renderWithDnd(<TaskRow task={task} actions={makeActions()} inProgressColumn />);
+      const button = screen.getByRole("button", { name: "Move to Backlog" });
+      expect(button).toBeTruthy();
+      expect(button.className).not.toContain("opacity-0");
+      expect(button.getAttribute("title")).toBe("Move to Backlog");
+    });
+
+    it("clicking it on a Backlog-column row calls onStartTask with the task id", () => {
+      const onStartTask = vi.fn();
+      const task = makeTask({ id: "tsk_1", title: "Draft the copy", stage: "pending" });
+      renderWithDnd(
+        <TaskRow task={task} actions={makeActions({ onStartTask })} inProgressColumn={false} />,
+      );
+      fireEvent.click(screen.getByRole("button", { name: "Move to In Progress" }));
+      expect(onStartTask).toHaveBeenCalledWith("tsk_1");
+    });
+
+    it("clicking it on an In Progress-column row calls onParkTask with the task id", () => {
+      const onParkTask = vi.fn();
+      const task = makeTask({
+        id: "tsk_1",
+        title: "Get legal sign-off",
+        stage: "in_progress",
+        inProgress: true,
+      });
+      renderWithDnd(
+        <TaskRow task={task} actions={makeActions({ onParkTask })} inProgressColumn />,
+      );
+      fireEvent.click(screen.getByRole("button", { name: "Move to Backlog" }));
+      expect(onParkTask).toHaveBeenCalledWith("tsk_1");
+    });
   });
 
   it("renders the trail line when showTrail is set and the task has trail context", () => {
@@ -1010,8 +1191,8 @@ describe("TaskRow — the Today marker (ghost rows deleted)", () => {
     const task = makeTask({
       id: "tsk_1",
       title: "Get legal sign-off",
-      bucket: "today",
-      inToday: true,
+      stage: "in_progress",
+      inProgress: true,
       trail,
     });
     renderWithDnd(<TaskRow task={task} actions={makeActions()} showTrail />);
@@ -1019,7 +1200,7 @@ describe("TaskRow — the Today marker (ghost rows deleted)", () => {
   });
 
   it("renders no trail line for a loose task even when showTrail is set", () => {
-    const task = makeTask({ id: "tsk_1", title: "Ship the invoice fix", bucket: "today" });
+    const task = makeTask({ id: "tsk_1", title: "Ship the invoice fix", stage: "in_progress" });
     const { container } = renderWithDnd(
       <TaskRow task={task} actions={makeActions()} showTrail />,
     );
@@ -1038,12 +1219,61 @@ describe("TaskRow — the Today marker (ghost rows deleted)", () => {
     const task = makeTask({
       id: "tsk_1",
       title: "Get legal sign-off",
-      bucket: "today",
-      inToday: true,
+      stage: "in_progress",
+      inProgress: true,
       trail,
     });
     renderWithDnd(<TaskRow task={task} actions={makeActions()} showTrail hideProject />);
     expect(screen.getAllByText("Rewrite the onboarding email").length).toBeGreaterThan(0);
     expect(screen.queryByText("Q3 Launch")).toBeNull();
+  });
+});
+
+describe("ParentGroupHeader", () => {
+  it("renders the parent title", () => {
+    render(
+      <ParentGroupHeader parentId="tsk_parent" parentTitle="Rewrite the onboarding email" />,
+    );
+    expect(screen.getByText("Rewrite the onboarding email")).toBeTruthy();
+  });
+
+  it("calls onNavigateToParent with the exact parentId when the title is clicked", () => {
+    const onNavigateToParent = vi.fn();
+    render(
+      <ParentGroupHeader
+        parentId="tsk_parent"
+        parentTitle="Rewrite the onboarding email"
+        onNavigateToParent={onNavigateToParent}
+      />,
+    );
+    fireEvent.click(screen.getByText("Rewrite the onboarding email"));
+    expect(onNavigateToParent).toHaveBeenCalledWith("tsk_parent");
+  });
+
+  it("renders no count chip or colour dot", () => {
+    const { container } = render(
+      <ParentGroupHeader parentId="tsk_parent" parentTitle="Rewrite the onboarding email" />,
+    );
+    expect(container.querySelector(".rounded-full")).toBeNull();
+    expect(container.textContent).not.toContain("·");
+  });
+
+  it("returns null for an empty or whitespace-only parentTitle", () => {
+    const { container: emptyContainer } = render(
+      <ParentGroupHeader parentId="tsk_parent" parentTitle="" />,
+    );
+    expect(emptyContainer.innerHTML).toBe("");
+
+    const { container: whitespaceContainer } = render(
+      <ParentGroupHeader parentId="tsk_parent" parentTitle="   " />,
+    );
+    expect(whitespaceContainer.innerHTML).toBe("");
+  });
+
+  it("is safe to render with onNavigateToParent omitted", () => {
+    render(<ParentGroupHeader parentId="tsk_parent" parentTitle="Rewrite the onboarding email" />);
+    expect(() =>
+      fireEvent.click(screen.getByText("Rewrite the onboarding email")),
+    ).not.toThrow();
   });
 });

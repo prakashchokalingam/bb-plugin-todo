@@ -1,20 +1,21 @@
-// The muted second line under a Today row: `# Project > Parent`. Renders
-// null whenever there is no context to show (a loose top-level task never
-// gains a second line). Each segment is a plain button — click-through to
-// the source row is the caller's job (scrolling/flashing lands in Phase 6);
-// this component only fires the callback.
+// The muted second line under an In Progress row: `# Project > Parent`.
+// Renders null whenever there is no context to show (a loose top-level task
+// never gains a second line). Each segment is a plain button — click-through
+// to the source row is the caller's job (scrolling/flashing lands in Phase
+// 6); this component only fires the callback.
 import { cn } from "@/lib/utils";
+import { firstLine, isMultiline, singleLineLabel } from "@/lib/taskText";
 import { TAG_DOT_CLASS } from "@/lib/tag-colors";
 import type { TrailDto } from "@/contract";
 
 export interface TrailLineProps {
   trail: TrailDto | null | undefined;
   /** Suppresses the project segment: the caller already names the project
-   * elsewhere (a Today project group's own header names it, so an orphan
-   * subtask rendered inside that group would otherwise repeat it). Default
-   * `false`, so Archive's existing use — and the loose/Unfiled group's
-   * orphan rows, which have no header naming a project for them — are
-   * completely unaffected. */
+   * elsewhere (an In Progress project group's own header names it, so an
+   * orphan subtask rendered inside that group would otherwise repeat it).
+   * Default `false`, so Archive's existing use — and the loose/Unfiled
+   * group's orphan rows, which have no header naming a project for them —
+   * are completely unaffected. */
   hideProject?: boolean;
   onNavigateToProject?: (projectId: string) => void;
   onNavigateToParent?: (parentId: string) => void;
@@ -61,10 +62,16 @@ export function TrailLine({
     </button>
   ) : null;
 
+  // A multiline parent shows only its first line here; the full text stays
+  // available through the tooltip and the accessible name. Single-line
+  // titles keep their exact text as the accessible name, as before.
+  const parentMultiline = hasParent && isMultiline(trail.parentTitle as string);
   const parentSegment = hasParent ? (
     <button
       type="button"
       dir="rtl"
+      title={parentMultiline ? singleLineLabel(trail.parentTitle as string) : undefined}
+      aria-label={parentMultiline ? singleLineLabel(trail.parentTitle as string) : undefined}
       onClick={() => onNavigateToParent?.(trail.parentId as string)}
       className="min-w-0 flex-1 truncate text-left text-muted-foreground hover:text-foreground focus-visible:text-foreground"
     >
@@ -75,7 +82,7 @@ export function TrailLine({
        * while the box stays RTL, so the ellipsis stays on the left and the
        * text still reads correctly. Do not remove without replacing the
        * isolate — jsdom cannot lay text out, so no test will catch it. */}
-      <bdi>{trail.parentTitle}</bdi>
+      <bdi>{firstLine(trail.parentTitle as string)}</bdi>
     </button>
   ) : null;
 

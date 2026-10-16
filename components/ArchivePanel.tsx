@@ -27,6 +27,9 @@ import {
 import { Button } from "@/components/ui/button";
 import { Icon } from "@/components/ui/icon";
 import { Separator } from "@/components/ui/separator";
+import { TaskText } from "@/components/TaskText";
+import { ImageThumbs } from "@/components/ImageThumbs";
+import { singleLineLabel } from "@/lib/taskText";
 
 const PAGE_SIZE = 100;
 
@@ -40,6 +43,8 @@ export interface ArchivePanelProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onChanged: () => void;
+  /** Host link opener for URLs in archived titles; see `BoardActions.onOpenUrl`. */
+  onOpenUrl?: (url: string) => boolean;
 }
 
 function formatDayLabel(day: string): string {
@@ -73,6 +78,7 @@ export default function ArchivePanel({
   open,
   onOpenChange,
   onChanged,
+  onOpenUrl,
 }: ArchivePanelProps) {
   const rpc = useRpc<typeof rpcContract>();
   const [listName, setListName] = useState<string | null>(null);
@@ -208,7 +214,7 @@ export default function ArchivePanel({
                 <AlertDialogDescription>
                   This will permanently delete {total}{" "}
                   {total === 1 ? "item" : "items"} archived in{" "}
-                  {listName ?? "this list"}. This can't be undone.
+                  {listName ?? "this list"}, with their images. This can't be undone.
                 </AlertDialogDescription>
               </AlertDialogHeader>
               <AlertDialogFooter>
@@ -240,17 +246,25 @@ export default function ArchivePanel({
                   {group.tasks.map((task) => (
                     <li
                       key={task.id}
-                      className="flex min-h-8 items-center justify-between gap-2 text-sm"
+                      className="flex min-h-8 items-start justify-between gap-2 py-1 text-sm"
                     >
-                      <span className="truncate text-foreground">
-                        {task.title}
-                      </span>
-                      <span className="flex shrink-0 items-center gap-1">
+                      <div className="flex min-w-0 flex-1 flex-col gap-1">
+                        <TaskText
+                          title={task.title}
+                          onOpenUrl={onOpenUrl}
+                          className="min-w-0 flex-1 text-foreground"
+                        />
+                        <ImageThumbs
+                          label={singleLineLabel(task.title)}
+                          items={task.images.map((img) => ({ key: img.id, src: img.url }))}
+                        />
+                      </div>
+                      <span className="-my-1 flex shrink-0 items-center gap-1">
                         <Button
                           type="button"
                           variant="ghost"
                           size="sm"
-                          aria-label={`Restore ${task.title}`}
+                          aria-label={`Restore ${singleLineLabel(task.title)}`}
                           onClick={() =>
                             restore([
                               task.id,
@@ -265,7 +279,7 @@ export default function ArchivePanel({
                           type="button"
                           variant="ghost"
                           size="icon"
-                          aria-label={`Delete ${task.title} permanently`}
+                          aria-label={`Delete ${singleLineLabel(task.title)} permanently`}
                           onClick={() => remove(task.id)}
                         >
                           <Icon name="Trash2" className="size-3.5" />

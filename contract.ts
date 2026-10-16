@@ -48,20 +48,49 @@ export interface TrailDto {
   parentTitle: string | null;
 }
 
+/** Raster formats the plugin accepts. Sniffed server-side, never trusted. */
+export const IMAGE_MIMES = ["image/png", "image/jpeg", "image/gif", "image/webp"] as const;
+export type ImageMime = (typeof IMAGE_MIMES)[number];
+
+/** Shared by client (early, friendly errors) and server (the real check). */
+export const IMAGE_LIMITS = {
+  /** Decoded bytes per image. */
+  maxBytes: 5 * 1024 * 1024,
+  /** Images attached to one task. */
+  maxPerTask: 10,
+  /** Decoded bytes across one request. */
+  maxRequestBytes: 16 * 1024 * 1024,
+  /** Longest base64 string for one image. */
+  maxBase64Length: Math.ceil((5 * 1024 * 1024) / 3) * 4,
+} as const;
+
+/** Metadata only. The bytes are served by the authenticated `image` route. */
+export interface ImageDto {
+  id: string;
+  mime: ImageMime;
+  size: number;
+  createdAt: number;
+  /** Same-origin path for `<img src>`; the route is `GET http/image?id=`. */
+  url: string;
+}
+
 export interface TaskDto {
   id: string;
   listId: string;
   parentId: string | null;
   title: string;
   notes: string | null;
-  bucket: "backlog" | "today";
-  day: string | null;
+  stage: "pending" | "in_progress";
   sortOrder: number;
   dueAt: number | null;
   hasDueTime: boolean;
   status: "open" | "done";
   completedAt: number | null;
-  carriedCount: number;
+  /** Whole local-calendar-days since this task's most recent flip into In
+   * Progress (`in_progress_since`), 0 for same-day. Resets to 0 the instant
+   * it's parked back to `pending` — the counter does not persist across a
+   * park/restart. */
+  carriedDays: number;
   createdAt: number;
   updatedAt: number;
   /** Present on top-level rows only; always [] on subtasks. */
@@ -70,17 +99,20 @@ export interface TaskDto {
   subtaskCounts: { total: number; done: number };
   /** Ordered by tag sortOrder. Populated on subtasks too. */
   tags: TagRefDto[];
+  /** Attached images, oldest first (max `IMAGE_LIMITS.maxPerTask`). Populated on subtasks too. */
+  images: ImageDto[];
   /** NULL = loose (not filed into a project). */
   projectId: string | null;
   trail: TrailDto | null;
   /**
-   * Computed server-side from the shared Today-membership predicate
-   * (`isTodayMember`/`TODAY_MEMBERSHIP_SQL` in lib/db.ts): true if manually
-   * scheduled (`bucket = 'today'`) OR due today/overdue and not dismissed
-   * for today. The one bit the client can't reconstruct on its own, since
-   * `today_dismissed_day` itself is never sent.
+   * Computed server-side from the shared In Progress-membership predicate
+   * (`isInProgressMember`/`IN_PROGRESS_MEMBERSHIP_SQL` in lib/db.ts): true
+   * iff `stage === 'in_progress'`. A due date never affects this — due
+   * dates are just due dates now. Sent explicitly anyway (rather than left
+   * for the client to recompute from `stage`) so the client never needs its
+   * own copy of the membership rule.
    */
-  inToday: boolean;
+  inProgress: boolean;
 }
 
 export interface ListDto {
@@ -98,13 +130,13 @@ export interface ProjectDto {
   color: TagColor;
   sortOrder: number;
   /** Collapse state is per-column (see `setProjectCollapsed`):
-   * `collapsed` is the Backlog column's own state, `todayCollapsed` is
-   * Today's — the same project renders in both columns at once, and
+   * `collapsed` is the Backlog column's own state, `inProgressCollapsed` is
+   * In Progress's — the same project renders in both columns at once, and
    * collapsing it in one must never affect the other. */
   collapsed: boolean;
-  todayCollapsed: boolean;
+  inProgressCollapsed: boolean;
   openCount: number;
-  todayCount: number;
+  inProgressCount: number;
   overdueCount: number;
 }
 
@@ -123,6 +155,21 @@ const tagDtoSchema = tagRefDtoSchema
     sortOrder: z.number(),
     taskCount: z.number().int(),
   })
+  .strict();
+
+const imageDtoSchema = z
+  .object({
+    id: idSchema,
+    mime: z.enum(IMAGE_MIMES),
+    size: z.number().int(),
+    createdAt: z.number(),
+    url: z.string(),
+  })
+  .strict();
+
+/** One image going up. Base64 is the RPC transport; it is never stored. */
+const imageInputSchema = z
+  .object({ data: z.string().min(1).max(IMAGE_LIMITS.maxBase64Length) })
   .strict();
 
 const trailDtoSchema = z
@@ -147,14 +194,13 @@ const taskDtoSchema: z.ZodType<TaskDto> = z.lazy(() =>
       parentId: idSchema.nullable(),
       title: z.string(),
       notes: z.string().nullable(),
-      bucket: z.enum(["backlog", "today"]),
-      day: z.string().nullable(),
+      stage: z.enum(["pending", "in_progress"]),
       sortOrder: z.number(),
       dueAt: z.number().nullable(),
       hasDueTime: z.boolean(),
       status: z.enum(["open", "done"]),
       completedAt: z.number().nullable(),
-      carriedCount: z.number().int(),
+      carriedDays: z.number().int(),
       createdAt: z.number(),
       updatedAt: z.number(),
       subtasks: z.array(taskDtoSchema),
@@ -162,9 +208,10 @@ const taskDtoSchema: z.ZodType<TaskDto> = z.lazy(() =>
         .object({ total: z.number().int(), done: z.number().int() })
         .strict(),
       tags: z.array(tagRefDtoSchema),
+      images: z.array(imageDtoSchema),
       projectId: idSchema.nullable(),
       trail: trailDtoSchema.nullable(),
-      inToday: z.boolean(),
+      inProgress: z.boolean(),
     })
     .strict(),
 );
@@ -187,9 +234,9 @@ const projectDtoSchema = z
     color: z.enum(TAG_COLORS),
     sortOrder: z.number(),
     collapsed: z.boolean(),
-    todayCollapsed: z.boolean(),
+    inProgressCollapsed: z.boolean(),
     openCount: z.number().int(),
-    todayCount: z.number().int(),
+    inProgressCount: z.number().int(),
     overdueCount: z.number().int(),
   })
   .strict();
@@ -202,12 +249,12 @@ export const rpcContract = defineRpcContract({
         lists: z.array(listDtoSchema),
         activeListId: idSchema,
         // No `tasks` here — the Backlog is now comprehensive, so
-        // `backlog.tasks` already carries everything a Today row needs
-        // (via `inToday`); the client derives its own grouped Today view
-        // from that single tree instead of trusting a second traversal.
-        today: z
+        // `backlog.tasks` already carries everything an In Progress row
+        // needs (via `inProgress`); the client derives its own grouped In
+        // Progress view from that single tree instead of trusting a second
+        // traversal.
+        inProgress: z
           .object({
-            day: z.string(),
             planned: z.number().int(),
             completed: z.number().int(),
           })
@@ -250,7 +297,7 @@ export const rpcContract = defineRpcContract({
     input: z
       .object({
         listId: idSchema,
-        bucket: z.enum(["backlog", "today"]),
+        stage: z.enum(["pending", "in_progress"]),
         title: z.string(),
         parentId: idSchema.nullable(),
         dueAt: z.number().nullable(),
@@ -261,6 +308,8 @@ export const rpcContract = defineRpcContract({
         // unchanged from. Optional (rather than required) so existing
         // callers that don't yet know about projects keep working.
         projectId: idSchema.nullable().optional(),
+        /** Created in the same transaction as the task: all or nothing. */
+        images: z.array(imageInputSchema).max(IMAGE_LIMITS.maxPerTask).optional(),
       })
       .strict(),
     output: z.object({ task: taskDtoSchema }).strict(),
@@ -273,6 +322,9 @@ export const rpcContract = defineRpcContract({
         notes: z.string().nullable().optional(),
         dueAt: z.number().nullable().optional(),
         hasDueTime: z.boolean().optional(),
+        /** Applied with the text edit in one transaction: removals first, then additions. */
+        addImages: z.array(imageInputSchema).max(IMAGE_LIMITS.maxPerTask).optional(),
+        removeImageIds: z.array(idSchema).max(IMAGE_LIMITS.maxPerTask).optional(),
       })
       .strict(),
     output: z.object({ task: taskDtoSchema }).strict(),
@@ -281,7 +333,7 @@ export const rpcContract = defineRpcContract({
     input: z
       .object({
         id: idSchema,
-        bucket: z.enum(["backlog", "today"]),
+        stage: z.enum(["pending", "in_progress"]),
         parentId: idSchema.nullable(),
         beforeId: idSchema.nullable(),
         afterId: idSchema.nullable(),
@@ -295,12 +347,15 @@ export const rpcContract = defineRpcContract({
     input: z.object({ id: idSchema }).strict(),
     output: z.object({ completedIds: z.array(idSchema) }).strict(),
   },
-  // Counterpart to moveTask's today->backlog dismissal stamp, for a task
-  // that was never manually scheduled (bucket = 'backlog') but renders in
-  // Today purely because it's due today or overdue — there's nothing to
-  // move, so this is a single-column stamp of today_dismissed_day.
-  dismissFromToday: {
-    input: z.object({ id: idSchema }).strict(),
+  // The one-click stage toggle in both directions. Flipping to `in_progress`
+  // stamps `in_progress_since` to now, starting the carried-days clock.
+  // Flipping to `pending` clears it back to NULL — the counter RESETS on
+  // park, by design. There is no more due-date auto-inclusion to guard
+  // against re-entry for (the old `dismissFromToday` this method used to
+  // subsume no longer has a reason to exist): membership is solely
+  // `stage`-based now, so a `pending` row can never boomerang back in.
+  setTaskStage: {
+    input: z.object({ id: idSchema, stage: z.enum(["pending", "in_progress"]) }).strict(),
     output: z.object({ ok: z.literal(true) }).strict(),
   },
   restoreTasks: {
@@ -381,9 +436,9 @@ export const rpcContract = defineRpcContract({
   },
   setProjectCollapsed: {
     // `column` says which of the two independent per-column bits this call
-    // writes — see `ProjectDto.collapsed`/`todayCollapsed`.
+    // writes — see `ProjectDto.collapsed`/`inProgressCollapsed`.
     input: z
-      .object({ id: idSchema, collapsed: z.boolean(), column: z.enum(["backlog", "today"]) })
+      .object({ id: idSchema, collapsed: z.boolean(), column: z.enum(["backlog", "in_progress"]) })
       .strict(),
     output: z.object({ ok: z.literal(true) }).strict(),
   },

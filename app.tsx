@@ -1,5 +1,5 @@
 // bb-plugin-todo — frontend entry. Registers exactly one surface: the
-// Todo nav panel (tab strip + Backlog/Today board), per docs/SPEC.md's
+// Todo nav panel (tab strip + Backlog/In Progress board), per docs/SPEC.md's
 // "Frontend" section.
 //
 // Compiled by `bb plugin build` into dist/app.js + dist/app.css. React and

@@ -22,3 +22,17 @@ export function localDay(date: Date): string {
 export function startOfNextLocalDay(date: Date): number {
   return new Date(date.getFullYear(), date.getMonth(), date.getDate() + 1, 0, 0, 0, 0).getTime();
 }
+
+/**
+ * Whole local-calendar-day difference between the local day of `fromMs` and
+ * the local day of `now` — same day is 0, the next calendar day is 1, and so
+ * on. Built on top of `localDay` (never raw ms arithmetic, which is wrong by
+ * an hour across a DST transition) so it agrees with every other "which day
+ * is this" reading in the app. Used to derive `TaskDto.carriedDays` from
+ * `in_progress_since` without a durable "carried_count" counter.
+ */
+export function localDayDiff(fromMs: number, now: Date): number {
+  const [fy, fm, fd] = localDay(new Date(fromMs)).split("-").map(Number);
+  const [ty, tm, td] = localDay(now).split("-").map(Number);
+  return Math.round((Date.UTC(ty, tm - 1, td) - Date.UTC(fy, fm - 1, fd)) / 86400000);
+}

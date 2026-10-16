@@ -11,7 +11,7 @@
 // patches `HTMLElement.prototype.getBoundingClientRect` to give each
 // measured element a distinct, stable rect (first-seen DOM order, stacked
 // top to bottom) purely so collision detection has real geometry to work
-// with; the actual before/after/nest/bucket decision this drag exercises
+// with; the actual before/after/nest/stage decision this drag exercises
 // lives in `lib/drag.ts` and is unit-tested there independently of the DOM.
 vi.mock("sonner", () => {
   const toast = vi.fn() as unknown as {
@@ -81,22 +81,22 @@ function makeTask(overrides: Partial<TaskDto> & { id: string; title: string }): 
     listId: "lst_1",
     parentId: null,
     notes: null,
-    bucket: "backlog",
-    day: null,
+    stage: "pending",
     sortOrder: 1000,
     dueAt: null,
     hasDueTime: false,
     status: "open",
     completedAt: null,
-    carriedCount: 0,
+    carriedDays: 0,
     createdAt: 0,
     updatedAt: 0,
     subtasks: [],
     subtaskCounts: { total: 0, done: 0 },
     tags: [],
+    images: [],
     projectId: null,
     trail: null,
-    inToday: false,
+    inProgress: false,
     ...overrides,
   };
 }
@@ -107,9 +107,9 @@ function makeProject(overrides: Partial<ProjectDto> & { id: string; name: string
     color: "teal",
     sortOrder: 1000,
     collapsed: false,
-    todayCollapsed: false,
+    inProgressCollapsed: false,
     openCount: 0,
-    todayCount: 0,
+    inProgressCount: 0,
     overdueCount: 0,
     ...overrides,
   };
@@ -137,13 +137,13 @@ describe("TodoPage — keyboard drag (dnd-kit KeyboardSensor)", () => {
               { id: "lst_1", name: "Work", sortOrder: 1000, openCount: 2, overdueCount: 0 },
             ],
             activeListId: "lst_1",
-            today: { day: "2026-08-20", planned: 0, completed: 0 },
+            inProgress: { planned: 0, completed: 0 },
             backlog: {
               total: 2,
               overdue: 0,
               tasks: [
-                makeTask({ id: "tsk_a", title: "First backlog item", bucket: "backlog" }),
-                makeTask({ id: "tsk_b", title: "Second backlog item", bucket: "backlog" }),
+                makeTask({ id: "tsk_a", title: "First backlog item", stage: "pending" }),
+                makeTask({ id: "tsk_b", title: "Second backlog item", stage: "pending" }),
               ],
             },
             totalOverdue: 0,
@@ -192,7 +192,7 @@ describe("TodoPage — keyboard drag (dnd-kit KeyboardSensor)", () => {
     expect(moves).toHaveLength(1);
     expect(moves[0].input).toEqual({
       id: "tsk_a",
-      bucket: "backlog",
+      stage: "pending",
       parentId: "tsk_b",
       beforeId: null,
       afterId: null,
@@ -202,7 +202,7 @@ describe("TodoPage — keyboard drag (dnd-kit KeyboardSensor)", () => {
 
 /**
  * Regression coverage for the reported bug: "the task goes to the proper
- * bucket but the animation comes back." The root cause was that
+ * stage but the animation comes back." The root cause was that
  * `handleDragEnd` updated local state only via `refetch()` — i.e. only
  * after the `moveTask` RPC round trip — so the DOM still showed the
  * dragged row at its OLD position while dnd-kit played the `DragOverlay`'s
@@ -222,13 +222,13 @@ describe("TodoPage — optimistic drag (destination visible before the RPC round
     return {
       lists: [{ id: "lst_1", name: "Work", sortOrder: 1000, openCount: 2, overdueCount: 0 }],
       activeListId: "lst_1",
-      today: { day: "2026-08-20", planned: 0, completed: 0 },
+      inProgress: { planned: 0, completed: 0 },
       backlog: {
         total: 2,
         overdue: 0,
         tasks: [
-          makeTask({ id: "tsk_a", title: "First backlog item", bucket: "backlog" }),
-          makeTask({ id: "tsk_b", title: "Second backlog item", bucket: "backlog" }),
+          makeTask({ id: "tsk_a", title: "First backlog item", stage: "pending" }),
+          makeTask({ id: "tsk_b", title: "Second backlog item", stage: "pending" }),
         ],
       },
       totalOverdue: 0,
@@ -243,20 +243,20 @@ describe("TodoPage — optimistic drag (destination visible before the RPC round
     const nestedA = makeTask({
       id: "tsk_a",
       title: "First backlog item",
-      bucket: "backlog",
+      stage: "pending",
       parentId: "tsk_b",
     });
     const b = makeTask({
       id: "tsk_b",
       title: "Second backlog item",
-      bucket: "backlog",
+      stage: "pending",
       subtasks: [nestedA],
       subtaskCounts: { total: 1, done: 0 },
     });
     return {
       lists: [{ id: "lst_1", name: "Work", sortOrder: 1000, openCount: 2, overdueCount: 0 }],
       activeListId: "lst_1",
-      today: { day: "2026-08-20", planned: 0, completed: 0 },
+      inProgress: { planned: 0, completed: 0 },
       backlog: { total: 1, overdue: 0, tasks: [b] },
       totalOverdue: 0,
       serverNow: Date.now(),
@@ -268,6 +268,14 @@ describe("TodoPage — optimistic drag (destination visible before the RPC round
   function textEquals(expected: string) {
     return (_content: string, element: Element | null) => element?.textContent === expected;
   }
+
+  /** `textEquals` compares raw `textContent`, which — since the Phase 4
+   * panel-collapse rework wrapped the heading `<span>` in a `<button>`
+   * (`Section.tsx`) — now also matches that wrapping button (its only other
+   * child is an `aria-hidden` chevron `<svg>`, which contributes no text).
+   * Scope the query to the innermost `<span>` so it resolves to exactly one
+   * element again, without weakening what's actually being asserted. */
+  const headingTextOptions = { selector: "span" } as const;
 
   /** Drives the same picked-up-drop-down-dropped keyboard sequence the test
    * above uses, then waits for the resulting `moveTask` call to be recorded. */
@@ -307,7 +315,7 @@ describe("TodoPage — optimistic drag (destination visible before the RPC round
     // Before the drop: both rows are top-level, so both get an
     // "add a subtask" affordance (`isTopLevel` in TaskRow.tsx).
     expect(screen.getByLabelText('Add a subtask to "First backlog item"')).toBeTruthy();
-    expect(screen.getByText(textEquals("BACKLOG · 2"))).toBeTruthy();
+    expect(screen.getByText(textEquals("BACKLOG · 2 pending"), headingTextOptions)).toBeTruthy();
 
     const grip = screen.getByLabelText('Reorder "First backlog item"');
     await dragFirstItemOntoSecond(grip);
@@ -319,7 +327,7 @@ describe("TodoPage — optimistic drag (destination visible before the RPC round
     const moves = view.inspection.rpcCalls.filter((c) => c.method === "moveTask");
     expect(moves[0].input).toEqual({
       id: "tsk_a",
-      bucket: "backlog",
+      stage: "pending",
       parentId: "tsk_b",
       beforeId: null,
       afterId: null,
@@ -333,7 +341,7 @@ describe("TodoPage — optimistic drag (destination visible before the RPC round
     // dropped from 2 to 1 top-level rows.
     expect(screen.queryByLabelText('Add a subtask to "First backlog item"')).toBeNull();
     expect(screen.getByLabelText('Add a subtask to "Second backlog item"')).toBeTruthy();
-    expect(screen.getByText(textEquals("BACKLOG · 1"))).toBeTruthy();
+    expect(screen.getByText(textEquals("BACKLOG · 1 pending"), headingTextOptions)).toBeTruthy();
     expect(screen.getByText("First backlog item")).toBeTruthy();
 
     // Now let the RPC round trip actually complete and reconcile.
@@ -346,7 +354,7 @@ describe("TodoPage — optimistic drag (destination visible before the RPC round
     expect(screen.queryByLabelText('Add a subtask to "First backlog item"')).toBeNull();
 
     getBoardDeferred.resolve(nestedBoard());
-    await waitFor(() => expect(screen.getByText(textEquals("BACKLOG · 1"))).toBeTruthy());
+    await waitFor(() => expect(screen.getByText(textEquals("BACKLOG · 1 pending"), headingTextOptions)).toBeTruthy());
     expect(screen.queryByLabelText('Add a subtask to "First backlog item"')).toBeNull();
   });
 
@@ -380,7 +388,7 @@ describe("TodoPage — optimistic drag (destination visible before the RPC round
 
     // Optimistic state is applied before the rejection lands.
     expect(screen.queryByLabelText('Add a subtask to "First backlog item"')).toBeNull();
-    expect(screen.getByText(textEquals("BACKLOG · 1"))).toBeTruthy();
+    expect(screen.getByText(textEquals("BACKLOG · 1 pending"), headingTextOptions)).toBeTruthy();
 
     moveDeferred.reject(new Error("server rejected the move"));
 
@@ -388,7 +396,7 @@ describe("TodoPage — optimistic drag (destination visible before the RPC round
     await waitFor(() => {
       expect(screen.getByLabelText('Add a subtask to "First backlog item"')).toBeTruthy();
     });
-    expect(screen.getByText(textEquals("BACKLOG · 2"))).toBeTruthy();
+    expect(screen.getByText(textEquals("BACKLOG · 2 pending"), headingTextOptions)).toBeTruthy();
     expect(toast.error).toHaveBeenCalled();
   });
 });
@@ -413,7 +421,7 @@ describe("TodoPage — tags", () => {
     return {
       lists: [{ id: "lst_1", name: "Work", sortOrder: 1000, openCount: 1, overdueCount: 0 }],
       activeListId: "lst_1",
-      today: { day: "2026-08-20", planned: 0, completed: 0 },
+      inProgress: { planned: 0, completed: 0 },
       backlog: {
         total: 1,
         overdue: 0,
@@ -800,10 +808,10 @@ describe("TodoPage — tags", () => {
  * keyboard-drag technique (`stubSequentialRects` + dnd-kit's KeyboardSensor)
  * as the "TodoPage — keyboard drag" describe block above.
  *
- * Phase 4 rewrite: ghost rows are gone. A task that qualifies for Today
- * (`task.inToday`) renders as a normal, fully-interactive row in BOTH
- * columns at once — no dimming, no swapped checkbox — distinguished only by
- * its today marker. The subtlety this suite surfaces and fixes (not merely
+ * Phase 4 rewrite: ghost rows are gone. A task that qualifies for In
+ * Progress (`task.inProgress`) renders as a normal, fully-interactive row in
+ * BOTH columns at once — no dimming, no swapped checkbox — distinguished
+ * only by its In Progress marker. The subtlety this suite surfaces and fixes (not merely
  * tests around) survives that rewrite unchanged: the same `TaskDto.id` on
  * screen twice at once used to collide as a duplicate dnd-kit sortable id;
  * `taskDragId` (`TaskRow.tsx`) still exists to prevent exactly that, and (b)
@@ -834,7 +842,7 @@ describe("TodoPage — projects & trail (end-to-end drag + render)", () => {
     return {
       lists: [{ id: "lst_1", name: "Work", sortOrder: 1000, openCount: 2, overdueCount: 0 }],
       activeListId: "lst_1",
-      today: { day: "2026-08-27", planned: 0, completed: 0 },
+      inProgress: { planned: 0, completed: 0 },
       backlog: { total: 1, overdue: 0, tasks: [parent] },
       totalOverdue: 0,
       serverNow: Date.now(),
@@ -846,13 +854,15 @@ describe("TodoPage — projects & trail (end-to-end drag + render)", () => {
   /**
    * The server's authoritative board after `moveTask` schedules the
    * subtask. Since Phase 2, the Backlog is the one comprehensive tree: the
-   * SAME subtask row (`bucket: "today"`, `inToday: true`, its `trail` now
+   * SAME subtask row (`stage: "in_progress"`, `inProgress: true`, its `trail` now
    * populated) is nested under its parent here — that single row is what
-   * both columns render from. `lib/todayView`'s `selectTodayView` derives
-   * Today's copy from it: because the PARENT doesn't itself qualify
-   * (`tsk_parent.inToday` is false — never scheduled, never due), the
-   * subtask surfaces in Today as a standalone, trailed "orphan" row inside
-   * the `Q3 Launch` project group, per `TodayProjectGroup.orphanSubtasks`.
+   * both columns render from. `lib/inProgressView`'s `selectInProgressView`
+   * derives In Progress's copy from it: because the PARENT doesn't itself
+   * qualify (`tsk_parent.inProgress` is false — never scheduled, never due),
+   * the subtask surfaces in In Progress under a `"parentGroup"` row keyed
+   * by that parent, inside the `Q3 Launch` project group — a
+   * `ParentGroupHeader` naming the parent, followed by the subtask,
+   * indented, with no trail (the header already names the parent).
    */
   function scheduledSubtaskBoard() {
     const sub = makeTask({
@@ -860,9 +870,8 @@ describe("TodoPage — projects & trail (end-to-end drag + render)", () => {
       title: "Get legal sign-off",
       parentId: "tsk_parent",
       projectId: "prj_1",
-      bucket: "today",
-      day: "2026-08-27",
-      inToday: true,
+      stage: "in_progress",
+      inProgress: true,
       trail: {
         projectId: "prj_1",
         projectName: "Q3 Launch",
@@ -881,16 +890,16 @@ describe("TodoPage — projects & trail (end-to-end drag + render)", () => {
     return {
       lists: [{ id: "lst_1", name: "Work", sortOrder: 1000, openCount: 2, overdueCount: 0 }],
       activeListId: "lst_1",
-      today: { day: "2026-08-27", planned: 1, completed: 0 },
+      inProgress: { planned: 1, completed: 0 },
       backlog: { total: 1, overdue: 0, tasks: [parent] },
       totalOverdue: 0,
       serverNow: Date.now(),
       tags: [],
-      projects: [{ ...project, todayCount: 1 }],
+      projects: [{ ...project, inProgressCount: 1 }],
     };
   }
 
-  async function dragSubtaskIntoToday() {
+  async function dragSubtaskIntoInProgress() {
     const app = await loadPluginApp(() => import("@/app"));
     const board = app.navPanels.find((p) => p.id === "board");
     if (!board) throw new Error("app.tsx has not registered the 'board' navPanel yet");
@@ -919,13 +928,13 @@ describe("TodoPage — projects & trail (end-to-end drag + render)", () => {
     // block above: a real macrotask, not a microtask, must elapse before
     // its own keydown listener exists.
     await new Promise((resolve) => setTimeout(resolve, 0));
-    // Empirically, landing the Today column's own (initially empty)
+    // Empirically, landing the In Progress column's own (initially empty)
     // droppable from a Backlog subtask takes several ArrowDown hops through
     // every intervening sortable/droppable (project header, sibling rows,
     // the project body, the loose-task row, both column containers) —
     // dnd-kit's `sortableKeyboardCoordinates` walks its droppable registry
     // one candidate at a time. 15 presses lands reliably past all of them
-    // onto the empty Today column and stays there (verified stable across a
+    // onto the empty In Progress column and stays there (verified stable across a
     // wide press range), without needing to hand-compute dnd-kit's internal
     // measurement order.
     for (let i = 0; i < 15; i++) {
@@ -942,8 +951,8 @@ describe("TodoPage — projects & trail (end-to-end drag + render)", () => {
     return view;
   }
 
-  it("(a) dragging a subtask from a project into Today keeps its parent, and Today shows its trail", async () => {
-    const view = await dragSubtaskIntoToday();
+  it("(a) dragging a subtask from a project into In Progress keeps its parent, and In Progress shows its trail", async () => {
+    const view = await dragSubtaskIntoInProgress();
 
     // The CENTRAL FIX (design doc's Problem section correction, lib/drag.ts
     // "CENTRAL FIX" comment): parentId is KEPT, not nulled, and projectId is
@@ -951,21 +960,21 @@ describe("TodoPage — projects & trail (end-to-end drag + render)", () => {
     const moves = view.inspection.rpcCalls.filter((c) => c.method === "moveTask");
     expect(moves[0].input).toEqual({
       id: "tsk_sub",
-      bucket: "today",
+      stage: "in_progress",
       parentId: "tsk_parent",
       beforeId: null,
       afterId: null,
     });
 
     // The server's authoritative post-move board (this test's `getBoard`
-    // stub's second response) renders the scheduled subtask as an orphan row
-    // inside Today's own "Q3 Launch" project group, with the parent's title
-    // as its trail's second line. "Q3 Launch" itself now comes from that
-    // group's OWN header (Today's `ProjectHeader`), not from `TrailLine` —
-    // `TrailLine` suppresses the project segment inside a project group
-    // (`hideProject`), since the header right above it already names it —
-    // so it appears at least twice on screen either way (once per column's
-    // copy of the project).
+    // stub's second response) renders the scheduled subtask under a
+    // `"parentGroup"` row inside In Progress's own "Q3 Launch" project
+    // group: a `ParentGroupHeader` naming the parent ("Rewrite the
+    // onboarding email"), with the subtask indented below it — no trail on
+    // either the header or the subtask row. "Q3 Launch" itself comes from
+    // the project group's OWN header (In Progress's `ProjectHeader`), so it
+    // appears at least twice on screen either way (once per column's copy
+    // of the project).
     await waitFor(() => {
       expect(screen.getAllByText("Q3 Launch").length).toBeGreaterThan(0);
     });
@@ -973,29 +982,41 @@ describe("TodoPage — projects & trail (end-to-end drag + render)", () => {
   });
 
   it("(b) the subtask remains a normal, fully-interactive row in its project after being scheduled", async () => {
-    await dragSubtaskIntoToday();
+    await dragSubtaskIntoInProgress();
 
-    // No more ghosts: the project's own (Backlog) copy of the subtask is
-    // still on screen as a real, undimmed row — the today marker is the
-    // ONLY visible sign it's scheduled, not a dimmed row with a swapped
-    // checkbox. Its marker button doubles as the removal affordance.
+    // No more ghosts, no more per-row "In Progress marker": the project's
+    // own (Backlog) copy of the subtask is still on screen as a real,
+    // undimmed row, and the ▶/◀ stage toggle is the only sign of which
+    // column each instance belongs to — the Backlog instance offers "Move
+    // to In Progress" (it can still be started), while the In Progress
+    // instance offers "Move to Backlog" (`actions.onParkTask`, the only way
+    // left to leave In Progress). Scoped to each row via its `data-task-id`
+    // container (`TaskRow.tsx`) rather than a bare `getAllByLabelText`
+    // count, since the fixture's parent task also renders its own "Move to
+    // In Progress" toggle.
+    let grips: HTMLElement[] = [];
     await waitFor(() => {
-      expect(screen.getAllByLabelText('Remove "Get legal sign-off" from Today').length).toBe(2);
+      grips = screen.getAllByLabelText('Reorder "Get legal sign-off"');
+      expect(grips.length).toBe(2);
     });
+    const rows = grips.map((grip) => grip.closest('[data-task-id="tsk_sub"]') as HTMLElement);
+    expect(rows.every(Boolean)).toBe(true);
+    expect(within(rows[0]).getByLabelText("Move to In Progress")).toBeTruthy();
+    expect(within(rows[1]).getByLabelText("Move to Backlog")).toBeTruthy();
     // Two full rows, not one real + one ghost: the drag handle (a real,
     // interactive control only a live row has) exists for BOTH the Backlog
-    // instance and the Today instance.
-    expect(screen.getAllByLabelText('Reorder "Get legal sign-off"').length).toBe(2);
+    // instance and the In Progress instance.
+    expect(grips.length).toBe(2);
 
     // The parent itself is untouched: still showing the "add a subtask"
     // affordance only top-level rows get — proving invariant 4 (scheduling
-    // a subtask never drags its parent into Today).
+    // a subtask never drags its parent into In Progress).
     expect(
       screen.getByLabelText('Add a subtask to "Rewrite the onboarding email"'),
     ).toBeTruthy();
   });
 
-  it("(c) dragging its Today instance back to the Backlog snaps it home, without colliding with its own Backlog instance", async () => {
+  it("(c) dragging its In Progress instance back to the Backlog snaps it home, without colliding with its own Backlog instance", async () => {
     const app = await loadPluginApp(() => import("@/app"));
     const board = app.navPanels.find((p) => p.id === "board");
     if (!board) throw new Error("app.tsx has not registered the 'board' navPanel yet");
@@ -1016,28 +1037,28 @@ describe("TodoPage — projects & trail (end-to-end drag + render)", () => {
     });
 
     // Two rows share this label at once: the Backlog instance (nested under
-    // its project) and the Today instance (the standalone orphan row) — the
-    // exact "same task, two live DOM instances" situation `taskDragId`
-    // exists for (`TaskRow.tsx`). Today renders after the Backlog in the
+    // its project) and the In Progress instance (indented under its
+    // `ParentGroupHeader`) — the exact "same task, two live DOM instances" situation `taskDragId`
+    // exists for (`TaskRow.tsx`). In Progress renders after the Backlog in the
     // DOM, so it's the last match. Grabbing and dropping THIS one (not the
     // Backlog one) is the real-gesture proof that dnd-kit's id registry
     // doesn't collide the two: if it did, this drag would either move the
     // wrong instance or silently no-op instead of producing the snap-home
     // `moveTask` call asserted below.
     const grips = screen.getAllByLabelText('Reorder "Get legal sign-off"');
-    const todayGrip = grips[grips.length - 1];
-    todayGrip.focus();
-    fireEvent.keyDown(todayGrip, { key: " ", code: "Space" });
+    const inProgressGrip = grips[grips.length - 1];
+    inProgressGrip.focus();
+    fireEvent.keyDown(inProgressGrip, { key: " ", code: "Space" });
     await new Promise((resolve) => setTimeout(resolve, 0));
-    // Empirically, two ArrowDown hops from the Today row land the drop
+    // Empirically, two ArrowDown hops from the In Progress row land the drop
     // directly ON the (unrelated, still-in-the-Backlog) parent task's own
     // row — a deliberately "wrong" landing spot within the Backlog, chosen
     // specifically to prove the snap-home rule doesn't care where it lands.
-    fireEvent.keyDown(todayGrip, { key: "ArrowDown", code: "ArrowDown" });
+    fireEvent.keyDown(inProgressGrip, { key: "ArrowDown", code: "ArrowDown" });
     await new Promise((resolve) => setTimeout(resolve, 0));
-    fireEvent.keyDown(todayGrip, { key: "ArrowDown", code: "ArrowDown" });
+    fireEvent.keyDown(inProgressGrip, { key: "ArrowDown", code: "ArrowDown" });
     await new Promise((resolve) => setTimeout(resolve, 0));
-    fireEvent.keyDown(todayGrip, { key: " ", code: "Space" });
+    fireEvent.keyDown(inProgressGrip, { key: " ", code: "Space" });
 
     await waitFor(() => {
       const moves = view.inspection.rpcCalls.filter((c) => c.method === "moveTask");
@@ -1054,11 +1075,11 @@ describe("TodoPage — projects & trail (end-to-end drag + render)", () => {
     // Backlog instance moved instead, this input's `id` would still read
     // "tsk_sub" (same task) but the drop math — computed from whichever DOM
     // row dnd-kit actually tracked as "active" — would differ from what a
-    // correct Today-column drag produces.
+    // correct In-Progress-column drag produces.
     const moves = view.inspection.rpcCalls.filter((c) => c.method === "moveTask");
     expect(moves[0].input).toEqual({
       id: "tsk_sub",
-      bucket: "backlog",
+      stage: "pending",
       parentId: "tsk_parent",
       beforeId: null,
       afterId: null,
@@ -1075,10 +1096,9 @@ describe("TodoPage — projects & trail (end-to-end drag + render)", () => {
       title: "Draft the copy",
       parentId: "tsk_parent",
       projectId: "prj_1",
-      bucket: "today",
-      day: "2026-08-27",
-      inToday: true,
-      carriedCount: 6,
+      stage: "in_progress",
+      inProgress: true,
+      carriedDays: 6,
       trail: {
         projectId: "prj_1",
         projectName: "Q3 Launch",
@@ -1088,10 +1108,10 @@ describe("TodoPage — projects & trail (end-to-end drag + render)", () => {
       },
     });
     // `carried`'s parent must itself be reachable from `backlog.tasks` for
-    // `selectTodayView` to find it at all — since Phase 2 there is no
-    // separate flat `today.tasks` array to short-circuit through; the
-    // parent doesn't itself qualify for Today (never scheduled, never due),
-    // so `carried` surfaces as a standalone, trailed orphan row exactly like
+    // `selectInProgressView` to find it at all — since Phase 2 there is no
+    // separate flat `inProgress.tasks` array to short-circuit through; the
+    // parent doesn't itself qualify for In Progress (never scheduled, never
+    // due), so `carried` surfaces under a `"parentGroup"` row exactly like
     // (a)/(b)'s subtask above.
     const parent = makeTask({
       id: "tsk_parent",
@@ -1109,7 +1129,7 @@ describe("TodoPage — projects & trail (end-to-end drag + render)", () => {
           getBoard: () => ({
             lists: [{ id: "lst_1", name: "Work", sortOrder: 1000, openCount: 1, overdueCount: 0 }],
             activeListId: "lst_1",
-            today: { day: "2026-08-27", planned: 1, completed: 0 },
+            inProgress: { planned: 1, completed: 0 },
             backlog: { total: 1, overdue: 0, tasks: [parent] },
             totalOverdue: 0,
             serverNow: Date.now(),
@@ -1122,13 +1142,13 @@ describe("TodoPage — projects & trail (end-to-end drag + render)", () => {
 
     await waitFor(() => screen.getAllByText("Draft the copy"));
 
-    // The "carried Nx" badge survives a task also having a today marker and
-    // a trail — the today marker is no longer either/or with the carried
+    // The "carried Nx" badge survives a task also having an In Progress
+    // marker and a trail — the marker is no longer either/or with the carried
     // badge (both features coexist on the same row).
-    expect(screen.getAllByText("carried 6×").length).toBeGreaterThan(0);
-    // The full trail — both the project (via the group's own header) and
-    // the parent segment (via `TrailLine`) — still renders regardless of
-    // how many times the task's been carried.
+    expect(screen.getAllByText("carried 6d").length).toBeGreaterThan(0);
+    // The project name (via the group's own header) and the parent's name
+    // (via its `ParentGroupHeader`) both still render regardless of how
+    // many times the task's been carried.
     expect(screen.getAllByText("Q3 Launch").length).toBeGreaterThan(0);
     expect(screen.getAllByText("Rewrite the onboarding email").length).toBeGreaterThan(0);
   });
@@ -1136,15 +1156,16 @@ describe("TodoPage — projects & trail (end-to-end drag + render)", () => {
 
 /**
  * Coverage for the design doc's "one new question" (Data plan): an
- * auto-included task (never manually scheduled — `bucket` stays
- * `'backlog'`, `inToday` true purely from its due date) has no `bucket`
- * flag for `moveTask` to clear, so dragging its TODAY instance out of Today
- * must dispatch `dismissFromToday` instead — never `moveTask` — while
- * dragging its BACKLOG instance is an entirely ordinary reorder that must
- * NOT dismiss it. Both gestures exercise the exact same on-screen situation
- * as the suite above (the same task, two live rows at once), so they double
- * as further real-gesture proof that `taskDragId`'s column-scoped ids don't
- * collide — this time on a task that was never dragged INTO Today at all,
+ * auto-included task (never manually scheduled — `stage` stays
+ * `'pending'`, `inProgress` true purely from its due date) has no `stage`
+ * flag for `moveTask` to clear, so dragging its IN-PROGRESS instance out of
+ * In Progress must dispatch `setTaskStage` instead — never `moveTask` —
+ * while dragging its BACKLOG instance is an entirely ordinary reorder that
+ * must NOT dismiss it. Both gestures exercise the exact same on-screen
+ * situation as the suite above (the same task, two live rows at once), so
+ * they double as further real-gesture proof that `taskDragId`'s
+ * column-scoped ids don't collide — this time on a task that was never
+ * dragged INTO In Progress at all,
  * only ever auto-included.
  */
 describe("TodoPage — dismissing vs. reordering an auto-included task", () => {
@@ -1152,15 +1173,15 @@ describe("TodoPage — dismissing vs. reordering an auto-included task", () => {
     stubSequentialRects();
   });
 
-  /** `tsk_auto` is due today (so `inToday: true` with `bucket` still
-   * "backlog" — the auto-included case), loose (no project, to keep the DOM
+  /** `tsk_auto` is due today (so `inProgress: true` with `stage` still
+   * "pending" — the auto-included case), loose (no project, to keep the DOM
    * simple and the keyboard-drag press counts stable), with a plain sibling
    * loose task, `tsk_other`, purely as a Backlog reorder target. */
   function autoIncludedBoard() {
     return {
       lists: [{ id: "lst_1", name: "Work", sortOrder: 1000, openCount: 2, overdueCount: 0 }],
       activeListId: "lst_1",
-      today: { day: "2026-08-27", planned: 1, completed: 0 },
+      inProgress: { planned: 1, completed: 0 },
       backlog: {
         total: 2,
         overdue: 0,
@@ -1168,11 +1189,11 @@ describe("TodoPage — dismissing vs. reordering an auto-included task", () => {
           makeTask({
             id: "tsk_auto",
             title: "Renew the domain",
-            bucket: "backlog",
-            inToday: true,
+            stage: "pending",
+            inProgress: true,
             dueAt: new Date("2026-08-27T10:00:00").getTime(),
           }),
-          makeTask({ id: "tsk_other", title: "Buy stamps", bucket: "backlog" }),
+          makeTask({ id: "tsk_other", title: "Buy stamps", stage: "pending" }),
         ],
       },
       totalOverdue: 0,
@@ -1182,7 +1203,7 @@ describe("TodoPage — dismissing vs. reordering an auto-included task", () => {
     };
   }
 
-  it("dragging the Today instance into the Backlog column calls dismissFromToday, never moveTask", async () => {
+  it("dragging the In Progress instance into the Backlog column calls setTaskStage, never moveTask", async () => {
     const app = await loadPluginApp(() => import("@/app"));
     const board = app.navPanels.find((p) => p.id === "board");
     if (!board) throw new Error("app.tsx has not registered the 'board' navPanel yet");
@@ -1193,7 +1214,7 @@ describe("TodoPage — dismissing vs. reordering an auto-included task", () => {
       {
         rpc: {
           getBoard: () => autoIncludedBoard(),
-          dismissFromToday: () => ({ ok: true as const }),
+          setTaskStage: () => ({ ok: true as const }),
           moveTask: () => ({ ok: true as const }),
         } as never,
       },
@@ -1203,36 +1224,36 @@ describe("TodoPage — dismissing vs. reordering an auto-included task", () => {
       expect(screen.getAllByText("Renew the domain").length).toBeGreaterThan(0);
     });
 
-    // Two live rows for the same task: the Backlog instance and the Today
-    // instance (Today's "Unfiled" loose group, since this task is loose).
-    // Grab the SECOND — the Today one, rendered after the Backlog in the
-    // DOM — and hop it once. Empirically (verified against several
-    // press counts), dnd-kit's `sortableKeyboardCoordinates` wraps a single
-    // ArrowDown from the last sortable in its registry back onto the first
-    // droppable candidate, which — with only two loose tasks per column in
-    // this fixture — lands on the Backlog column's own body. A larger press
-    // count instead walks back into a Today-column target and re-enters
-    // Today (an ordinary reorder there), the opposite of what this test
-    // means to exercise.
+    // Two live rows for the same task: the Backlog instance and the In
+    // Progress instance (In Progress's "Unfiled" loose group, since this
+    // task is loose). Grab the SECOND — the In Progress one, rendered after
+    // the Backlog in the DOM — and hop it once. Empirically (verified
+    // against several press counts), dnd-kit's `sortableKeyboardCoordinates`
+    // wraps a single ArrowDown from the last sortable in its registry back
+    // onto the first droppable candidate, which — with only two loose tasks
+    // per column in this fixture — lands on the Backlog column's own body.
+    // A larger press count instead walks back into an In-Progress-column
+    // target and re-enters In Progress (an ordinary reorder there), the
+    // opposite of what this test means to exercise.
     const grips = screen.getAllByLabelText('Reorder "Renew the domain"');
-    const todayGrip = grips[grips.length - 1];
-    todayGrip.focus();
-    fireEvent.keyDown(todayGrip, { key: " ", code: "Space" });
+    const inProgressGrip = grips[grips.length - 1];
+    inProgressGrip.focus();
+    fireEvent.keyDown(inProgressGrip, { key: " ", code: "Space" });
     await new Promise((resolve) => setTimeout(resolve, 0));
-    fireEvent.keyDown(todayGrip, { key: "ArrowDown", code: "ArrowDown" });
+    fireEvent.keyDown(inProgressGrip, { key: "ArrowDown", code: "ArrowDown" });
     await new Promise((resolve) => setTimeout(resolve, 0));
-    fireEvent.keyDown(todayGrip, { key: " ", code: "Space" });
+    fireEvent.keyDown(inProgressGrip, { key: " ", code: "Space" });
 
     await waitFor(() => {
-      const dismisses = view.inspection.rpcCalls.filter((c) => c.method === "dismissFromToday");
+      const dismisses = view.inspection.rpcCalls.filter((c) => c.method === "setTaskStage");
       expect(dismisses.length).toBeGreaterThan(0);
     });
 
     expect(
-      view.inspection.rpcCalls.filter((c) => c.method === "dismissFromToday")[0].input,
-    ).toEqual({ id: "tsk_auto" });
+      view.inspection.rpcCalls.filter((c) => c.method === "setTaskStage")[0].input,
+    ).toEqual({ id: "tsk_auto", stage: "pending" });
     // The one thing this whole test exists to prove: no `moveTask` at all —
-    // there's no `bucket` flag on an auto-included task for it to clear.
+    // there's no `stage` flag on an auto-included task for it to clear.
     expect(view.inspection.rpcCalls.some((c) => c.method === "moveTask")).toBe(false);
   });
 
@@ -1247,7 +1268,7 @@ describe("TodoPage — dismissing vs. reordering an auto-included task", () => {
       {
         rpc: {
           getBoard: () => autoIncludedBoard(),
-          dismissFromToday: () => ({ ok: true as const }),
+          setTaskStage: () => ({ ok: true as const }),
           moveTask: () => ({ ok: true as const }),
         } as never,
       },
@@ -1273,23 +1294,25 @@ describe("TodoPage — dismissing vs. reordering an auto-included task", () => {
       expect(moves.length).toBeGreaterThan(0);
     });
 
-    // An ordinary Backlog-to-Backlog reorder: `bucket` stays "backlog", and
+    // An ordinary Backlog-to-Backlog reorder: `stage` stays "pending", and
     // — the assertion this test exists for — no dismissal was triggered by
     // merely moving the task's OWN Backlog row among its Backlog siblings.
-    expect(view.inspection.rpcCalls.some((c) => c.method === "dismissFromToday")).toBe(false);
+    expect(view.inspection.rpcCalls.some((c) => c.method === "setTaskStage")).toBe(false);
     const moves = view.inspection.rpcCalls.filter((c) => c.method === "moveTask");
-    expect(moves[0].input).toMatchObject({ id: "tsk_auto", bucket: "backlog" });
+    expect(moves[0].input).toMatchObject({ id: "tsk_auto", stage: "pending" });
   });
 });
 
 /**
- * `removeFromToday` (`TodoPage.tsx`) is the today marker's click handler —
- * the non-drag route to the same two outcomes the suite above exercises via
- * a gesture. Routed purely off `task.bucket`, per the design doc's "two
- * write paths".
+ * The one-click ▶ Start / ◀ Park stage-toggle buttons on `TaskRow` (the
+ * feature request's "change the status to inprogress to pending state
+ * (vice versa)" without a drag gesture). Both directions always call
+ * `setTaskStage` directly — no `task.stage`-based routing to `moveTask` —
+ * see `TodoPage.tsx`'s `setTaskStageAction`.
  */
-describe("TodoPage — the today marker's click routes to the right RPC", () => {
-  it("clicking the marker on a manually-scheduled task calls moveTask (snap-home), not dismissFromToday", async () => {
+describe("TodoPage — the ▶ Start / ◀ Park one-click stage toggle", () => {
+  it("▶ Start on a Backlog row calls setTaskStage(id, 'in_progress') and optimistically shows the task in In Progress before the RPC resolves", async () => {
+    const stageDeferred = deferred<{ ok: true }>();
     const app = await loadPluginApp(() => import("@/app"));
     const board = app.navPanels.find((p) => p.id === "board");
     if (!board) throw new Error("app.tsx has not registered the 'board' navPanel yet");
@@ -1302,52 +1325,47 @@ describe("TodoPage — the today marker's click routes to the right RPC", () => 
           getBoard: () => ({
             lists: [{ id: "lst_1", name: "Work", sortOrder: 1000, openCount: 1, overdueCount: 0 }],
             activeListId: "lst_1",
-            today: { day: "2026-08-27", planned: 1, completed: 0 },
+            inProgress: { planned: 0, completed: 0 },
             backlog: {
               total: 1,
               overdue: 0,
-              tasks: [
-                makeTask({
-                  id: "tsk_scheduled",
-                  title: "Ship the invoice fix",
-                  bucket: "today",
-                  day: "2026-08-27",
-                  inToday: true,
-                }),
-              ],
+              tasks: [makeTask({ id: "tsk_1", title: "Draft the copy", stage: "pending" })],
             },
             totalOverdue: 0,
-            serverNow: Date.now(),
+            serverNow: new Date("2026-08-27T09:00:00").getTime(),
             tags: [],
             projects: [],
           }),
-          moveTask: () => ({ ok: true as const }),
-          dismissFromToday: () => ({ ok: true as const }),
+          setTaskStage: () => stageDeferred.promise,
         } as never,
       },
     );
 
-    await waitFor(() => {
-      expect(screen.getAllByLabelText('Remove "Ship the invoice fix" from Today').length).toBe(2);
-    });
-    fireEvent.click(
-      screen.getAllByLabelText('Remove "Ship the invoice fix" from Today')[0],
-    );
+    await waitFor(() => screen.getByText("Draft the copy"));
+    // Only the Backlog instance exists yet — not `inProgress`.
+    expect(screen.getAllByText("Draft the copy")).toHaveLength(1);
+
+    fireEvent.click(screen.getByLabelText("Move to In Progress"));
 
     await waitFor(() => {
-      expect(view.inspection.rpcCalls.some((c) => c.method === "moveTask")).toBe(true);
+      expect(view.inspection.rpcCalls.some((c) => c.method === "setTaskStage")).toBe(true);
     });
-    expect(view.inspection.rpcCalls.find((c) => c.method === "moveTask")?.input).toEqual({
-      id: "tsk_scheduled",
-      bucket: "backlog",
-      parentId: null,
-      beforeId: null,
-      afterId: null,
+    expect(view.inspection.rpcCalls.find((c) => c.method === "setTaskStage")?.input).toEqual({
+      id: "tsk_1",
+      stage: "in_progress",
     });
-    expect(view.inspection.rpcCalls.some((c) => c.method === "dismissFromToday")).toBe(false);
+
+    // Optimistic: the row is already doubled into In Progress too, before
+    // `setTaskStage` has resolved.
+    await waitFor(() => {
+      expect(screen.getAllByText("Draft the copy")).toHaveLength(2);
+    });
+
+    stageDeferred.resolve({ ok: true });
   });
 
-  it("clicking the marker on an auto-included task calls dismissFromToday, not moveTask", async () => {
+  it("◀ Park on an In Progress row calls setTaskStage(id, 'pending'); a rejection rolls back and toasts", async () => {
+    const stageDeferred = deferred<{ ok: true }>();
     const app = await loadPluginApp(() => import("@/app"));
     const board = app.navPanels.find((p) => p.id === "board");
     if (!board) throw new Error("app.tsx has not registered the 'board' navPanel yet");
@@ -1360,17 +1378,16 @@ describe("TodoPage — the today marker's click routes to the right RPC", () => 
           getBoard: () => ({
             lists: [{ id: "lst_1", name: "Work", sortOrder: 1000, openCount: 1, overdueCount: 0 }],
             activeListId: "lst_1",
-            today: { day: "2026-08-27", planned: 1, completed: 0 },
+            inProgress: { planned: 1, completed: 0 },
             backlog: {
               total: 1,
               overdue: 0,
               tasks: [
                 makeTask({
-                  id: "tsk_due",
-                  title: "Renew the domain",
-                  bucket: "backlog",
-                  inToday: true,
-                  dueAt: new Date("2026-08-27T10:00:00").getTime(),
+                  id: "tsk_1",
+                  title: "Get legal sign-off",
+                  stage: "in_progress",
+                  inProgress: true,
                 }),
               ],
             },
@@ -1379,34 +1396,49 @@ describe("TodoPage — the today marker's click routes to the right RPC", () => 
             tags: [],
             projects: [],
           }),
-          moveTask: () => ({ ok: true as const }),
-          dismissFromToday: () => ({ ok: true as const }),
+          setTaskStage: () => stageDeferred.promise,
         } as never,
       },
     );
 
     await waitFor(() => {
-      expect(screen.getAllByLabelText('Remove "Renew the domain" from Today').length).toBe(2);
+      expect(screen.getAllByText("Get legal sign-off")).toHaveLength(2);
     });
-    fireEvent.click(screen.getAllByLabelText('Remove "Renew the domain" from Today')[0]);
+
+    fireEvent.click(screen.getAllByLabelText("Move to Backlog")[0]);
 
     await waitFor(() => {
-      expect(view.inspection.rpcCalls.some((c) => c.method === "dismissFromToday")).toBe(true);
+      expect(view.inspection.rpcCalls.some((c) => c.method === "setTaskStage")).toBe(true);
     });
-    expect(view.inspection.rpcCalls.find((c) => c.method === "dismissFromToday")?.input).toEqual({
-      id: "tsk_due",
+    expect(view.inspection.rpcCalls.find((c) => c.method === "setTaskStage")?.input).toEqual({
+      id: "tsk_1",
+      stage: "pending",
     });
-    expect(view.inspection.rpcCalls.some((c) => c.method === "moveTask")).toBe(false);
+
+    // Optimistic: only the Backlog instance remains while the RPC is still
+    // pending — the In Progress instance has already disappeared.
+    await waitFor(() => {
+      expect(screen.getAllByText("Get legal sign-off")).toHaveLength(1);
+    });
+
+    stageDeferred.reject(new Error("server rejected the park"));
+
+    // Rolled back: the task reappears in In Progress too, and the user is told.
+    await waitFor(() => {
+      expect(screen.getAllByText("Get legal sign-off")).toHaveLength(2);
+    });
+    expect(toast.error).toHaveBeenCalled();
   });
 });
 
 /**
- * The Today column's own grouping/hiding behaviour (`lib/todayView.ts`'s
- * unit tests already cover the pure derivation exhaustively; this proves
- * `TodoPage`/`Section`/`ProjectGroup` actually render what it derives).
+ * The In Progress column's own grouping/hiding behaviour
+ * (`lib/inProgressView.ts`'s unit tests already cover the pure derivation
+ * exhaustively; this proves `TodoPage`/`Section`/`ProjectGroup` actually
+ * render what it derives).
  */
-describe("TodoPage — Today column rendering", () => {
-  it("groups by project and hides a project with nothing qualifying for Today", async () => {
+describe("TodoPage — In Progress column rendering", () => {
+  it("groups by project and hides a project with nothing qualifying for In Progress", async () => {
     const app = await loadPluginApp(() => import("@/app"));
     const board = app.navPanels.find((p) => p.id === "board");
     if (!board) throw new Error("app.tsx has not registered the 'board' navPanel yet");
@@ -1422,7 +1454,7 @@ describe("TodoPage — Today column rendering", () => {
           getBoard: () => ({
             lists: [{ id: "lst_1", name: "Work", sortOrder: 1000, openCount: 2, overdueCount: 0 }],
             activeListId: "lst_1",
-            today: { day: "2026-08-27", planned: 1, completed: 0 },
+            inProgress: { planned: 1, completed: 0 },
             backlog: {
               total: 2,
               overdue: 0,
@@ -1431,12 +1463,11 @@ describe("TodoPage — Today column rendering", () => {
                   id: "tsk_busy",
                   title: "Get legal sign-off",
                   projectId: "prj_busy",
-                  bucket: "today",
-                  day: "2026-08-27",
-                  inToday: true,
+                  stage: "in_progress",
+                  inProgress: true,
                 }),
-                // Nothing in "Someday" qualifies for Today — it must not
-                // render a group there at all (unlike the Backlog, which
+                // Nothing in "Someday" qualifies for In Progress — it must
+                // not render a group there at all (unlike the Backlog, which
                 // never hides an empty project).
                 makeTask({
                   id: "tsk_quiet",
@@ -1458,11 +1489,11 @@ describe("TodoPage — Today column rendering", () => {
       expect(screen.getAllByText("Q3 Launch").length).toBeGreaterThan(0);
     });
     // "Someday" still renders once, for its Backlog card — but never a
-    // second time for an (empty, hidden) Today card.
+    // second time for an (empty, hidden) In Progress card.
     expect(screen.getAllByText("Someday").length).toBe(1);
   });
 
-  it("shows a parent trail for an orphan subtask under the loose/Unfiled group", async () => {
+  it("shows a ParentGroupHeader for a non-qualifying parent's subtask under the loose/Unfiled group", async () => {
     const app = await loadPluginApp(() => import("@/app"));
     const board = app.navPanels.find((p) => p.id === "board");
     if (!board) throw new Error("app.tsx has not registered the 'board' navPanel yet");
@@ -1471,9 +1502,8 @@ describe("TodoPage — Today column rendering", () => {
       id: "tsk_sub",
       title: "Ship the invoice fix",
       parentId: "tsk_parent",
-      bucket: "today",
-      day: "2026-08-27",
-      inToday: true,
+      stage: "in_progress",
+      inProgress: true,
       trail: {
         projectId: null,
         projectName: null,
@@ -1497,7 +1527,7 @@ describe("TodoPage — Today column rendering", () => {
           getBoard: () => ({
             lists: [{ id: "lst_1", name: "Work", sortOrder: 1000, openCount: 1, overdueCount: 0 }],
             activeListId: "lst_1",
-            today: { day: "2026-08-27", planned: 1, completed: 0 },
+            inProgress: { planned: 1, completed: 0 },
             backlog: { total: 1, overdue: 0, tasks: [parent] },
             totalOverdue: 0,
             serverNow: Date.now(),
@@ -1508,11 +1538,151 @@ describe("TodoPage — Today column rendering", () => {
       },
     );
 
-    // The loose group in Today is labelled "Unfiled" (see Section.tsx and
-    // the UX doc's mockup), and the orphan subtask's trail names its parent
-    // (no project segment — this task is loose, so there's nothing to hide
-    // OR to show on that side).
+    // The loose group in In Progress is labelled "Unfiled" (see Section.tsx and
+    // the UX doc's mockup), and the subtask's `"parentGroup"` row's own
+    // `ParentGroupHeader` names its parent — no trail on either the header
+    // or the subtask row (this task is loose, so there's no project to
+    // show either way).
     await waitFor(() => screen.getByText("Unfiled"));
     expect(screen.getAllByText("Q4 invoicing cleanup").length).toBeGreaterThan(0);
+  });
+});
+
+/**
+ * Phase 4 panel collapse (`hooks/usePanelCollapse.ts` + `CollapsedRail.tsx`):
+ * collapsing a panel replaces its `Section` with a `CollapsedRail`, hands the
+ * freed space to the other (still `flex-1`) panel, enforces "never both
+ * collapsed at once" by construction, and persists per list in localStorage
+ * — deliberately NOT through the server/board data, so a fresh mount must
+ * still see it via `localStorage` alone, without any RPC round trip.
+ */
+describe("TodoPage — panel collapse", () => {
+  // This Node runtime ships a broken built-in `globalThis.localStorage`
+  // (backed by no file, every method throws/undefined — see the
+  // `--localstorage-file` startup warning), which vitest's jsdom
+  // environment leaves in place instead of jsdom's own Storage
+  // implementation. A real browser (what `usePanelCollapse.ts` actually
+  // runs in) has a working `localStorage`; this in-memory stand-in exists
+  // purely so THIS test environment does too.
+  function installMemoryLocalStorage() {
+    const store = new Map<string, string>();
+    Object.defineProperty(window, "localStorage", {
+      configurable: true,
+      value: {
+        getItem: (k: string) => (store.has(k) ? (store.get(k) as string) : null),
+        setItem: (k: string, v: string) => {
+          store.set(k, String(v));
+        },
+        removeItem: (k: string) => {
+          store.delete(k);
+        },
+        clear: () => {
+          store.clear();
+        },
+        key: (i: number) => Array.from(store.keys())[i] ?? null,
+        get length() {
+          return store.size;
+        },
+      },
+    });
+  }
+
+  beforeEach(() => {
+    installMemoryLocalStorage();
+  });
+
+  function collapseBoard() {
+    return {
+      lists: [{ id: "lst_1", name: "Work", sortOrder: 1000, openCount: 1, overdueCount: 0 }],
+      activeListId: "lst_1",
+      inProgress: { planned: 2, completed: 1 },
+      backlog: {
+        total: 1,
+        overdue: 0,
+        tasks: [makeTask({ id: "tsk_1", title: "Draft the copy", stage: "pending" })],
+      },
+      totalOverdue: 0,
+      serverNow: Date.now(),
+      tags: [],
+      projects: [],
+    };
+  }
+
+  async function renderBoard() {
+    const app = await loadPluginApp(() => import("@/app"));
+    const board = app.navPanels.find((p) => p.id === "board");
+    if (!board) throw new Error("app.tsx has not registered the 'board' navPanel yet");
+    const view = renderSlot(
+      { component: board.component },
+      { subPath: "" },
+      { rpc: { getBoard: () => collapseBoard() } as never },
+    );
+    // Wait for the tab (always rendered regardless of panel collapse state)
+    // rather than "Draft the copy" itself — a remounted, still-collapsed
+    // Backlog never shows that task text at all.
+    await waitFor(() => screen.getByText("Work"));
+    return view;
+  }
+
+  it("collapsing Backlog gives In Progress full width", async () => {
+    await renderBoard();
+
+    // Both panels start expanded: two real Section headings, no rail yet.
+    expect(screen.getByText("BACKLOG", { exact: false })).toBeTruthy();
+    expect(screen.getByText("IN PROGRESS")).toBeTruthy();
+    expect(screen.queryByLabelText(/^Expand /)).toBeNull();
+
+    fireEvent.click(screen.getByLabelText("Collapse BACKLOG"));
+
+    // Backlog is now a rail (its Section header is gone; the rail's own
+    // "Expand" control is the only remaining trace of it), while In
+    // Progress is untouched and still a full Section.
+    const rail = await screen.findByLabelText("Expand BACKLOG");
+    expect(screen.queryByLabelText("Collapse BACKLOG")).toBeNull();
+    expect(screen.getByText("IN PROGRESS")).toBeTruthy();
+
+    // The rail's own wrapper collapses to the fixed ~40px width class; the
+    // still-expanded In Progress column keeps `flex-1`, so it's the one
+    // that gets the freed space — "the other panel takes full width" is a
+    // consequence of this class swap, not a separately-computed style.
+    expect(rail.parentElement?.className).toContain("@3xl:w-9");
+    expect(rail.parentElement?.className).toContain("@3xl:flex-none");
+    const inProgressWrapper = screen.getByText("IN PROGRESS").closest("section")?.parentElement;
+    expect(inProgressWrapper?.className).toContain("flex-1");
+    expect(inProgressWrapper?.className).not.toContain("@3xl:w-9");
+  });
+
+  it("collapsing the second panel automatically restores the first", async () => {
+    await renderBoard();
+
+    fireEvent.click(screen.getByLabelText("Collapse BACKLOG"));
+    await screen.findByLabelText("Expand BACKLOG");
+
+    // Collapsing In Progress next must restore Backlog — never both
+    // collapsed at once (enforced by the hook's single-value encoding, not
+    // by anything in the view).
+    fireEvent.click(screen.getByLabelText("Collapse IN PROGRESS"));
+
+    await screen.findByLabelText("Expand IN PROGRESS");
+    expect(screen.queryByLabelText("Expand BACKLOG")).toBeNull();
+    expect(screen.getByText("BACKLOG", { exact: false })).toBeTruthy();
+  });
+
+  it("the collapse choice survives a remount via localStorage", async () => {
+    const view = await renderBoard();
+
+    fireEvent.click(screen.getByLabelText("Collapse BACKLOG"));
+    await screen.findByLabelText("Expand BACKLOG");
+
+    view.lifecycle.unmount();
+    cleanup();
+
+    // A brand-new mount for the SAME list, with no interaction at all — the
+    // choice must come back from `localStorage.todo.panel.lst_1`, not from
+    // any board/server data (this test's `getBoard` stub carries no notion
+    // of collapse at all).
+    await renderBoard();
+    expect(await screen.findByLabelText("Expand BACKLOG")).toBeTruthy();
+    expect(screen.queryByLabelText("Collapse BACKLOG")).toBeNull();
   });
 });

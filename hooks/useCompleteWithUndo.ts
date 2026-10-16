@@ -7,6 +7,7 @@ import { useCallback } from "react";
 import { toast } from "sonner";
 import { useRpc } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "@/contract";
+import { firstLine } from "@/lib/taskText";
 
 const UNDO_DURATION_MS = 8000;
 
@@ -21,7 +22,7 @@ export function useCompleteWithUndo(
         .call("completeTask", { id: task.id })
         .then(({ completedIds }) => {
           onChanged();
-          toast(`Done · ${task.title}`, {
+          toast(`Done · ${firstLine(task.title)}`, {
             duration: UNDO_DURATION_MS,
             action: {
               label: "Undo",

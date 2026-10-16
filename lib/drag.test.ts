@@ -7,7 +7,7 @@ import {
   dropZoneId,
   parseDropZoneId,
   resolveDropZone,
-  type Bucket,
+  type Column,
   type ComputeMoveResult,
   type DragBoardTasks,
   type DragTaskRef,
@@ -20,22 +20,22 @@ function makeTask(overrides: Partial<TaskDto> & { id: string }): TaskDto {
     parentId: null,
     title: overrides.id,
     notes: null,
-    bucket: "backlog",
-    day: null,
+    stage: "pending",
     sortOrder: 1000,
     dueAt: null,
     hasDueTime: false,
     status: "open",
     completedAt: null,
-    carriedCount: 0,
+    carriedDays: 0,
     createdAt: 0,
     updatedAt: 0,
     subtasks: [],
     subtaskCounts: { total: 0, done: 0 },
     tags: [],
+    images: [],
     projectId: null,
     trail: null,
-    inToday: false,
+    inProgress: false,
     ...overrides,
   };
 }
@@ -51,59 +51,60 @@ function board(backlog: TaskDto[]): DragBoardTasks {
 }
 
 /** Shorthand for a `DragTaskRef` grabbed from the Backlog column, the
- * common case in most of these tests — only the "leaving Today"/"dismiss"
- * tests need to construct one with `column: "today"` explicitly. */
+ * common case in most of these tests — only the "leaving In Progress"/
+ * "dismiss" tests need to construct one with `column: "in_progress"`
+ * explicitly. */
 function fromBacklog(task: Partial<DragTaskRef> & { taskId: string }): DragTaskRef {
-  return { parentId: null, bucket: "backlog", inToday: false, column: "backlog", ...task };
+  return { parentId: null, stage: "pending", inProgress: false, column: "backlog", ...task };
 }
 
-function fromToday(task: Partial<DragTaskRef> & { taskId: string }): DragTaskRef {
-  return { parentId: null, bucket: "today", inToday: true, column: "today", ...task };
+function fromInProgress(task: Partial<DragTaskRef> & { taskId: string }): DragTaskRef {
+  return { parentId: null, stage: "in_progress", inProgress: true, column: "in_progress", ...task };
 }
 
 describe("dropZoneId / parseDropZoneId", () => {
   it("round-trips a section id", () => {
-    const id = dropZoneId("section", "today");
-    expect(id).toBe("section:today:");
-    expect(parseDropZoneId(id)).toEqual({ kind: "section", column: "today", targetId: "" });
+    const id = dropZoneId("section", "in_progress");
+    expect(id).toBe("section:in_progress:");
+    expect(parseDropZoneId(id)).toEqual({ kind: "section", column: "in_progress", targetId: "" });
   });
 
   it("round-trips a project id, distinctly per column", () => {
     const backlogId = dropZoneId("project", "backlog", "prj_1");
-    const todayId = dropZoneId("project", "today", "prj_1");
-    expect(backlogId).not.toBe(todayId);
+    const inProgressId = dropZoneId("project", "in_progress", "prj_1");
+    expect(backlogId).not.toBe(inProgressId);
     expect(parseDropZoneId(backlogId)).toEqual({ kind: "project", column: "backlog", targetId: "prj_1" });
-    expect(parseDropZoneId(todayId)).toEqual({ kind: "project", column: "today", targetId: "prj_1" });
+    expect(parseDropZoneId(inProgressId)).toEqual({ kind: "project", column: "in_progress", targetId: "prj_1" });
   });
 
   it("round-trips a task id, distinctly per column, so the same task can be a drop target from either column", () => {
     const backlogId = dropZoneId("task", "backlog", "tsk_1");
-    const todayId = dropZoneId("task", "today", "tsk_1");
-    expect(backlogId).not.toBe(todayId);
+    const inProgressId = dropZoneId("task", "in_progress", "tsk_1");
+    expect(backlogId).not.toBe(inProgressId);
     expect(parseDropZoneId(backlogId)?.column).toBe("backlog");
-    expect(parseDropZoneId(todayId)?.column).toBe("today");
+    expect(parseDropZoneId(inProgressId)?.column).toBe("in_progress");
   });
 
   it("returns null for an id from an unrelated scheme", () => {
     expect(parseDropZoneId("tsk_1")).toBeNull();
-    expect(parseDropZoneId("today:tsk_1")).toBeNull();
+    expect(parseDropZoneId("in_progress:tsk_1")).toBeNull();
     expect(parseDropZoneId("bogus:backlog:tsk_1")).toBeNull();
     expect(parseDropZoneId("project:north:prj_1")).toBeNull();
   });
 });
 
-describe("computeTaskMove — Backlog row -> Today column, no specific target row", () => {
-  it("flips bucket and keeps a project task parentless, with no order write", () => {
-    const task = makeTask({ id: "tsk_a", bucket: "backlog", projectId: "prj_1" });
+describe("computeTaskMove — Backlog row -> In Progress column, no specific target row", () => {
+  it("flips stage and keeps a project task parentless, with no order write", () => {
+    const task = makeTask({ id: "tsk_a", stage: "pending", projectId: "prj_1" });
     const b = board([task]);
     const result = computeTaskMove(
       fromBacklog({ taskId: "tsk_a" }),
-      { kind: "section", column: "today" },
+      { kind: "section", column: "in_progress" },
       b,
     );
     expect(result).toEqual({
       kind: "move",
-      move: { id: "tsk_a", bucket: "today", parentId: null, beforeId: null, afterId: null },
+      move: { id: "tsk_a", stage: "in_progress", parentId: null, beforeId: null, afterId: null },
     });
     expect((result as { kind: "move"; move: MoveTaskInput }).move).not.toHaveProperty("projectId");
   });
@@ -111,81 +112,81 @@ describe("computeTaskMove — Backlog row -> Today column, no specific target ro
   it("CENTRAL FIX — a subtask keeps its parentId (was: nulled)", () => {
     const parent = makeTask({
       id: "tsk_parent",
-      bucket: "backlog",
+      stage: "pending",
       projectId: "prj_1",
-      subtasks: [makeTask({ id: "tsk_sub", parentId: "tsk_parent", bucket: "backlog", projectId: "prj_1" })],
+      subtasks: [makeTask({ id: "tsk_sub", parentId: "tsk_parent", stage: "pending", projectId: "prj_1" })],
       subtaskCounts: { total: 1, done: 0 },
     });
     const b = board([parent]);
     const result = computeTaskMove(
       fromBacklog({ taskId: "tsk_sub", parentId: "tsk_parent" }),
-      { kind: "section", column: "today" },
+      { kind: "section", column: "in_progress" },
       b,
     );
     expect(result).toEqual({
       kind: "move",
-      move: { id: "tsk_sub", bucket: "today", parentId: "tsk_parent", beforeId: null, afterId: null },
+      move: { id: "tsk_sub", stage: "in_progress", parentId: "tsk_parent", beforeId: null, afterId: null },
     });
   });
 
-  it("no order write even when other tasks already sit in Today (regression: must not append to bottom)", () => {
-    const already = makeTask({ id: "tsk_already", bucket: "today", inToday: true });
-    const dragged = makeTask({ id: "tsk_a", bucket: "backlog" });
+  it("no order write even when other tasks already sit in In Progress (regression: must not append to bottom)", () => {
+    const already = makeTask({ id: "tsk_already", stage: "in_progress", inProgress: true });
+    const dragged = makeTask({ id: "tsk_a", stage: "pending" });
     const b = board([already, dragged]);
-    const result = computeTaskMove(fromBacklog({ taskId: "tsk_a" }), { kind: "section", column: "today" }, b);
+    const result = computeTaskMove(fromBacklog({ taskId: "tsk_a" }), { kind: "section", column: "in_progress" }, b);
     expect(result).toEqual({
       kind: "move",
-      move: { id: "tsk_a", bucket: "today", parentId: null, beforeId: null, afterId: null },
+      move: { id: "tsk_a", stage: "in_progress", parentId: null, beforeId: null, afterId: null },
     });
   });
 });
 
-describe("computeTaskMove — Backlog row -> Today, near a specific row", () => {
+describe("computeTaskMove — Backlog row -> In Progress, near a specific row", () => {
   it("flags scheduled and interpolates order from the HOME sibling group (the dragged task's OWN project, not the target's)", () => {
-    const sibling1 = makeTask({ id: "tsk_s1", bucket: "backlog", projectId: "prj_1" });
-    const sibling2 = makeTask({ id: "tsk_s2", bucket: "backlog", projectId: "prj_1" });
-    const dragged = makeTask({ id: "tsk_a", bucket: "backlog", projectId: "prj_1" });
+    const sibling1 = makeTask({ id: "tsk_s1", stage: "pending", projectId: "prj_1" });
+    const sibling2 = makeTask({ id: "tsk_s2", stage: "pending", projectId: "prj_1" });
+    const dragged = makeTask({ id: "tsk_a", stage: "pending", projectId: "prj_1" });
     const b = board([sibling1, sibling2, dragged]);
-    // Drop tsk_a "before" sibling2, in the Today column. sibling2 is a
+    // Drop tsk_a "before" sibling2, in the In Progress column. sibling2 is a
     // genuine member of tsk_a's own home group (same project), so it's a
     // usable order reference.
     const result = computeTaskMove(
       fromBacklog({ taskId: "tsk_a" }),
-      { kind: "task", taskId: "tsk_s2", column: "today" },
+      { kind: "task", taskId: "tsk_s2", column: "in_progress" },
       b,
       rowRect(0),
       rowRect(1),
     );
     expect(result).toEqual({
       kind: "move",
-      move: { id: "tsk_a", bucket: "today", parentId: null, beforeId: "tsk_s2", afterId: "tsk_s1" },
+      move: { id: "tsk_a", stage: "in_progress", parentId: null, beforeId: "tsk_s2", afterId: "tsk_s1" },
     });
     expect((result as { kind: "move"; move: MoveTaskInput }).move).not.toHaveProperty("projectId");
   });
 
-  it("a subtask entering Today near a row keeps its parentId (central fix, near-row route)", () => {
-    const sibling = makeTask({ id: "tsk_sib", parentId: "tsk_parent", bucket: "backlog", projectId: "prj_1" });
+  it("a subtask entering In Progress near a row keeps its parentId (central fix, near-row route)", () => {
+    const sibling = makeTask({ id: "tsk_sib", parentId: "tsk_parent", stage: "pending", projectId: "prj_1" });
     const parent = makeTask({
       id: "tsk_parent",
-      bucket: "backlog",
+      stage: "pending",
       projectId: "prj_1",
       subtasks: [
         sibling,
-        makeTask({ id: "tsk_sub", parentId: "tsk_parent", bucket: "backlog", projectId: "prj_1" }),
+        makeTask({ id: "tsk_sub", parentId: "tsk_parent", stage: "pending", projectId: "prj_1" }),
       ],
       subtaskCounts: { total: 2, done: 0 },
     });
     const b = board([parent]);
     const result = computeTaskMove(
       fromBacklog({ taskId: "tsk_sub", parentId: "tsk_parent" }),
-      { kind: "task", taskId: "tsk_sib", column: "today" },
+      { kind: "task", taskId: "tsk_sib", column: "in_progress" },
       b,
       rowRect(5), // after
       rowRect(0),
     );
     expect(result).toEqual({
       kind: "move",
-      move: { id: "tsk_sub", bucket: "today", parentId: "tsk_parent", beforeId: null, afterId: "tsk_sib" },
+      move: { id: "tsk_sub", stage: "in_progress", parentId: "tsk_parent", beforeId: null, afterId: "tsk_sib" },
     });
   });
 
@@ -194,30 +195,30 @@ describe("computeTaskMove — Backlog row -> Today, near a specific row", () => 
     // tsk_a's home group — there's no meaningful position reference, so the
     // server's home-scoped sibling lookup would ignore beforeId/afterId
     // anyway; this must not send a stale/meaningless reference.
-    const dragged = makeTask({ id: "tsk_a", bucket: "backlog", projectId: "prj_1" });
-    const unrelated = makeTask({ id: "tsk_other", bucket: "today", inToday: true, projectId: "prj_2" });
+    const dragged = makeTask({ id: "tsk_a", stage: "pending", projectId: "prj_1" });
+    const unrelated = makeTask({ id: "tsk_other", stage: "in_progress", inProgress: true, projectId: "prj_2" });
     const b = board([dragged, unrelated]);
     const result = computeTaskMove(
       fromBacklog({ taskId: "tsk_a" }),
-      { kind: "task", taskId: "tsk_other", column: "today" },
+      { kind: "task", taskId: "tsk_other", column: "in_progress" },
       b,
       rowRect(5),
       rowRect(0),
     );
     expect(result).toEqual({
       kind: "move",
-      move: { id: "tsk_a", bucket: "today", parentId: null, beforeId: null, afterId: null },
+      move: { id: "tsk_a", stage: "in_progress", parentId: null, beforeId: null, afterId: null },
     });
   });
 });
 
-describe("computeTaskMove — Today row -> Backlog, bucket === 'today' (existing snap-home path)", () => {
+describe("computeTaskMove — In Progress row -> Backlog, stage === 'in_progress' (existing snap-home path)", () => {
   it("snaps home regardless of where it's dropped in the Backlog column", () => {
-    const scheduled = makeTask({ id: "tsk_a", bucket: "today", projectId: "prj_1", inToday: true });
-    const other = makeTask({ id: "tsk_b", bucket: "backlog", projectId: "prj_2" });
+    const scheduled = makeTask({ id: "tsk_a", stage: "in_progress", projectId: "prj_1", inProgress: true });
+    const other = makeTask({ id: "tsk_b", stage: "pending", projectId: "prj_2" });
     const b = board([scheduled, other]);
     const result = computeTaskMove(
-      fromToday({ taskId: "tsk_a" }),
+      fromInProgress({ taskId: "tsk_a" }),
       { kind: "task", taskId: "tsk_b", column: "backlog" },
       b,
       rowRect(5),
@@ -225,25 +226,25 @@ describe("computeTaskMove — Today row -> Backlog, bucket === 'today' (existing
     );
     expect(result).toEqual({
       kind: "move",
-      move: { id: "tsk_a", bucket: "backlog", parentId: null, beforeId: null, afterId: null },
+      move: { id: "tsk_a", stage: "pending", parentId: null, beforeId: null, afterId: null },
     });
     expect((result as { kind: "move"; move: MoveTaskInput }).move).not.toHaveProperty("projectId");
   });
 
   it("snaps home on a bare section-body drop too", () => {
-    const scheduled = makeTask({ id: "tsk_a", bucket: "today", inToday: true });
+    const scheduled = makeTask({ id: "tsk_a", stage: "in_progress", inProgress: true });
     const b = board([scheduled]);
-    const result = computeTaskMove(fromToday({ taskId: "tsk_a" }), { kind: "section", column: "backlog" }, b);
+    const result = computeTaskMove(fromInProgress({ taskId: "tsk_a" }), { kind: "section", column: "backlog" }, b);
     expect(result).toEqual({
       kind: "move",
-      move: { id: "tsk_a", bucket: "backlog", parentId: null, beforeId: null, afterId: null },
+      move: { id: "tsk_a", stage: "pending", parentId: null, beforeId: null, afterId: null },
     });
   });
 
   it("leaves sort_order, parent_id, and project_id untouched (asserted via the omitted fields / null position)", () => {
-    const scheduled = makeTask({ id: "tsk_a", parentId: null, bucket: "today", projectId: "prj_1", inToday: true });
+    const scheduled = makeTask({ id: "tsk_a", parentId: null, stage: "in_progress", projectId: "prj_1", inProgress: true });
     const b = board([scheduled]);
-    const result = computeTaskMove(fromToday({ taskId: "tsk_a" }), { kind: "section", column: "backlog" }, b) as {
+    const result = computeTaskMove(fromInProgress({ taskId: "tsk_a" }), { kind: "section", column: "backlog" }, b) as {
       kind: "move";
       move: MoveTaskInput;
     };
@@ -253,14 +254,14 @@ describe("computeTaskMove — Today row -> Backlog, bucket === 'today' (existing
     expect(result.move.parentId).toBeNull();
   });
 
-  it("reordering an inToday task from its Backlog-column instance is an ordinary reorder, NOT a snap-home", () => {
-    // Same underlying task, same bucket, but dragged from the BACKLOG
-    // column this time — column, not bucket, decides "leaving Today".
-    const scheduled = makeTask({ id: "tsk_a", bucket: "today", projectId: "prj_1", inToday: true });
-    const sibling = makeTask({ id: "tsk_b", bucket: "backlog", projectId: "prj_1" });
+  it("reordering an inProgress task from its Backlog-column instance is an ordinary reorder, NOT a snap-home", () => {
+    // Same underlying task, same stage, but dragged from the BACKLOG
+    // column this time — column, not stage, decides "leaving In Progress".
+    const scheduled = makeTask({ id: "tsk_a", stage: "in_progress", projectId: "prj_1", inProgress: true });
+    const sibling = makeTask({ id: "tsk_b", stage: "pending", projectId: "prj_1" });
     const b = board([scheduled, sibling]);
     const result = computeTaskMove(
-      fromBacklog({ taskId: "tsk_a", bucket: "today", inToday: true }),
+      fromBacklog({ taskId: "tsk_a", stage: "in_progress", inProgress: true }),
       { kind: "task", taskId: "tsk_b", column: "backlog" },
       b,
       rowRect(5),
@@ -269,18 +270,18 @@ describe("computeTaskMove — Today row -> Backlog, bucket === 'today' (existing
     // A real reorder: afterId points at tsk_b, not the null/null snap-home shape.
     expect(result).toEqual({
       kind: "move",
-      move: { id: "tsk_a", bucket: "backlog", parentId: null, projectId: "prj_1", beforeId: null, afterId: "tsk_b" },
+      move: { id: "tsk_a", stage: "pending", parentId: null, projectId: "prj_1", beforeId: null, afterId: "tsk_b" },
     });
   });
 });
 
-describe("computeTaskMove — Today row -> Backlog, auto-included only (bucket 'backlog' && inToday)", () => {
+describe("computeTaskMove — In Progress row -> Backlog, auto-included only (stage 'pending' && inProgress)", () => {
   it("produces a dismiss outcome, not a moveTask", () => {
-    const auto = makeTask({ id: "tsk_a", bucket: "backlog", inToday: true, dueAt: 1000 });
-    const other = makeTask({ id: "tsk_b", bucket: "backlog" });
+    const auto = makeTask({ id: "tsk_a", stage: "pending", inProgress: true, dueAt: 1000 });
+    const other = makeTask({ id: "tsk_b", stage: "pending" });
     const b = board([auto, other]);
     const result = computeTaskMove(
-      fromToday({ taskId: "tsk_a", bucket: "backlog", inToday: true }),
+      fromInProgress({ taskId: "tsk_a", stage: "pending", inProgress: true }),
       { kind: "task", taskId: "tsk_b", column: "backlog" },
       b,
       rowRect(5),
@@ -290,10 +291,10 @@ describe("computeTaskMove — Today row -> Backlog, auto-included only (bucket '
   });
 
   it("dismisses on a bare section-body drop too", () => {
-    const auto = makeTask({ id: "tsk_a", bucket: "backlog", inToday: true, dueAt: 1000 });
+    const auto = makeTask({ id: "tsk_a", stage: "pending", inProgress: true, dueAt: 1000 });
     const b = board([auto]);
     const result = computeTaskMove(
-      fromToday({ taskId: "tsk_a", bucket: "backlog", inToday: true }),
+      fromInProgress({ taskId: "tsk_a", stage: "pending", inProgress: true }),
       { kind: "section", column: "backlog" },
       b,
     );
@@ -301,11 +302,11 @@ describe("computeTaskMove — Today row -> Backlog, auto-included only (bucket '
   });
 
   it("does NOT dismiss when the same task is reordered from its Backlog-column instance", () => {
-    const auto = makeTask({ id: "tsk_a", bucket: "backlog", inToday: true, dueAt: 1000, projectId: "prj_1" });
-    const sibling = makeTask({ id: "tsk_b", bucket: "backlog", projectId: "prj_1" });
+    const auto = makeTask({ id: "tsk_a", stage: "pending", inProgress: true, dueAt: 1000, projectId: "prj_1" });
+    const sibling = makeTask({ id: "tsk_b", stage: "pending", projectId: "prj_1" });
     const b = board([auto, sibling]);
     const result = computeTaskMove(
-      fromBacklog({ taskId: "tsk_a", inToday: true }),
+      fromBacklog({ taskId: "tsk_a", inProgress: true }),
       { kind: "task", taskId: "tsk_b", column: "backlog" },
       b,
       rowRect(5),
@@ -315,21 +316,21 @@ describe("computeTaskMove — Today row -> Backlog, auto-included only (bucket '
   });
 });
 
-describe("computeTaskMove — Today project A -> project B (re-home, sort_order only, bucket unchanged)", () => {
-  it("stays in Today: bucket remains 'today', project changes, order appended in the target project", () => {
-    const scheduled = makeTask({ id: "tsk_a", bucket: "today", projectId: "prj_1", inToday: true });
-    const inTargetProject = makeTask({ id: "tsk_in_prj2", bucket: "backlog", projectId: "prj_2" });
+describe("computeTaskMove — In Progress project A -> project B (re-home, sort_order only, stage unchanged)", () => {
+  it("stays in In Progress: stage remains 'in_progress', project changes, order appended in the target project", () => {
+    const scheduled = makeTask({ id: "tsk_a", stage: "in_progress", projectId: "prj_1", inProgress: true });
+    const inTargetProject = makeTask({ id: "tsk_in_prj2", stage: "pending", projectId: "prj_2" });
     const b = board([scheduled, inTargetProject]);
     const result = computeTaskMove(
-      fromToday({ taskId: "tsk_a" }),
-      { kind: "project", projectId: "prj_2", column: "today" },
+      fromInProgress({ taskId: "tsk_a" }),
+      { kind: "project", projectId: "prj_2", column: "in_progress" },
       b,
     );
     expect(result).toEqual({
       kind: "move",
       move: {
         id: "tsk_a",
-        bucket: "today",
+        stage: "in_progress",
         parentId: null,
         projectId: "prj_2",
         beforeId: null,
@@ -339,36 +340,36 @@ describe("computeTaskMove — Today project A -> project B (re-home, sort_order 
   });
 
   it("dropping on a different project's header in the BACKLOG column unschedules AND re-homes", () => {
-    const scheduled = makeTask({ id: "tsk_a", bucket: "today", projectId: "prj_1", inToday: true });
+    const scheduled = makeTask({ id: "tsk_a", stage: "in_progress", projectId: "prj_1", inProgress: true });
     const b = board([scheduled]);
     const result = computeTaskMove(
-      fromToday({ taskId: "tsk_a" }),
+      fromInProgress({ taskId: "tsk_a" }),
       { kind: "project", projectId: "prj_2", column: "backlog" },
       b,
     );
     expect(result).toEqual({
       kind: "move",
-      move: { id: "tsk_a", bucket: "backlog", parentId: null, projectId: "prj_2", beforeId: null, afterId: null },
+      move: { id: "tsk_a", stage: "pending", parentId: null, projectId: "prj_2", beforeId: null, afterId: null },
     });
   });
 });
 
-describe("computeTaskMove — reorder within Today, same project", () => {
+describe("computeTaskMove — reorder within In Progress, same project", () => {
   it("plain reorder among home siblings", () => {
-    const a = makeTask({ id: "tsk_a", bucket: "today", projectId: "prj_1", inToday: true });
-    const bTask = makeTask({ id: "tsk_b", bucket: "today", projectId: "prj_1", inToday: true });
-    const c = makeTask({ id: "tsk_c", bucket: "today", projectId: "prj_1", inToday: true });
+    const a = makeTask({ id: "tsk_a", stage: "in_progress", projectId: "prj_1", inProgress: true });
+    const bTask = makeTask({ id: "tsk_b", stage: "in_progress", projectId: "prj_1", inProgress: true });
+    const c = makeTask({ id: "tsk_c", stage: "in_progress", projectId: "prj_1", inProgress: true });
     const brd = board([a, bTask, c]);
     const result = computeTaskMove(
-      fromToday({ taskId: "tsk_c" }),
-      { kind: "task", taskId: "tsk_a", column: "today" },
+      fromInProgress({ taskId: "tsk_c" }),
+      { kind: "task", taskId: "tsk_a", column: "in_progress" },
       brd,
       rowRect(0),
       rowRect(1),
     );
     expect(result).toEqual({
       kind: "move",
-      move: { id: "tsk_c", bucket: "today", parentId: null, beforeId: "tsk_a", afterId: null },
+      move: { id: "tsk_c", stage: "in_progress", parentId: null, beforeId: "tsk_a", afterId: null },
     });
   });
 });
@@ -389,32 +390,32 @@ describe("computeTaskMove — project header reorder (unchanged)", () => {
 });
 
 describe("computeTaskMove — nesting into a subtask", () => {
-  it("dropping into the middle band of a top-level row nests under it, bucket following the target column", () => {
+  it("dropping into the middle band of a top-level row nests under it, stage following the target column", () => {
     const parent = makeTask({
       id: "tsk_parent",
-      bucket: "today",
-      inToday: true,
-      subtasks: [makeTask({ id: "tsk_sub1", parentId: "tsk_parent", bucket: "backlog" })],
+      stage: "in_progress",
+      inProgress: true,
+      subtasks: [makeTask({ id: "tsk_sub1", parentId: "tsk_parent", stage: "pending" })],
       subtaskCounts: { total: 1, done: 0 },
     });
-    const dragged = makeTask({ id: "tsk_drag", bucket: "backlog" });
+    const dragged = makeTask({ id: "tsk_drag", stage: "pending" });
     const b = board([parent, dragged]);
     const result = computeTaskMove(
       fromBacklog({ taskId: "tsk_drag" }),
-      { kind: "task", taskId: "tsk_parent", column: "today" },
+      { kind: "task", taskId: "tsk_parent", column: "in_progress" },
       b,
       rowRect(0),
       rowRect(0),
     );
     expect(result).toEqual({
       kind: "move",
-      move: { id: "tsk_drag", bucket: "today", parentId: "tsk_parent", beforeId: null, afterId: "tsk_sub1" },
+      move: { id: "tsk_drag", stage: "in_progress", parentId: "tsk_parent", beforeId: null, afterId: "tsk_sub1" },
     });
   });
 
   it("nesting under a top-level row with no existing subtasks appends as its only subtask", () => {
-    const parent = makeTask({ id: "tsk_parent", bucket: "backlog" });
-    const dragged = makeTask({ id: "tsk_drag", bucket: "backlog" });
+    const parent = makeTask({ id: "tsk_parent", stage: "pending" });
+    const dragged = makeTask({ id: "tsk_drag", stage: "pending" });
     const b = board([parent, dragged]);
     const result = computeTaskMove(
       fromBacklog({ taskId: "tsk_drag" }),
@@ -425,18 +426,18 @@ describe("computeTaskMove — nesting into a subtask", () => {
     );
     expect(result).toEqual({
       kind: "move",
-      move: { id: "tsk_drag", bucket: "backlog", parentId: "tsk_parent", beforeId: null, afterId: null },
+      move: { id: "tsk_drag", stage: "pending", parentId: "tsk_parent", beforeId: null, afterId: null },
     });
   });
 
   it("dropping onto a subtask never nests — depth stays 1", () => {
     const parent = makeTask({
       id: "tsk_parent",
-      bucket: "backlog",
-      subtasks: [makeTask({ id: "tsk_sub1", parentId: "tsk_parent", bucket: "backlog" })],
+      stage: "pending",
+      subtasks: [makeTask({ id: "tsk_sub1", parentId: "tsk_parent", stage: "pending" })],
       subtaskCounts: { total: 1, done: 0 },
     });
-    const dragged = makeTask({ id: "tsk_drag", bucket: "backlog" });
+    const dragged = makeTask({ id: "tsk_drag", stage: "pending" });
     const b = board([dragged, parent]);
     const result = computeTaskMove(
       fromBacklog({ taskId: "tsk_drag" }),
@@ -455,11 +456,11 @@ describe("computeTaskMove — promoting a subtask to top-level", () => {
   it("dragging a subtask into the before/after zone of a top-level row promotes it", () => {
     const parent = makeTask({
       id: "tsk_parent",
-      bucket: "backlog",
-      subtasks: [makeTask({ id: "tsk_sub", parentId: "tsk_parent", bucket: "backlog" })],
+      stage: "pending",
+      subtasks: [makeTask({ id: "tsk_sub", parentId: "tsk_parent", stage: "pending" })],
       subtaskCounts: { total: 1, done: 0 },
     });
-    const otherTop = makeTask({ id: "tsk_other", bucket: "backlog" });
+    const otherTop = makeTask({ id: "tsk_other", stage: "pending" });
     const b = board([parent, otherTop]);
     const result = computeTaskMove(
       fromBacklog({ taskId: "tsk_sub", parentId: "tsk_parent" }),
@@ -470,19 +471,19 @@ describe("computeTaskMove — promoting a subtask to top-level", () => {
     );
     expect(result).toEqual({
       kind: "move",
-      move: { id: "tsk_sub", bucket: "backlog", parentId: null, projectId: null, beforeId: null, afterId: "tsk_other" },
+      move: { id: "tsk_sub", stage: "pending", parentId: null, projectId: null, beforeId: null, afterId: "tsk_other" },
     });
   });
 });
 
 describe("computeTaskMove — a subtask reordering among its own siblings", () => {
   it("keeps parentId and computes beforeId/afterId from the real (backlog-tree) sibling group", () => {
-    const s1 = makeTask({ id: "tsk_s1", parentId: "tsk_parent", bucket: "backlog" });
-    const s2 = makeTask({ id: "tsk_s2", parentId: "tsk_parent", bucket: "backlog" });
-    const s3 = makeTask({ id: "tsk_s3", parentId: "tsk_parent", bucket: "backlog" });
+    const s1 = makeTask({ id: "tsk_s1", parentId: "tsk_parent", stage: "pending" });
+    const s2 = makeTask({ id: "tsk_s2", parentId: "tsk_parent", stage: "pending" });
+    const s3 = makeTask({ id: "tsk_s3", parentId: "tsk_parent", stage: "pending" });
     const parent = makeTask({
       id: "tsk_parent",
-      bucket: "backlog",
+      stage: "pending",
       subtasks: [s1, s2, s3],
       subtaskCounts: { total: 3, done: 0 },
     });
@@ -494,10 +495,50 @@ describe("computeTaskMove — a subtask reordering among its own siblings", () =
       rowRect(0),
       rowRect(1),
     );
+    // `toEqual` alone would NOT catch `projectId: undefined` sneaking into
+    // `move` (vitest's `toEqual` treats an undefined-valued key as absent),
+    // which is exactly how this scenario used to slip a literal `undefined`
+    // into the RPC payload and blow up the SDK's JSON validator. Pin it down
+    // explicitly: the key must be genuinely absent, not present-but-undefined.
     expect(result).toEqual({
       kind: "move",
-      move: { id: "tsk_s3", bucket: "backlog", parentId: "tsk_parent", beforeId: "tsk_s1", afterId: null },
+      move: { id: "tsk_s3", stage: "pending", parentId: "tsk_parent", beforeId: "tsk_s1", afterId: null },
     });
+    expect((result as { kind: "move"; move: MoveTaskInput }).move).not.toHaveProperty("projectId");
+  });
+});
+
+describe("computeTaskMove — dropping a top-level task onto a subtask (regression)", () => {
+  // Reproduces the reported runtime error: "rpc input at $input.projectId is
+  // not a JSON value". Dropping a dragged task next to a row whose
+  // `parentId !== null` (a subtask) used to compute `projectId: undefined`
+  // and put that literal key/value into the returned `move`, which the SDK's
+  // JSON validator rejects because `.optional()` in the contract means "key
+  // absent", not "present with an undefined value".
+  it("dropping a plain top-level task next to a subtask omits projectId entirely, no undefined values anywhere", () => {
+    const sub = makeTask({ id: "tsk_sub", parentId: "tsk_parent", stage: "pending" });
+    const parent = makeTask({
+      id: "tsk_parent",
+      stage: "pending",
+      projectId: "prj_1",
+      subtasks: [sub],
+      subtaskCounts: { total: 1, done: 0 },
+    });
+    const dragged = makeTask({ id: "tsk_drag", stage: "pending", projectId: "prj_2" });
+    const b = board([parent, dragged]);
+    const result = computeTaskMove(
+      fromBacklog({ taskId: "tsk_drag" }),
+      { kind: "task", taskId: "tsk_sub", column: "backlog" },
+      b,
+      rowRect(0),
+      rowRect(0),
+    ) as { kind: "move"; move: MoveTaskInput };
+
+    expect(result.kind).toBe("move");
+    // The key must be genuinely absent, not present-but-undefined — this is
+    // the exact distinction `toEqual` alone cannot pin down.
+    expect(result.move).not.toHaveProperty("projectId");
+    expect(Object.values(result.move).every((v) => v !== undefined)).toBe(true);
   });
 });
 
@@ -535,7 +576,7 @@ describe("computeTaskMove — no-op edges", () => {
     );
     expect(result).toEqual({
       kind: "move",
-      move: { id: "tsk_only", bucket: "backlog", parentId: null, projectId: null, beforeId: null, afterId: null },
+      move: { id: "tsk_only", stage: "pending", parentId: null, projectId: null, beforeId: null, afterId: null },
     });
   });
 });
@@ -559,25 +600,25 @@ describe("resolveDropZone", () => {
   });
 });
 
-describe("Bucket type sanity", () => {
-  it("only 'backlog' and 'today' are valid buckets", () => {
-    const buckets: Bucket[] = ["backlog", "today"];
-    expect(buckets).toHaveLength(2);
+describe("Column type sanity", () => {
+  it("only 'backlog' and 'in_progress' are valid columns", () => {
+    const columns: Column[] = ["backlog", "in_progress"];
+    expect(columns).toHaveLength(2);
   });
 });
 
 // ---------------------------------------------------------------------------
 // A task visible in both columns at once must be draggable from either,
 // without id collision — the direct consequence of Backlog being
-// comprehensive (decision 1) plus Today rendering the same rows (decision 6).
+// comprehensive (decision 1) plus In Progress rendering the same rows (decision 6).
 // ---------------------------------------------------------------------------
 describe("computeTaskMove — a task visible in both columns can be dragged from either", () => {
   it("dragging its Backlog-column instance onto a Backlog target reorders normally", () => {
-    const auto = makeTask({ id: "tsk_a", bucket: "backlog", inToday: true, dueAt: 1, projectId: "prj_1" });
-    const sibling = makeTask({ id: "tsk_b", bucket: "backlog", projectId: "prj_1" });
+    const auto = makeTask({ id: "tsk_a", stage: "pending", inProgress: true, dueAt: 1, projectId: "prj_1" });
+    const sibling = makeTask({ id: "tsk_b", stage: "pending", projectId: "prj_1" });
     const b = board([auto, sibling]);
     const result = computeTaskMove(
-      fromBacklog({ taskId: "tsk_a", inToday: true }),
+      fromBacklog({ taskId: "tsk_a", inProgress: true }),
       { kind: "task", taskId: "tsk_b", column: "backlog" },
       b,
       rowRect(5),
@@ -586,12 +627,12 @@ describe("computeTaskMove — a task visible in both columns can be dragged from
     expect(result?.kind).toBe("move");
   });
 
-  it("dragging its Today-column instance onto a Backlog target dismisses it", () => {
-    const auto = makeTask({ id: "tsk_a", bucket: "backlog", inToday: true, dueAt: 1, projectId: "prj_1" });
-    const sibling = makeTask({ id: "tsk_b", bucket: "backlog", projectId: "prj_1" });
+  it("dragging its In Progress-column instance onto a Backlog target dismisses it", () => {
+    const auto = makeTask({ id: "tsk_a", stage: "pending", inProgress: true, dueAt: 1, projectId: "prj_1" });
+    const sibling = makeTask({ id: "tsk_b", stage: "pending", projectId: "prj_1" });
     const b = board([auto, sibling]);
     const result = computeTaskMove(
-      fromToday({ taskId: "tsk_a", bucket: "backlog", inToday: true }),
+      fromInProgress({ taskId: "tsk_a", stage: "pending", inProgress: true }),
       { kind: "task", taskId: "tsk_b", column: "backlog" },
       b,
       rowRect(5),
@@ -607,70 +648,68 @@ describe("applyMoveToBoard", () => {
     expect(applyMoveToBoard(b, null)).toBe(b);
   });
 
-  it("entering Today with no target row: leaves sort_order untouched (stays at its array index)", () => {
-    const first = makeTask({ id: "tsk_first", bucket: "backlog" });
-    const a = makeTask({ id: "tsk_a", bucket: "backlog", projectId: "prj_1" });
-    const last = makeTask({ id: "tsk_last", bucket: "backlog" });
+  it("entering In Progress with no target row: leaves sort_order untouched (stays at its array index)", () => {
+    const first = makeTask({ id: "tsk_first", stage: "pending" });
+    const a = makeTask({ id: "tsk_a", stage: "pending", projectId: "prj_1" });
+    const last = makeTask({ id: "tsk_last", stage: "pending" });
     const b = board([first, a, last]);
     const outcome: ComputeMoveResult = {
       kind: "move",
-      move: { id: "tsk_a", bucket: "today", parentId: null, beforeId: null, afterId: null },
+      move: { id: "tsk_a", stage: "in_progress", parentId: null, beforeId: null, afterId: null },
     };
-    const next = applyMoveToBoard(b, outcome, "2026-08-27");
+    const next = applyMoveToBoard(b, outcome);
 
     // Same position, same length — no relocation happened.
     expect(next.backlog.map((t) => t.id)).toEqual(["tsk_first", "tsk_a", "tsk_last"]);
     const patched = next.backlog[1];
-    expect(patched.bucket).toBe("today");
-    expect(patched.inToday).toBe(true);
-    expect(patched.day).toBe("2026-08-27");
+    expect(patched.stage).toBe("in_progress");
+    expect(patched.inProgress).toBe(true);
     expect(patched.projectId).toBe("prj_1");
   });
 
-  it("leaving Today via snap-home: leaves sort_order, parent_id, and project_id untouched", () => {
-    const other = makeTask({ id: "tsk_other", bucket: "backlog", projectId: "prj_2" });
-    const scheduled = makeTask({ id: "tsk_a", bucket: "today", projectId: "prj_1", inToday: true, day: "2026-08-27" });
+  it("leaving In Progress via snap-home: leaves sort_order, parent_id, and project_id untouched", () => {
+    const other = makeTask({ id: "tsk_other", stage: "pending", projectId: "prj_2" });
+    const scheduled = makeTask({ id: "tsk_a", stage: "in_progress", projectId: "prj_1", inProgress: true });
     const b = board([other, scheduled]);
     const outcome: ComputeMoveResult = {
       kind: "move",
-      move: { id: "tsk_a", bucket: "backlog", parentId: null, beforeId: null, afterId: null },
+      move: { id: "tsk_a", stage: "pending", parentId: null, beforeId: null, afterId: null },
     };
     const next = applyMoveToBoard(b, outcome);
 
     expect(next.backlog.map((t) => t.id)).toEqual(["tsk_other", "tsk_a"]);
     const patched = next.backlog[1];
-    expect(patched.bucket).toBe("backlog");
-    expect(patched.inToday).toBe(false);
-    expect(patched.day).toBeNull();
+    expect(patched.stage).toBe("pending");
+    expect(patched.inProgress).toBe(false);
     expect(patched.projectId).toBe("prj_1");
   });
 
-  it("an auto-included task dragged out of Today produces the dismiss outcome and NOT a moveTask", () => {
-    const auto = makeTask({ id: "tsk_a", bucket: "backlog", inToday: true, dueAt: 1, projectId: "prj_1" });
-    const b = board([auto]);
-    const outcome = computeTaskMove(
-      fromToday({ taskId: "tsk_a", bucket: "backlog", inToday: true }),
-      { kind: "section", column: "backlog" },
-      b,
-    );
-    expect(outcome).toEqual({ kind: "dismiss", id: "tsk_a" });
+  // `stage: "pending"` + `inProgress: true` is no longer a reachable domain
+  // state (membership is solely stage-based now), so `computeTaskMove` can
+  // never actually produce a "dismiss" outcome in practice — but
+  // `applyMoveToBoard` still supports one structurally (see its doc
+  // comment), so this exercises that harmless dead path directly with a
+  // hand-built outcome rather than a real drag gesture.
+  it("a hand-built dismiss outcome patches only inProgress, leaving stage/parent/project untouched", () => {
+    const task = makeTask({ id: "tsk_a", stage: "pending", inProgress: true, dueAt: 1, projectId: "prj_1" });
+    const b = board([task]);
+    const outcome: ComputeMoveResult = { kind: "dismiss", id: "tsk_a" };
 
     const next = applyMoveToBoard(b, outcome);
-    // bucket/parent/project/day untouched — only inToday flips.
-    expect(next.backlog[0].bucket).toBe("backlog");
+    expect(next.backlog[0].stage).toBe("pending");
     expect(next.backlog[0].projectId).toBe("prj_1");
-    expect(next.backlog[0].inToday).toBe(false);
+    expect(next.backlog[0].inProgress).toBe(false);
     expect(next.backlog[0].dueAt).toBe(1);
   });
 
   it("reorder within a section: relocates within the same tree per beforeId/afterId", () => {
-    const a = makeTask({ id: "tsk_a", bucket: "today", inToday: true });
-    const bTask = makeTask({ id: "tsk_b", bucket: "today", inToday: true });
-    const c = makeTask({ id: "tsk_c", bucket: "today", inToday: true });
+    const a = makeTask({ id: "tsk_a", stage: "in_progress", inProgress: true });
+    const bTask = makeTask({ id: "tsk_b", stage: "in_progress", inProgress: true });
+    const c = makeTask({ id: "tsk_c", stage: "in_progress", inProgress: true });
     const brd = board([a, bTask, c]);
     const outcome: ComputeMoveResult = {
       kind: "move",
-      move: { id: "tsk_c", bucket: "today", parentId: null, beforeId: "tsk_a", afterId: null },
+      move: { id: "tsk_c", stage: "in_progress", parentId: null, beforeId: "tsk_a", afterId: null },
     };
     const next = applyMoveToBoard(brd, outcome);
 
@@ -678,12 +717,12 @@ describe("applyMoveToBoard", () => {
   });
 
   it("nesting: dropping a top-level task onto another makes it a subtask, removed from the top-level array", () => {
-    const a = makeTask({ id: "tsk_a", bucket: "backlog" });
-    const parent = makeTask({ id: "tsk_parent", bucket: "backlog" });
+    const a = makeTask({ id: "tsk_a", stage: "pending" });
+    const parent = makeTask({ id: "tsk_parent", stage: "pending" });
     const b = board([a, parent]);
     const outcome: ComputeMoveResult = {
       kind: "move",
-      move: { id: "tsk_a", bucket: "backlog", parentId: "tsk_parent", beforeId: null, afterId: null },
+      move: { id: "tsk_a", stage: "pending", parentId: "tsk_parent", beforeId: null, afterId: null },
     };
     const next = applyMoveToBoard(b, outcome);
 
@@ -692,23 +731,23 @@ describe("applyMoveToBoard", () => {
     expect(nextParent.subtasks.map((s) => s.id)).toEqual(["tsk_a"]);
     expect(nextParent.subtaskCounts.total).toBe(1);
     expect(nextParent.subtasks[0].parentId).toBe("tsk_parent");
-    expect(nextParent.subtasks[0].bucket).toBe("backlog");
+    expect(nextParent.subtasks[0].stage).toBe("pending");
   });
 
   it("nesting a task that itself has subtasks promotes those children to top-level siblings", () => {
-    const grandchild1 = makeTask({ id: "tsk_gc1", parentId: "tsk_a", bucket: "backlog" });
-    const grandchild2 = makeTask({ id: "tsk_gc2", parentId: "tsk_a", bucket: "backlog" });
+    const grandchild1 = makeTask({ id: "tsk_gc1", parentId: "tsk_a", stage: "pending" });
+    const grandchild2 = makeTask({ id: "tsk_gc2", parentId: "tsk_a", stage: "pending" });
     const a = makeTask({
       id: "tsk_a",
-      bucket: "backlog",
+      stage: "pending",
       subtasks: [grandchild1, grandchild2],
       subtaskCounts: { total: 2, done: 0 },
     });
-    const parent = makeTask({ id: "tsk_parent", bucket: "backlog" });
+    const parent = makeTask({ id: "tsk_parent", stage: "pending" });
     const b = board([a, parent]);
     const outcome: ComputeMoveResult = {
       kind: "move",
-      move: { id: "tsk_a", bucket: "backlog", parentId: "tsk_parent", beforeId: null, afterId: null },
+      move: { id: "tsk_a", stage: "pending", parentId: "tsk_parent", beforeId: null, afterId: null },
     };
     const next = applyMoveToBoard(b, outcome);
 
@@ -725,50 +764,48 @@ describe("applyMoveToBoard", () => {
     const gc2 = next.backlog.find((t) => t.id === "tsk_gc2");
     expect(gc1?.parentId).toBeNull();
     expect(gc2?.parentId).toBeNull();
-    expect(gc1?.bucket).toBe("backlog");
+    expect(gc1?.stage).toBe("pending");
   });
 
-  it("scheduling a parent into Today does NOT drag its subtasks along (invariant 4)", () => {
-    const sub = makeTask({ id: "tsk_sub", parentId: "tsk_a", bucket: "backlog" });
+  it("scheduling a parent into In Progress does NOT drag its subtasks along (invariant 4)", () => {
+    const sub = makeTask({ id: "tsk_sub", parentId: "tsk_a", stage: "pending" });
     const a = makeTask({
       id: "tsk_a",
-      bucket: "backlog",
+      stage: "pending",
       subtasks: [sub],
       subtaskCounts: { total: 1, done: 0 },
     });
     const b = board([a]);
     const outcome: ComputeMoveResult = {
       kind: "move",
-      move: { id: "tsk_a", bucket: "today", parentId: null, beforeId: null, afterId: null },
+      move: { id: "tsk_a", stage: "in_progress", parentId: null, beforeId: null, afterId: null },
     };
-    const next = applyMoveToBoard(b, outcome, "2026-08-20");
+    const next = applyMoveToBoard(b, outcome);
 
     expect(next.backlog.map((t) => t.id)).toEqual(["tsk_a"]);
-    expect(next.backlog[0].bucket).toBe("today");
-    expect(next.backlog[0].inToday).toBe(true);
-    expect(next.backlog[0].day).toBe("2026-08-20");
+    expect(next.backlog[0].stage).toBe("in_progress");
+    expect(next.backlog[0].inProgress).toBe(true);
     expect(next.backlog[0].subtasks.map((s) => s.id)).toEqual(["tsk_sub"]);
-    expect(next.backlog[0].subtasks[0].bucket).toBe("backlog");
-    expect(next.backlog[0].subtasks[0].inToday).toBe(false);
-    expect(next.backlog[0].subtasks[0].day).toBeNull();
+    expect(next.backlog[0].subtasks[0].stage).toBe("pending");
+    expect(next.backlog[0].subtasks[0].inProgress).toBe(false);
   });
 
   it("does not mutate the input board's arrays or task objects", () => {
-    const sub = makeTask({ id: "tsk_sub", parentId: "tsk_parent", bucket: "backlog" });
+    const sub = makeTask({ id: "tsk_sub", parentId: "tsk_parent", stage: "pending" });
     const parent = makeTask({
       id: "tsk_parent",
-      bucket: "backlog",
+      stage: "pending",
       subtasks: [sub],
       subtaskCounts: { total: 1, done: 0 },
     });
-    const other = makeTask({ id: "tsk_other", bucket: "backlog" });
+    const other = makeTask({ id: "tsk_other", stage: "pending" });
     const b = board([other, parent]);
     const snapshotBacklog = [...b.backlog];
     const snapshotParent = { ...parent, subtasks: [...parent.subtasks] };
 
     const outcome: ComputeMoveResult = {
       kind: "move",
-      move: { id: "tsk_sub", bucket: "today", parentId: "tsk_parent", beforeId: null, afterId: null },
+      move: { id: "tsk_sub", stage: "in_progress", parentId: "tsk_parent", beforeId: null, afterId: null },
     };
     applyMoveToBoard(b, outcome);
 
@@ -783,7 +820,7 @@ describe("applyMoveToBoard", () => {
     const b = board([makeTask({ id: "tsk_a" })]);
     const outcome: ComputeMoveResult = {
       kind: "move",
-      move: { id: "tsk_ghost", bucket: "today", parentId: null, beforeId: null, afterId: null },
+      move: { id: "tsk_ghost", stage: "in_progress", parentId: null, beforeId: null, afterId: null },
     };
     expect(applyMoveToBoard(b, outcome)).toBe(b);
   });
@@ -794,12 +831,12 @@ describe("applyMoveToBoard", () => {
   });
 
   it("re-homing to a different project relocates the entry and writes the explicit projectId", () => {
-    const a = makeTask({ id: "tsk_a", bucket: "backlog", projectId: "prj_1" });
-    const inTarget = makeTask({ id: "tsk_in_prj2", bucket: "backlog", projectId: "prj_2" });
+    const a = makeTask({ id: "tsk_a", stage: "pending", projectId: "prj_1" });
+    const inTarget = makeTask({ id: "tsk_in_prj2", stage: "pending", projectId: "prj_2" });
     const b = board([a, inTarget]);
     const outcome: ComputeMoveResult = {
       kind: "move",
-      move: { id: "tsk_a", bucket: "backlog", parentId: null, projectId: "prj_2", beforeId: null, afterId: "tsk_in_prj2" },
+      move: { id: "tsk_a", stage: "pending", parentId: null, projectId: "prj_2", beforeId: null, afterId: "tsk_in_prj2" },
     };
     const next = applyMoveToBoard(b, outcome);
 
@@ -807,37 +844,37 @@ describe("applyMoveToBoard", () => {
     expect(next.backlog[1].projectId).toBe("prj_2");
   });
 
-  it("sets inToday in all four directions: entering, staying, leaving, dismissing", () => {
+  it("sets inProgress in all four directions: entering, staying, leaving, dismissing", () => {
     // Entering.
-    const enter = applyMoveToBoard(board([makeTask({ id: "tsk_a", bucket: "backlog" })]), {
+    const enter = applyMoveToBoard(board([makeTask({ id: "tsk_a", stage: "pending" })]), {
       kind: "move",
-      move: { id: "tsk_a", bucket: "today", parentId: null, beforeId: null, afterId: null },
+      move: { id: "tsk_a", stage: "in_progress", parentId: null, beforeId: null, afterId: null },
     });
-    expect(enter.backlog[0].inToday).toBe(true);
+    expect(enter.backlog[0].inProgress).toBe(true);
 
-    // Staying (reorder within Today).
+    // Staying (reorder within In Progress).
     const stay = applyMoveToBoard(
       board([
-        makeTask({ id: "tsk_a", bucket: "today", inToday: true }),
-        makeTask({ id: "tsk_b", bucket: "today", inToday: true }),
+        makeTask({ id: "tsk_a", stage: "in_progress", inProgress: true }),
+        makeTask({ id: "tsk_b", stage: "in_progress", inProgress: true }),
       ]),
-      { kind: "move", move: { id: "tsk_a", bucket: "today", parentId: null, beforeId: null, afterId: "tsk_b" } },
+      { kind: "move", move: { id: "tsk_a", stage: "in_progress", parentId: null, beforeId: null, afterId: "tsk_b" } },
     );
-    expect(stay.backlog.find((t) => t.id === "tsk_a")?.inToday).toBe(true);
+    expect(stay.backlog.find((t) => t.id === "tsk_a")?.inProgress).toBe(true);
 
     // Leaving (snap-home).
-    const leave = applyMoveToBoard(board([makeTask({ id: "tsk_a", bucket: "today", inToday: true })]), {
+    const leave = applyMoveToBoard(board([makeTask({ id: "tsk_a", stage: "in_progress", inProgress: true })]), {
       kind: "move",
-      move: { id: "tsk_a", bucket: "backlog", parentId: null, beforeId: null, afterId: null },
+      move: { id: "tsk_a", stage: "pending", parentId: null, beforeId: null, afterId: null },
     });
-    expect(leave.backlog[0].inToday).toBe(false);
+    expect(leave.backlog[0].inProgress).toBe(false);
 
     // Dismissing (auto-included).
-    const dismiss = applyMoveToBoard(board([makeTask({ id: "tsk_a", bucket: "backlog", inToday: true })]), {
+    const dismiss = applyMoveToBoard(board([makeTask({ id: "tsk_a", stage: "pending", inProgress: true })]), {
       kind: "dismiss",
       id: "tsk_a",
     });
-    expect(dismiss.backlog[0].inToday).toBe(false);
-    expect(dismiss.backlog[0].bucket).toBe("backlog"); // dismiss never touches bucket
+    expect(dismiss.backlog[0].inProgress).toBe(false);
+    expect(dismiss.backlog[0].stage).toBe("pending"); // dismiss never touches stage
   });
 });

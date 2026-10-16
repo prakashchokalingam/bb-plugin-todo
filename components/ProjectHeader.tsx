@@ -6,10 +6,11 @@
 // a "..." menu (Rename / Change colour / Delete, the last behind the
 // existing AlertDialog confirm).
 //
-// variant="today": a plain, read-only group label. Collapse still works,
-// but the colour, rename, "+", and "..." menu are all withheld — those
-// live in the Backlog only (one editing surface per concept; two draggable
-// orderings of one `projects.sort_order` would fight each other).
+// variant="in_progress": a plain, read-only group label. Collapse still
+// works, but the colour, rename, "+", and "..." menu are all withheld —
+// those live in the Backlog only (one editing surface per concept; two
+// draggable orderings of one `projects.sort_order` would fight each
+// other).
 import { useState } from "react";
 import type { ProjectDto, TagColor } from "@/contract";
 import { cn } from "@/lib/utils";
@@ -36,16 +37,16 @@ import {
 
 export interface ProjectHeaderProps {
   project: ProjectDto;
-  /** "today" withholds rename/colour/delete/"+" — see file header comment.
-   * Default "backlog": today's existing, unchanged behaviour. */
-  variant?: "backlog" | "today";
+  /** "in_progress" withholds rename/colour/delete/"+" — see file header
+   * comment. Default "backlog": today's existing, unchanged behaviour. */
+  variant?: "backlog" | "in_progress";
   /** Whether this header acts as a drag handle for project reordering.
-   * Default `true`. `ProjectGroup` passes `false` for `variant="today"`:
-   * there is no `projects.sort_order` write path from Today, so the header
-   * renders with no grab affordance/cursor. */
+   * Default `true`. `ProjectGroup` passes `false` for
+   * `variant="in_progress"`: there is no `projects.sort_order` write path
+   * from In Progress, so the header renders with no grab affordance/cursor. */
   draggable?: boolean;
   onToggleCollapsed: () => void;
-  /** Backlog-only; unused (and safely omittable) when `variant="today"`. */
+  /** Backlog-only; unused (and safely omittable) when `variant="in_progress"`. */
   onRename?: (name: string) => void;
   onChangeColor?: (color: TagColor) => void;
   onDelete?: () => void;
@@ -67,7 +68,7 @@ export function ProjectHeader({
   const isBacklog = variant === "backlog";
   // Collapse state is per-column — read the field that matches this
   // header's own variant, never the other column's bit.
-  const isCollapsed = isBacklog ? project.collapsed : project.todayCollapsed;
+  const isCollapsed = isBacklog ? project.collapsed : project.inProgressCollapsed;
   const [renaming, setRenaming] = useState(false);
   const [draft, setDraft] = useState(project.name);
   const [colorOpen, setColorOpen] = useState(false);
@@ -87,8 +88,8 @@ export function ProjectHeader({
   }
 
   const countsLabel =
-    project.todayCount > 0
-      ? `${project.openCount} open · ${project.todayCount} today`
+    project.inProgressCount > 0
+      ? `${project.openCount} open · ${project.inProgressCount} in progress`
       : `${project.openCount} open`;
 
   return (

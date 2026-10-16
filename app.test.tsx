@@ -20,8 +20,9 @@ import {
 } from "@get-bb/plugin-sdk/testing/app";
 import type { TagDto, TaskDto } from "@/contract";
 import TodoHeaderActions from "./components/TodoHeaderActions";
-import { TaskRow } from "./components/TaskRow";
+import { TaskRow, type TaskRowProps } from "./components/TaskRow";
 import type { BoardActions } from "./components/Section";
+import { TooltipProvider } from "./components/ui/tooltip";
 import { emitBoardCommand, useBoardCommand } from "./lib/board-bus";
 
 vi.mock("sonner", () => {
@@ -61,22 +62,22 @@ function makeTask(overrides: Partial<TaskDto> = {}): TaskDto {
     parentId: null,
     title: "Standup",
     notes: null,
-    bucket: "today",
-    day: "2026-08-20",
+    stage: "in_progress",
     sortOrder: 1000,
     dueAt: null,
     hasDueTime: false,
     status: "done",
     completedAt: Date.now(),
-    carriedCount: 0,
+    carriedDays: 0,
     createdAt: Date.now(),
     updatedAt: Date.now(),
     subtasks: [],
     subtaskCounts: { total: 0, done: 0 },
     tags: [],
+    images: [],
     projectId: null,
     trail: null,
-    inToday: false,
+    inProgress: false,
     ...overrides,
   };
 }
@@ -158,7 +159,7 @@ describe("OverdueAccessory", () => {
           getBoard: () => ({
             lists: [],
             activeListId: "lst_1",
-            today: { day: "2026-08-20", planned: 0, completed: 0 },
+            inProgress: { planned: 0, completed: 0 },
             backlog: { total: 0, overdue: 0, tasks: [] },
             totalOverdue: 5,
             serverNow: Date.now(),
@@ -180,7 +181,7 @@ describe("OverdueAccessory", () => {
           getBoard: () => ({
             lists: [],
             activeListId: "lst_1",
-            today: { day: "2026-08-20", planned: 0, completed: 0 },
+            inProgress: { planned: 0, completed: 0 },
             backlog: { total: 0, overdue: 0, tasks: [] },
             totalOverdue: 0,
             serverNow: Date.now(),
@@ -319,7 +320,7 @@ describe("ArchivePanel", () => {
               { id: "lst_1", name: "Work", sortOrder: 1000, openCount: 0, overdueCount: 0 },
             ],
             activeListId: "lst_1",
-            today: { day: "2026-08-20", planned: 0, completed: 0 },
+            inProgress: { planned: 0, completed: 0 },
             backlog: { total: 0, overdue: 0, tasks: [] },
             totalOverdue: 0,
             serverNow: Date.now(),
@@ -359,7 +360,7 @@ describe("ArchivePanel", () => {
               { id: "lst_1", name: "Work", sortOrder: 1000, openCount: 0, overdueCount: 0 },
             ],
             activeListId: "lst_1",
-            today: { day: "2026-08-20", planned: 0, completed: 0 },
+            inProgress: { planned: 0, completed: 0 },
             backlog: { total: 0, overdue: 0, tasks: [] },
             totalOverdue: 0,
             serverNow: Date.now(),
@@ -403,7 +404,7 @@ describe("ArchivePanel", () => {
               { id: "lst_1", name: "Work", sortOrder: 1000, openCount: 0, overdueCount: 0 },
             ],
             activeListId: "lst_1",
-            today: { day: "2026-08-20", planned: 0, completed: 0 },
+            inProgress: { planned: 0, completed: 0 },
             backlog: { total: 0, overdue: 0, tasks: [] },
             totalOverdue: 0,
             serverNow: Date.now(),
@@ -450,7 +451,7 @@ describe("ArchivePanel", () => {
               { id: "lst_1", name: "Work", sortOrder: 1000, openCount: 0, overdueCount: 0 },
             ],
             activeListId: "lst_1",
-            today: { day: "2026-08-20", planned: 0, completed: 0 },
+            inProgress: { planned: 0, completed: 0 },
             backlog: { total: 0, overdue: 0, tasks: [] },
             totalOverdue: 0,
             serverNow: Date.now(),
@@ -478,6 +479,7 @@ function makeActions(overrides: Partial<BoardActions> = {}): BoardActions {
     overId: null,
     onToggleComplete: vi.fn(),
     onRenameTask: vi.fn(),
+    onUpdateTask: vi.fn().mockResolvedValue(undefined),
     onSetDue: vi.fn(),
     onDeleteTask: vi.fn(),
     onCreateTask: vi.fn(),
@@ -490,14 +492,29 @@ function makeActions(overrides: Partial<BoardActions> = {}): BoardActions {
       sortOrder: 1000,
       taskCount: 0,
     })),
+    onStartTask: vi.fn(),
+    onParkTask: vi.fn(),
     ...overrides,
   };
+}
+
+/** `renderSlot` mounts `component` with no ambient providers of its own.
+ * TaskRow's ▶/◀ stage-toggle button (added alongside the one-click stage
+ * toggle feature) renders a Radix `Tooltip`, which throws without a
+ * `TooltipProvider` ancestor — the real app supplies one at `TodoPage`'s
+ * root, so this stand-in reproduces that for these standalone renders. */
+function TaskRowWithTooltipProvider(props: TaskRowProps) {
+  return (
+    <TooltipProvider>
+      <TaskRow {...props} />
+    </TooltipProvider>
+  );
 }
 
 describe("TaskRow inline actions", () => {
   it("the calendar button opens the due date popover", async () => {
     renderSlot(
-      { component: TaskRow },
+      { component: TaskRowWithTooltipProvider },
       { task: makeTask({ title: "Q3 planning doc" }), actions: makeActions() },
       {},
     );
@@ -513,7 +530,7 @@ describe("TaskRow inline actions", () => {
 
   it("the plus button reveals an inline subtask input on a top-level row", async () => {
     renderSlot(
-      { component: TaskRow },
+      { component: TaskRowWithTooltipProvider },
       { task: makeTask({ title: "Q3 planning doc" }), actions: makeActions() },
       {},
     );
@@ -529,7 +546,7 @@ describe("TaskRow inline actions", () => {
 
   it("the plus button is absent on subtask rows", () => {
     renderSlot(
-      { component: TaskRow },
+      { component: TaskRowWithTooltipProvider },
       {
         task: makeTask({ id: "tsk_sub", title: "Pull last quarter's numbers", parentId: "tsk_1" }),
         actions: makeActions(),
@@ -549,7 +566,7 @@ describe("TaskRow inline actions", () => {
     const NOON = new Date(2026, 7, 20, 12, 0, 0, 0).getTime();
     const HOUR = 60 * 60 * 1000;
     renderSlot(
-      { component: TaskRow },
+      { component: TaskRowWithTooltipProvider },
       {
         task: makeTask({
           title: "Ship the invoice fix",
@@ -568,7 +585,7 @@ describe("TaskRow inline actions", () => {
 
   it("the \"...\" menu contains Delete only, no Set due date or Add subtask", async () => {
     renderSlot(
-      { component: TaskRow },
+      { component: TaskRowWithTooltipProvider },
       { task: makeTask({ title: "Q3 planning doc" }), actions: makeActions() },
       {},
     );
@@ -602,7 +619,7 @@ describe("board nav panel (app.tsx)", () => {
     expect(board?.experimental_sidebarAccessory).toBeTruthy();
   });
 
-  it("renders both Backlog and Today sections from stubbed rpc", async () => {
+  it("renders both Backlog and In Progress sections from stubbed rpc", async () => {
     const app = await loadPluginApp(() => import("./app"));
     const board = app.navPanels.find((p) => p.id === "board");
     if (!board) {
@@ -618,17 +635,17 @@ describe("board nav panel (app.tsx)", () => {
               { id: "lst_1", name: "Work", sortOrder: 1000, openCount: 1, overdueCount: 0 },
             ],
             activeListId: "lst_1",
-            today: { day: "2026-08-20", planned: 1, completed: 0 },
+            inProgress: { planned: 1, completed: 0 },
             // The task lives in `backlog.tasks` (the one comprehensive tree
-            // since Phase 2) with `bucket: "today"` + `inToday: true`; the
-            // Today column derives its own grouped view from this same row
-            // via `lib/todayView`'s `selectTodayView` rather than trusting a
-            // separate `today.tasks` array, which no longer exists on the
-            // wire.
+            // since Phase 2) with `stage: "in_progress"` + `inProgress: true`;
+            // the In Progress column derives its own grouped view from this
+            // same row via `lib/inProgressView`'s `selectInProgressView`
+            // rather than trusting a separate `inProgress.tasks` array,
+            // which no longer exists on the wire.
             backlog: {
               total: 1,
               overdue: 0,
-              tasks: [makeTask({ status: "open", bucket: "today", inToday: true })],
+              tasks: [makeTask({ status: "open", stage: "in_progress", inProgress: true })],
             },
             totalOverdue: 0,
             serverNow: Date.now(),
@@ -641,12 +658,13 @@ describe("board nav panel (app.tsx)", () => {
 
     await waitFor(() => {
       expect(screen.getByText(/backlog/i)).toBeTruthy();
-      // The row is `inToday`, so it renders in both columns — once as a
-      // plain Backlog row and again under the Today heading — plus its own
-      // "· today" marker text, so more than one node now matches /today/i.
-      // The column heading itself is exact, so assert on it specifically
-      // rather than the ambiguous substring match.
-      expect(screen.getByText("TODAY · Thu 20 Aug")).toBeTruthy();
+      // The row is `inProgress`, so it renders in both columns — once as a
+      // plain Backlog row and again under the In Progress heading — plus
+      // its own "· in progress" marker text, so more than one node now
+      // matches /in progress/i. The column heading itself is exact (and, per
+      // the today-as-view deletion, no longer carries a date suffix), so
+      // assert on it specifically rather than the ambiguous substring match.
+      expect(screen.getByText("IN PROGRESS")).toBeTruthy();
     });
   });
 
@@ -666,7 +684,7 @@ describe("board nav panel (app.tsx)", () => {
               { id: "lst_1", name: "Work", sortOrder: 1000, openCount: 0, overdueCount: 0 },
             ],
             activeListId: "lst_1",
-            today: { day: "2026-08-20", planned: 0, completed: 0 },
+            inProgress: { planned: 0, completed: 0 },
             backlog: { total: 0, overdue: 0, tasks: [] },
             totalOverdue: 0,
             serverNow: Date.now(),
@@ -683,8 +701,9 @@ describe("board nav panel (app.tsx)", () => {
     // The board's first paint is async (useRpc().call returns a Promise), so
     // wait for the add row to exist before typing into it.
     // Both sections render an add row, so scope the query to one of them
-    // rather than matching /add to (today|backlog)/ and hitting two elements.
-    const input = await screen.findByPlaceholderText(/add to today/i);
+    // rather than matching /add to (in progress|backlog)/ and hitting two
+    // elements.
+    const input = await screen.findByPlaceholderText(/add to in progress/i);
     fireEvent.change(input, { target: { value: "New task" } });
     fireEvent.keyDown(input, { key: "Enter", code: "Enter" });
 
@@ -711,11 +730,11 @@ describe("board nav panel (app.tsx)", () => {
               { id: "lst_1", name: "Work", sortOrder: 1000, openCount: 1, overdueCount: 0 },
             ],
             activeListId: "lst_1",
-            today: { day: "2026-08-20", planned: 1, completed: 0 },
+            inProgress: { planned: 1, completed: 0 },
             backlog: {
               total: 1,
               overdue: 0,
-              tasks: [makeTask({ id: "tsk_open", status: "open", inToday: true })],
+              tasks: [makeTask({ id: "tsk_open", status: "open", inProgress: true })],
             },
             totalOverdue: 0,
             serverNow: Date.now(),
@@ -728,9 +747,9 @@ describe("board nav panel (app.tsx)", () => {
     );
 
     // Same here: wait for the row to paint before clicking its checkbox.
-    // The task is `inToday`, so (per Phase 4's model) it renders once in the
-    // Backlog column and again in the Today column — two real, equally
-    // interactive checkboxes for the same task id. Either one calls
+    // The task is `inProgress`, so (per Phase 4's model) it renders once in
+    // the Backlog column and again in the In Progress column — two real,
+    // equally interactive checkboxes for the same task id. Either one calls
     // `completeTask` with the same id, so the first match is as good as any.
     await waitFor(() => screen.getAllByRole("checkbox", { name: /standup/i }));
     const checkbox = screen.getAllByRole("checkbox", { name: /standup/i })[0];

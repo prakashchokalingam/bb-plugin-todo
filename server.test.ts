@@ -1,3 +1,5 @@
+import { existsSync, readdirSync, utimesSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import { beforeEach, describe, expect, it } from "vitest";
 import plugin from "./server.js";
@@ -27,7 +29,7 @@ describe("server.ts rpc surface", () => {
 
     const created = (await harness.callRpc("createTask", {
       listId,
-      bucket: "backlog",
+      stage: "pending",
       title: "Write the report",
       parentId: null,
       dueAt: null,
@@ -35,25 +37,25 @@ describe("server.ts rpc surface", () => {
       position: "bottom",
     })) as any;
     expect(created.task.title).toBe("Write the report");
-    expect(created.task.bucket).toBe("backlog");
+    expect(created.task.stage).toBe("pending");
 
     await harness.callRpc("moveTask", {
       id: created.task.id,
-      bucket: "today",
+      stage: "in_progress",
       parentId: null,
       beforeId: null,
       afterId: null,
     });
     let boardAfterMove = await getBoard(harness, listId);
     let movedDto = boardAfterMove.backlog.tasks.find((t: any) => t.id === created.task.id);
-    expect(movedDto.bucket).toBe("today");
-    expect(movedDto.inToday).toBe(true);
+    expect(movedDto.stage).toBe("in_progress");
+    expect(movedDto.inProgress).toBe(true);
 
     const completed = (await harness.callRpc("completeTask", { id: created.task.id })) as any;
     expect(completed.completedIds).toEqual([created.task.id]);
     let boardAfterComplete = await getBoard(harness, listId);
     expect(boardAfterComplete.backlog.tasks.map((t: any) => t.id)).not.toContain(created.task.id); // done, vanished
-    expect(boardAfterComplete.today.completed).toBe(1);
+    expect(boardAfterComplete.inProgress.completed).toBe(1);
 
     await harness.callRpc("restoreTasks", { ids: completed.completedIds });
     let boardAfterRestore = await getBoard(harness, listId);
@@ -70,7 +72,7 @@ describe("server.ts rpc surface", () => {
     await expect(
       harness.callRpc("createTask", {
         listId: board.activeListId,
-        bucket: "backlog",
+        stage: "pending",
         title: "   ",
         parentId: null,
         dueAt: null,
@@ -86,7 +88,7 @@ describe("server.ts rpc surface", () => {
     const listId = board.activeListId;
     const parent = (await harness.callRpc("createTask", {
       listId,
-      bucket: "backlog",
+      stage: "pending",
       title: "Parent",
       parentId: null,
       dueAt: null,
@@ -95,7 +97,7 @@ describe("server.ts rpc surface", () => {
     })) as any;
     const child = (await harness.callRpc("createTask", {
       listId,
-      bucket: "backlog",
+      stage: "pending",
       title: "Child",
       parentId: parent.task.id,
       dueAt: null,
@@ -105,7 +107,7 @@ describe("server.ts rpc surface", () => {
     await expect(
       harness.callRpc("createTask", {
         listId,
-        bucket: "backlog",
+        stage: "pending",
         title: "Grandchild",
         parentId: child.task.id,
         dueAt: null,
@@ -121,7 +123,7 @@ describe("server.ts rpc surface", () => {
     const listId = board.activeListId;
     const a = (await harness.callRpc("createTask", {
       listId,
-      bucket: "backlog",
+      stage: "pending",
       title: "A",
       parentId: null,
       dueAt: null,
@@ -130,7 +132,7 @@ describe("server.ts rpc surface", () => {
     })) as any;
     const b = (await harness.callRpc("createTask", {
       listId,
-      bucket: "backlog",
+      stage: "pending",
       title: "B",
       parentId: null,
       dueAt: null,
@@ -139,7 +141,7 @@ describe("server.ts rpc surface", () => {
     })) as any;
     await harness.callRpc("moveTask", {
       id: b.task.id,
-      bucket: "backlog",
+      stage: "pending",
       parentId: a.task.id,
       beforeId: null,
       afterId: null,
@@ -147,7 +149,7 @@ describe("server.ts rpc surface", () => {
     await expect(
       harness.callRpc("moveTask", {
         id: a.task.id,
-        bucket: "backlog",
+        stage: "pending",
         parentId: b.task.id,
         beforeId: null,
         afterId: null,
@@ -155,57 +157,69 @@ describe("server.ts rpc surface", () => {
     ).rejects.toBeTruthy();
   });
 
-  it("rollover is idempotent across repeated getBoard calls the same day", async () => {
+  // There is no more carry-forward/rollover: In Progress membership is
+  // solely `stage = 'in_progress'`, which never goes stale with the
+  // passage of a calendar day, so repeated getBoard calls the same (or a
+  // later) day must never mutate a row's carriedDays on their own — only an
+  // actual stage flip (moveTask/setTaskStage) does that.
+  it("repeated getBoard calls never mutate a row's carriedDays or stage on their own", async () => {
     const { harness } = await setup();
     const board1 = await getBoard(harness);
-    const board2 = await getBoard(harness);
-    expect(board2.today.day).toBe(board1.today.day);
+    const listId = board1.activeListId;
+    const created = (await harness.callRpc("createTask", {
+      listId,
+      stage: "in_progress",
+      title: "scheduled",
+      parentId: null,
+      dueAt: null,
+      hasDueTime: false,
+      position: "bottom",
+    })) as any;
+
+    const boardA = await getBoard(harness, listId);
+    const boardB = await getBoard(harness, listId);
+    const rowA = boardA.backlog.tasks.find((t: any) => t.id === created.task.id);
+    const rowB = boardB.backlog.tasks.find((t: any) => t.id === created.task.id);
+    expect(rowA.carriedDays).toBe(rowB.carriedDays);
+    expect(rowA.stage).toBe("in_progress");
+    expect(rowB.stage).toBe("in_progress");
   });
 
-  // Regression: a stale rollover:lastDay kv key (already "today" from an
-  // earlier getBoard call) must never gate the carry-forward UPDATE. A row
-  // that becomes stale AFTER the day's first getBoard call — inserted
-  // directly, or a slept machine catching up mid-day — has to be rolled by
-  // the very next getBoard, not left dangling until the kv key itself
-  // changes.
-  it("rolls forward a row that goes stale after the kv key is already set to today", async () => {
+  // Regression: an open, overdue, stage='pending' task must be ABSENT from
+  // In Progress — a due date, however overdue, never grants membership.
+  it("an open, overdue, stage='pending' task is absent from In Progress", async () => {
     const { bb, harness } = await setup();
     const board1 = await getBoard(harness);
     const listId = board1.activeListId;
 
-    // getBoard already ran once above, so rollover:lastDay is now "today" —
-    // exactly the state that used to short-circuit the lazy rollover.
     const conn = bb.storage.database();
-    const staleId = "tsk_regress_stale_guard_hole_0001";
+    const overdueId = "tsk_regress_overdue_pending_0001";
     conn
       .prepare(
-        `INSERT INTO tasks (id, list_id, parent_id, title, notes, bucket, day, sort_order, due_at, has_due_time, status, completed_at, carried_count, created_at, updated_at)
-         VALUES (?, ?, NULL, 'stale row', NULL, 'today', '2020-01-01', 999999, NULL, 0, 'open', NULL, 3, 0, 0)`,
+        `INSERT INTO tasks (id, list_id, parent_id, title, notes, stage, sort_order, due_at, has_due_time, status, completed_at, carried_count, created_at, updated_at)
+         VALUES (?, ?, NULL, 'overdue, never scheduled', NULL, 'pending', 999999, ?, 1, 'open', NULL, 0, 0, 0)`,
       )
-      .run(staleId, listId);
+      .run(overdueId, listId, new Date(2020, 0, 1).getTime());
 
     const board2 = await getBoard(harness, listId);
-    const row = board2.backlog.tasks.find((t: any) => t.id === staleId);
+    const row = board2.backlog.tasks.find((t: any) => t.id === overdueId);
     expect(row).toBeDefined();
-    expect(row.day).toBe(board2.today.day);
-    expect(row.carriedCount).toBe(4);
-    // The Today counter and the Today membership flag must agree: the row
-    // that shows up as inToday is counted in planned.
-    expect(row.inToday).toBe(true);
-    expect(board2.today.planned).toBeGreaterThan(0);
+    expect(row.stage).toBe("pending");
+    expect(row.inProgress).toBe(false);
   });
 
-  // Regression: today.planned/completed must be derived from the same
-  // predicate as inToday, so they can never disagree — including for
-  // subtasks, which planned counts but only nest under backlog.tasks.
-  it("today.planned/completed can never disagree with the count of inToday rows across backlog.tasks (including subtasks)", async () => {
+  // Regression: inProgress.planned/completed must be derived from the same
+  // predicate as inProgress (the per-row flag), so they can never disagree —
+  // including for subtasks, which planned counts but only nest under
+  // backlog.tasks.
+  it("inProgress.planned/completed can never disagree with the count of inProgress rows across backlog.tasks (including subtasks)", async () => {
     const { harness } = await setup();
     const board = await getBoard(harness);
     const listId = board.activeListId;
 
     const parent = (await harness.callRpc("createTask", {
       listId,
-      bucket: "today",
+      stage: "in_progress",
       title: "parent",
       parentId: null,
       dueAt: null,
@@ -214,7 +228,7 @@ describe("server.ts rpc surface", () => {
     })) as any;
     await harness.callRpc("createTask", {
       listId,
-      bucket: "today",
+      stage: "in_progress",
       title: "child",
       parentId: parent.task.id,
       dueAt: null,
@@ -223,12 +237,12 @@ describe("server.ts rpc surface", () => {
     });
 
     const after = await getBoard(harness, listId);
-    const openInTodayCount = after.backlog.tasks.reduce(
-      (sum: number, t: any) => sum + (t.inToday ? 1 : 0) + t.subtasks.filter((s: any) => s.inToday).length,
+    const openInProgressCount = after.backlog.tasks.reduce(
+      (sum: number, t: any) => sum + (t.inProgress ? 1 : 0) + t.subtasks.filter((s: any) => s.inProgress).length,
       0,
     );
-    expect(after.today.planned).toBe(openInTodayCount);
-    expect(after.today.completed).toBe(0);
+    expect(after.inProgress.planned).toBe(openInProgressCount);
+    expect(after.inProgress.completed).toBe(0);
   });
 
   it("archive grouping and clearArchive", async () => {
@@ -237,7 +251,7 @@ describe("server.ts rpc surface", () => {
     const listId = board.activeListId;
     const created = (await harness.callRpc("createTask", {
       listId,
-      bucket: "backlog",
+      stage: "pending",
       title: "Archive me",
       parentId: null,
       dueAt: null,
@@ -284,7 +298,7 @@ describe("server.ts rpc surface", () => {
     const before = harness.realtimeSignals.length;
     await harness.callRpc("createTask", {
       listId: board.activeListId,
-      bucket: "backlog",
+      stage: "pending",
       title: "Signal check",
       parentId: null,
       dueAt: null,
@@ -330,7 +344,7 @@ describe("server.ts rpc surface", () => {
 
     const created = (await harness.callRpc("createTask", {
       listId,
-      bucket: "backlog",
+      stage: "pending",
       title: "Tag me",
       parentId: null,
       dueAt: null,
@@ -370,7 +384,7 @@ describe("server.ts rpc surface", () => {
 
     const created = (await harness.callRpc("createTask", {
       listId: board.activeListId,
-      bucket: "backlog",
+      stage: "pending",
       title: "Tag signal check",
       parentId: null,
       dueAt: null,
@@ -431,13 +445,13 @@ describe("server.ts rpc surface", () => {
     const boardAfterCollapse = await getBoard(harness, listId);
     const afterCollapse = boardAfterCollapse.projects.find((p: any) => p.id === updated.project.id);
     expect(afterCollapse.collapsed).toBe(true);
-    expect(afterCollapse.todayCollapsed).toBe(false); // the other column's bit is untouched
+    expect(afterCollapse.inProgressCollapsed).toBe(false); // the other column's bit is untouched
 
     // Filing a task, then deleting the project, releases it to loose rather
     // than deleting it (invariant 6, exercised end-to-end through the RPC).
     const filedTask = (await harness.callRpc("createTask", {
       listId,
-      bucket: "backlog",
+      stage: "pending",
       title: "Filed task",
       parentId: null,
       dueAt: null,
@@ -470,32 +484,32 @@ describe("server.ts rpc surface", () => {
   // Regression for the reported bug: collapsing/expanding a project in one
   // column silently collapsed/expanded it in the other, because both
   // columns rendered the same single `collapsed` bit. `column` now routes
-  // the write to exactly one of `collapsed` / `todayCollapsed`.
+  // the write to exactly one of `collapsed` / `inProgressCollapsed`.
   it("setProjectCollapsed({ column }) writes only that column's collapse bit, over RPC, and still publishes board", async () => {
     const { harness } = await setup();
     const board = await getBoard(harness);
     const listId = board.activeListId;
     const project = (await harness.callRpc("createProject", { listId, name: "Q3 Launch", color: "blue" })) as any;
     expect(project.project.collapsed).toBe(false);
-    expect(project.project.todayCollapsed).toBe(false);
+    expect(project.project.inProgressCollapsed).toBe(false);
 
     const before = harness.realtimeSignals.length;
-    const todayCollapsed = (await harness.callRpc("setProjectCollapsed", {
+    const inProgressCollapsed = (await harness.callRpc("setProjectCollapsed", {
       id: project.project.id,
       collapsed: true,
-      column: "today",
+      column: "in_progress",
     })) as any;
-    expect(todayCollapsed.ok).toBe(true);
+    expect(inProgressCollapsed.ok).toBe(true);
     const signals = harness.realtimeSignals.slice(before);
     expect(signals.at(-1)?.channel).toBe("board");
     expect((signals.at(-1)?.payload as any).listId).toBe(listId);
 
     let board2 = await getBoard(harness, listId);
     let found = board2.projects.find((p: any) => p.id === project.project.id);
-    expect(found.todayCollapsed).toBe(true);
-    expect(found.collapsed).toBe(false); // backlog's bit is untouched by a today write
+    expect(found.inProgressCollapsed).toBe(true);
+    expect(found.collapsed).toBe(false); // backlog's bit is untouched by an in-progress write
 
-    // And the mirror: a backlog write leaves today's bit alone.
+    // And the mirror: a backlog write leaves in progress's bit alone.
     await harness.callRpc("setProjectCollapsed", {
       id: project.project.id,
       collapsed: true,
@@ -504,7 +518,7 @@ describe("server.ts rpc surface", () => {
     board2 = await getBoard(harness, listId);
     found = board2.projects.find((p: any) => p.id === project.project.id);
     expect(found.collapsed).toBe(true);
-    expect(found.todayCollapsed).toBe(true); // unchanged from the earlier today write, not reset
+    expect(found.inProgressCollapsed).toBe(true); // unchanged from the earlier in-progress write, not reset
   });
 
   it("moveTask + projectId re-homes a task and its trail; a plain Backlog drop snaps it back to its own slot", async () => {
@@ -516,7 +530,7 @@ describe("server.ts rpc surface", () => {
     const otherProject = (await harness.callRpc("createProject", { listId, name: "Other", color: "red" })) as any;
     const task = (await harness.callRpc("createTask", {
       listId,
-      bucket: "backlog",
+      stage: "pending",
       title: "Rewrite the onboarding email",
       parentId: null,
       dueAt: null,
@@ -526,25 +540,25 @@ describe("server.ts rpc surface", () => {
     })) as any;
 
     // Schedule it — it stays filed under `project`, comprehensive Backlog
-    // means it's the same row, just now bucket='today'/inToday.
+    // means it's the same row, just now stage='in_progress'/inProgress.
     await harness.callRpc("moveTask", {
       id: task.task.id,
-      bucket: "today",
+      stage: "in_progress",
       parentId: null,
       beforeId: null,
       afterId: null,
     });
     let afterSchedule = await getBoard(harness, listId);
     let scheduledRow = afterSchedule.backlog.tasks.find((t: any) => t.id === task.task.id);
-    expect(scheduledRow.bucket).toBe("today");
-    expect(scheduledRow.inToday).toBe(true);
+    expect(scheduledRow.stage).toBe("in_progress");
+    expect(scheduledRow.inProgress).toBe(true);
     expect(scheduledRow.trail.projectId).toBe(project.project.id);
     expect(scheduledRow.trail.projectName).toBe("Q3 Launch");
 
     // Unschedule with no projectId: snaps home, stays in `project`.
     await harness.callRpc("moveTask", {
       id: task.task.id,
-      bucket: "backlog",
+      stage: "pending",
       parentId: null,
       beforeId: null,
       afterId: null,
@@ -552,13 +566,13 @@ describe("server.ts rpc surface", () => {
     let afterSnapHome = await getBoard(harness, listId);
     let snapped = afterSnapHome.backlog.tasks.find((t: any) => t.id === task.task.id);
     expect(snapped.projectId).toBe(project.project.id);
-    expect(snapped.bucket).toBe("backlog");
-    expect(snapped.inToday).toBe(false);
+    expect(snapped.stage).toBe("pending");
+    expect(snapped.inProgress).toBe(false);
 
     // Re-home to a different project.
     await harness.callRpc("moveTask", {
       id: task.task.id,
-      bucket: "backlog",
+      stage: "pending",
       parentId: null,
       beforeId: null,
       afterId: null,
@@ -569,14 +583,14 @@ describe("server.ts rpc surface", () => {
     expect(rehomed.projectId).toBe(otherProject.project.id);
   });
 
-  it("scheduling a subtask into Today keeps its parent_id and shows it as a flat, trailed row — the parent is not scheduled", async () => {
+  it("scheduling a subtask into In Progress keeps its parent_id and shows it as a flat, trailed row — the parent is not scheduled", async () => {
     const { harness } = await setup();
     const board = await getBoard(harness);
     const listId = board.activeListId;
 
     const parent = (await harness.callRpc("createTask", {
       listId,
-      bucket: "backlog",
+      stage: "pending",
       title: "Rewrite the onboarding email",
       parentId: null,
       dueAt: null,
@@ -585,7 +599,7 @@ describe("server.ts rpc surface", () => {
     })) as any;
     const child = (await harness.callRpc("createTask", {
       listId,
-      bucket: "backlog",
+      stage: "pending",
       title: "Get legal sign-off",
       parentId: parent.task.id,
       dueAt: null,
@@ -595,7 +609,7 @@ describe("server.ts rpc surface", () => {
 
     await harness.callRpc("moveTask", {
       id: child.task.id,
-      bucket: "today",
+      stage: "in_progress",
       parentId: parent.task.id,
       beforeId: null,
       afterId: null,
@@ -603,20 +617,20 @@ describe("server.ts rpc surface", () => {
 
     const after = await getBoard(harness, listId);
     const parentRow = after.backlog.tasks.find((t: any) => t.id === parent.task.id);
-    expect(parentRow.bucket).toBe("backlog"); // scheduling the subtask did not schedule the parent
+    expect(parentRow.stage).toBe("pending"); // scheduling the subtask did not schedule the parent
     const childRow = parentRow.subtasks.find((t: any) => t.id === child.task.id);
-    expect(childRow.bucket).toBe("today");
-    expect(childRow.inToday).toBe(true);
+    expect(childRow.stage).toBe("in_progress");
+    expect(childRow.inProgress).toBe(true);
     expect(childRow.trail.parentTitle).toBe("Rewrite the onboarding email");
   });
 
-  it("today counts survive completion vanishing rows from the board", async () => {
+  it("in-progress counts survive completion vanishing rows from the board", async () => {
     const { harness } = await setup();
     const board = await getBoard(harness);
     const listId = board.activeListId;
     const t1 = (await harness.callRpc("createTask", {
       listId,
-      bucket: "today",
+      stage: "in_progress",
       title: "one",
       parentId: null,
       dueAt: null,
@@ -625,7 +639,7 @@ describe("server.ts rpc surface", () => {
     })) as any;
     await harness.callRpc("createTask", {
       listId,
-      bucket: "today",
+      stage: "in_progress",
       title: "two",
       parentId: null,
       dueAt: null,
@@ -635,44 +649,218 @@ describe("server.ts rpc surface", () => {
     await harness.callRpc("completeTask", { id: t1.task.id });
 
     const after = await getBoard(harness, listId);
-    expect(after.today.planned).toBe(2);
-    expect(after.today.completed).toBe(1);
-    const openInToday = after.backlog.tasks.filter((t: any) => t.inToday).length;
-    expect(openInToday).toBe(1); // t1 done and vanished; t2 still open and inToday
+    expect(after.inProgress.planned).toBe(2);
+    expect(after.inProgress.completed).toBe(1);
+    const openInProgress = after.backlog.tasks.filter((t: any) => t.inProgress).length;
+    expect(openInProgress).toBe(1); // t1 done and vanished; t2 still open and inProgress
   });
 
-  it("dismissFromToday stamps today_dismissed_day so an auto-included row stops rendering inToday, and publishes a board realtime signal", async () => {
+  // setTaskStage("pending") flips stage away from In Progress and RESETS
+  // the carried-days clock — an auto-included/due-date row is no longer a
+  // thing that can exist, so this only ever affects a genuinely
+  // manually-scheduled row.
+  it("setTaskStage(\"pending\") flips stage, resets carriedDays, and publishes a board realtime signal", async () => {
     const { harness } = await setup();
     const board = await getBoard(harness);
     const listId = board.activeListId;
 
-    const overdue = (await harness.callRpc("createTask", {
+    const scheduled = (await harness.callRpc("createTask", {
       listId,
-      bucket: "backlog",
-      title: "overdue, never scheduled",
+      stage: "in_progress",
+      title: "scheduled",
       parentId: null,
-      dueAt: Date.now() - 1000 * 60 * 60 * 24 * 3,
+      dueAt: null,
       hasDueTime: false,
       position: "bottom",
     })) as any;
 
-    const beforeDismiss = await getBoard(harness, listId);
-    const beforeDto = beforeDismiss.backlog.tasks.find((t: any) => t.id === overdue.task.id);
-    expect(beforeDto.inToday).toBe(true);
+    const beforePark = await getBoard(harness, listId);
+    const beforeDto = beforePark.backlog.tasks.find((t: any) => t.id === scheduled.task.id);
+    expect(beforeDto.inProgress).toBe(true);
 
     const before = harness.realtimeSignals.length;
-    const result = (await harness.callRpc("dismissFromToday", { id: overdue.task.id })) as any;
+    const result = (await harness.callRpc("setTaskStage", { id: scheduled.task.id, stage: "pending" })) as any;
     expect(result.ok).toBe(true);
     const signals = harness.realtimeSignals.slice(before);
     expect(signals.length).toBeGreaterThan(0);
     expect(signals.at(-1)?.channel).toBe("board");
     expect((signals.at(-1)?.payload as any).listId).toBe(listId);
 
-    const afterDismiss = await getBoard(harness, listId);
-    const afterDto = afterDismiss.backlog.tasks.find((t: any) => t.id === overdue.task.id);
-    expect(afterDto.inToday).toBe(false);
-    expect(afterDto.bucket).toBe("backlog"); // dismissFromToday never touches bucket
+    const afterPark = await getBoard(harness, listId);
+    const afterDto = afterPark.backlog.tasks.find((t: any) => t.id === scheduled.task.id);
+    expect(afterDto.inProgress).toBe(false);
+    expect(afterDto.stage).toBe("pending");
+    expect(afterDto.carriedDays).toBe(0); // the counter resets on park
 
-    await expect(harness.callRpc("dismissFromToday", { id: "tsk_missing" })).rejects.toBeTruthy();
+    await expect(harness.callRpc("setTaskStage", { id: "tsk_missing", stage: "pending" })).rejects.toBeTruthy();
+  });
+
+  // The other direction: setTaskStage("in_progress") is a plain manual
+  // schedule — stamps in_progress_since to now and publishes board like
+  // every other mutation.
+  it("setTaskStage(\"in_progress\") manually schedules a task and publishes a board realtime signal", async () => {
+    const { harness } = await setup();
+    const board = await getBoard(harness);
+    const listId = board.activeListId;
+
+    const task = (await harness.callRpc("createTask", {
+      listId,
+      stage: "pending",
+      title: "not due, not scheduled",
+      parentId: null,
+      dueAt: null,
+      hasDueTime: false,
+      position: "bottom",
+    })) as any;
+
+    const before = await getBoard(harness, listId);
+    const beforeDto = before.backlog.tasks.find((t: any) => t.id === task.task.id);
+    expect(beforeDto.inProgress).toBe(false);
+
+    const beforeSignals = harness.realtimeSignals.length;
+    const result = (await harness.callRpc("setTaskStage", { id: task.task.id, stage: "in_progress" })) as any;
+    expect(result.ok).toBe(true);
+    const signals = harness.realtimeSignals.slice(beforeSignals);
+    expect(signals.length).toBeGreaterThan(0);
+    expect(signals.at(-1)?.channel).toBe("board");
+    expect((signals.at(-1)?.payload as any).listId).toBe(listId);
+
+    const after = await getBoard(harness, listId);
+    const afterDto = after.backlog.tasks.find((t: any) => t.id === task.task.id);
+    expect(afterDto.stage).toBe("in_progress");
+    expect(afterDto.inProgress).toBe(true);
+    expect(afterDto.carriedDays).toBe(0); // just entered, same day
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Image attachments: RPC + the authenticated bytes route
+// ---------------------------------------------------------------------------
+
+const PNG_B64 = Buffer.concat([
+  Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+  Buffer.alloc(24, 3),
+]).toString("base64");
+
+describe("server.ts image attachments", () => {
+  async function withBoard() {
+    const { bb, harness } = await setup();
+    const board = await getBoard(harness);
+    const imagesDir = join(dirname(bb.storage.database().name), "images");
+    const create = (input: Record<string, unknown> = {}) =>
+      harness.callRpc("createTask", {
+        listId: board.activeListId,
+        stage: "pending",
+        title: "with image",
+        parentId: null,
+        dueAt: null,
+        hasDueTime: false,
+        position: "bottom",
+        ...input,
+      }) as Promise<any>;
+    return { bb, harness, board, imagesDir, create };
+  }
+
+  it("creates a task with images and returns metadata only", async () => {
+    const { create, imagesDir } = await withBoard();
+    const { task } = await create({ images: [{ data: PNG_B64 }] });
+    expect(task.images).toHaveLength(1);
+    expect(task.images[0]).toEqual({
+      id: expect.stringMatching(/^img_/),
+      mime: "image/png",
+      size: 32,
+      createdAt: expect.any(Number),
+      url: `/api/v1/plugins/todo/http/image?id=${task.images[0].id}`,
+    });
+    expect(JSON.stringify(task)).not.toContain(PNG_B64);
+    expect(readdirSync(imagesDir)).toEqual([`${task.images[0].id}.png`]);
+  });
+
+  it("serves the bytes with safe headers, by query id", async () => {
+    const { harness, create } = await withBoard();
+    const { task } = await create({ images: [{ data: PNG_B64 }] });
+    const res = await harness.fetchHttp("GET", `/image?id=${task.images[0].id}`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("image/png");
+    expect(res.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(res.headers.get("content-security-policy")).toContain("sandbox");
+    expect(res.headers.get("cache-control")).toContain("private");
+    expect(Buffer.from(await res.arrayBuffer()).toString("base64")).toBe(PNG_B64);
+  });
+
+  it("returns 404 for unknown, malformed, and missing ids, and for a deleted task", async () => {
+    const { harness, create } = await withBoard();
+    const { task } = await create({ images: [{ data: PNG_B64 }] });
+    const id = task.images[0].id;
+    expect((await harness.fetchHttp("GET", "/image")).status).toBe(404);
+    expect((await harness.fetchHttp("GET", "/image?id=img_00000000000000000000zz")).status).toBe(404);
+    expect((await harness.fetchHttp("GET", "/image?id=../../data.db")).status).toBe(404);
+    // Exact-match routes: a path-param style URL is not a route at all.
+    await expect(harness.fetchHttp("GET", `/image/${id}`)).rejects.toThrow(/no http route/);
+    await harness.callRpc("deleteTask", { id: task.id });
+    expect((await harness.fetchHttp("GET", `/image?id=${id}`)).status).toBe(404);
+  });
+
+  it("rejects an invalid image and creates no task or file", async () => {
+    const { harness, board, create, imagesDir } = await withBoard();
+    await expect(create({ images: [{ data: Buffer.from("<svg/>").toString("base64") }] })).rejects.toThrow(
+      /PNG, JPEG, GIF, or WebP/,
+    );
+    expect((await getBoard(harness, board.activeListId)).backlog.tasks).toEqual([]);
+    expect(readdirSync(imagesDir)).toEqual([]);
+  });
+
+  it("adds and removes images through updateTask, deleting the removed file", async () => {
+    const { harness, create, imagesDir } = await withBoard();
+    const { task } = await create({ images: [{ data: PNG_B64 }] });
+    const first = task.images[0].id;
+    const { task: updated } = (await harness.callRpc("updateTask", {
+      id: task.id,
+      title: "edited",
+      addImages: [{ data: PNG_B64 }],
+      removeImageIds: [first],
+    })) as any;
+    expect(updated.title).toBe("edited");
+    expect(updated.images).toHaveLength(1);
+    expect(updated.images[0].id).not.toBe(first);
+    expect(readdirSync(imagesDir)).toEqual([`${updated.images[0].id}.png`]);
+  });
+
+  it("deletes files on task delete, list delete, and clear archive", async () => {
+    const { harness, board, create, imagesDir } = await withBoard();
+    const a = (await create({ images: [{ data: PNG_B64 }] })).task;
+    await harness.callRpc("deleteTask", { id: a.id });
+    expect(readdirSync(imagesDir)).toEqual([]);
+
+    const b = (await create({ images: [{ data: PNG_B64 }] })).task;
+    await harness.callRpc("completeTask", { id: b.id });
+    expect(readdirSync(imagesDir)).toHaveLength(1); // archive keeps it
+    await harness.callRpc("clearArchive", { listId: board.activeListId });
+    expect(readdirSync(imagesDir)).toEqual([]);
+
+    const { list } = (await harness.callRpc("createList", { name: "Scratch" })) as any;
+    await harness.callRpc("createTask", {
+      listId: list.id,
+      stage: "pending",
+      title: "in scratch",
+      parentId: null,
+      dueAt: null,
+      hasDueTime: false,
+      position: "bottom",
+      images: [{ data: PNG_B64 }],
+    });
+    expect(readdirSync(imagesDir)).toHaveLength(1);
+    await harness.callRpc("deleteList", { id: list.id });
+    expect(readdirSync(imagesDir)).toEqual([]);
+  });
+
+  it("registers a cleanup schedule that removes abandoned files after the grace period", async () => {
+    const { harness, imagesDir } = await withBoard();
+    const orphan = join(imagesDir, "img_00000000000000000000cc.png");
+    writeFileSync(orphan, "orphan");
+    const old = new Date(Date.now() - 3_600_000);
+    utimesSync(orphan, old, old);
+    await harness.runSchedule("image-cleanup");
+    expect(existsSync(orphan)).toBe(false);
   });
 });

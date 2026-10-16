@@ -1,7 +1,13 @@
 // bb-plugin-todo — server entry. Thin wiring only: open the db, migrate,
-// seed, register the rpc contract, schedule the rollover cron, and publish
-// realtime signals after mutations. All SQL and business logic live under
-// lib/.
+// seed, register the rpc contract, and publish realtime signals after
+// mutations. All SQL and business logic live under lib/.
+//
+// There is no more carry-forward/rollover here: "Today" as a concept (and
+// the `day`-based carry-forward it required) is deleted entirely. In
+// Progress membership is now solely `stage = 'in_progress'`, which never
+// goes stale with the passage of a calendar day, so there is nothing left
+// to roll over lazily or on a cron.
+import { dirname, join } from "node:path";
 import { type BbPluginApi } from "@get-bb/plugin-sdk";
 import { rpcContract } from "./contract.js";
 
@@ -10,10 +16,7 @@ import { rpcContract } from "./contract.js";
 // contract.ts remains the single source of truth.
 export { rpcContract } from "./contract.js";
 import * as db from "./lib/db.js";
-import { localDay } from "./lib/day.js";
-import { runRollover } from "./lib/rollover.js";
-
-const ROLLOVER_KV_KEY = "rollover:lastDay";
+import { configureImageUrls, ImageStore, isImageId } from "./lib/images.js";
 
 export default async function plugin(bb: BbPluginApi) {
   const conn = bb.storage.database();
@@ -23,21 +26,43 @@ export default async function plugin(bb: BbPluginApi) {
   bb.storage.migrate(conn, db.MIGRATIONS);
   db.seed(conn, new Date());
 
-  // Lazy rollover: runs the carry-forward UPDATE unconditionally on every
-  // call. `rollover:lastDay` is bookkeeping only — never a correctness
-  // gate. It used to guard the call ("skip the UPDATE if we've already
-  // rolled today"), but that let any row that became stale after the day's
-  // first getBoard call — one created directly, or a slept machine
-  // catching up mid-day — sit with a stale `day` and no carried_count bump
-  // until the kv key itself changed at midnight+5. runRollover()'s UPDATE
-  // is a single indexed statement that matches nothing once a row's `day`
-  // is already today, so calling it unconditionally costs nothing
-  // measurable and is the only way to stay correct if the kv key is stale
-  // or missing, per SPEC.md.
-  async function ensureRollover(now: Date): Promise<void> {
-    runRollover(conn, now);
-    await bb.storage.kv.set(ROLLOVER_KV_KEY, localDay(now));
+  // Image bytes live next to data.db (the plugin's own data dir), never in
+  // the plugin source. The db holds the metadata and the delete queue.
+  configureImageUrls(bb.pluginId);
+  const imageStore = new ImageStore(join(dirname(conn.name), "images"));
+  imageStore.start(conn, new Date());
+
+  /** Drain the delete queue after a mutation. Never throws; failures stay queued. */
+  function drainImages(): void {
+    imageStore.processCleanup(conn, new Date());
   }
+
+  // Authenticated ("local" auth: BB app origin or same-origin GET) image
+  // bytes. Exact-match routes have no params, so the id is a query value.
+  bb.http.route("GET", "/image", (c) => {
+    const id = c.req.query("id") ?? "";
+    const row = isImageId(id) ? db.getImageFile(conn, id) : undefined;
+    const bytes = row ? imageStore.read(row.fileName) : null;
+    if (!row || !bytes) return c.json({ ok: false, error: "image not found" }, 404);
+    return new Response(new Uint8Array(bytes), {
+      status: 200,
+      headers: {
+        "Content-Type": row.mime,
+        "Content-Length": String(bytes.length),
+        "Content-Disposition": "inline",
+        "X-Content-Type-Options": "nosniff",
+        "Content-Security-Policy": "default-src 'none'; sandbox",
+        // Ids are never reused and image bytes never change.
+        "Cache-Control": "private, max-age=31536000, immutable",
+      },
+    });
+  });
+
+  // Reconcile abandoned files and retry failed deletions, also after a
+  // restart (the queue is a table).
+  bb.background.schedule("image-cleanup", "*/5 * * * *", () => {
+    imageStore.start(conn, new Date());
+  });
 
   function publish(listId: string | null): void {
     bb.realtime.publish("board", { listId });
@@ -46,24 +71,35 @@ export default async function plugin(bb: BbPluginApi) {
   bb.rpc.register(rpcContract, {
     async getBoard({ listId }) {
       const now = new Date();
-      await ensureRollover(now);
       return db.getBoard(conn, listId, now);
     },
 
     async getArchive({ listId, limit, offset }) {
       const now = new Date();
-      await ensureRollover(now);
       return db.getArchive(conn, listId, limit, offset, now);
     },
 
-    createTask(input) {
-      const task = db.createTask(conn, input, new Date());
+    createTask({ images, ...input }) {
+      const now = new Date();
+      const task = imageStore.withStaged(
+        conn,
+        images ?? [],
+        (staged) => db.createTask(conn, { ...input, images: staged }, now),
+        now,
+      );
       publish(task.listId);
       return { task };
     },
 
-    updateTask(input) {
-      const task = db.updateTask(conn, input, new Date());
+    updateTask({ addImages, ...input }) {
+      const now = new Date();
+      const task = imageStore.withStaged(
+        conn,
+        addImages ?? [],
+        (staged) => db.updateTask(conn, { ...input, addImages: staged }, now),
+        now,
+      );
+      if (input.removeImageIds?.length) drainImages();
       publish(task.listId);
       return { task };
     },
@@ -80,8 +116,8 @@ export default async function plugin(bb: BbPluginApi) {
       return { completedIds };
     },
 
-    dismissFromToday({ id }) {
-      const { listId } = db.dismissFromToday(conn, id, new Date());
+    setTaskStage({ id, stage }) {
+      const { listId } = db.setTaskStage(conn, id, stage, new Date());
       publish(listId);
       return { ok: true as const };
     },
@@ -98,6 +134,7 @@ export default async function plugin(bb: BbPluginApi) {
 
     deleteTask({ id }) {
       const { listId } = db.deleteTask(conn, id);
+      drainImages();
       publish(listId);
       return { ok: true as const };
     },
@@ -116,6 +153,7 @@ export default async function plugin(bb: BbPluginApi) {
 
     deleteList({ id }) {
       const lists = db.deleteList(conn, id, new Date());
+      drainImages();
       publish(id);
       return { lists };
     },
@@ -128,6 +166,7 @@ export default async function plugin(bb: BbPluginApi) {
 
     clearArchive({ listId }) {
       const deleted = db.clearArchive(conn, listId);
+      drainImages();
       publish(listId);
       return { deleted };
     },
@@ -193,12 +232,6 @@ export default async function plugin(bb: BbPluginApi) {
       publish(listId);
       return { ok: true as const };
     },
-  });
-
-  bb.background.schedule("rollover", "5 0 * * *", async () => {
-    const now = new Date();
-    runRollover(conn, now);
-    await bb.storage.kv.set(ROLLOVER_KV_KEY, localDay(now));
   });
 
   bb.onDispose(() => {
