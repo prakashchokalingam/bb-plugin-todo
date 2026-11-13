@@ -19,7 +19,6 @@ import {
   renderSlot,
 } from "@get-bb/plugin-sdk/testing/app";
 import type { TagDto, TaskDto } from "@/contract";
-import TodoHeaderActions from "./components/TodoHeaderActions";
 import { TaskRow, type TaskRowProps } from "./components/TaskRow";
 import type { BoardActions } from "./components/Section";
 import { TooltipProvider } from "./components/ui/tooltip";
@@ -41,9 +40,10 @@ import { toast } from "sonner";
 // OverdueAccessory, useCompleteWithUndo — must therefore be imported
 // AFTER `installTestPluginRuntime()` runs, via dynamic import; a static
 // top-level import would bind those hooks to `undefined` before the test
-// runtime exists. `TodoHeaderActions` and `lib/board-bus` don't touch the
-// SDK, so they stay static imports above.
+// runtime exists. `TodoHeaderActions` uses the SDK for the standalone URL, so import it
+// after runtime setup too. `lib/board-bus` stays a static import.
 installTestPluginRuntime();
+const { default: TodoHeaderActions } = await import("./components/TodoHeaderActions");
 const { default: ArchivePanel } = await import("./components/ArchivePanel");
 const { default: OverdueAccessory } = await import(
   "./components/OverdueAccessory"
@@ -542,6 +542,72 @@ describe("TaskRow inline actions", () => {
     await waitFor(() => {
       expect(screen.getByPlaceholderText("add subtask")).toBeTruthy();
     });
+  });
+
+  it("keeps the subtask input focused across consecutive submissions", () => {
+    const actions = makeActions();
+    renderSlot(
+      { component: TaskRowWithTooltipProvider },
+      { task: makeTask({ title: "Parent" }), actions },
+      {},
+    );
+    fireEvent.click(screen.getByRole("button", { name: 'Add a subtask to "Parent"' }));
+    const input = screen.getByPlaceholderText("add subtask") as HTMLTextAreaElement;
+    expect(document.activeElement).toBe(input);
+    for (const title of ["First child", "Second child"]) {
+      fireEvent.change(input, { target: { value: title } });
+      fireEvent.keyDown(input, { key: "Enter" });
+      expect(actions.onCreateTask).toHaveBeenLastCalledWith({
+        stage: "in_progress", parentId: "tsk_1", title,
+      });
+      expect(screen.getByPlaceholderText("add subtask")).toBe(input);
+      expect(input.value).toBe("");
+      expect(document.activeElement).toBe(input);
+    }
+    expect(actions.onCreateTask).toHaveBeenCalledTimes(2);
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(screen.queryByPlaceholderText("add subtask")).toBeNull();
+    expect(actions.onCreateTask).toHaveBeenCalledTimes(2);
+  });
+
+  it("opens a focused input from the bottom button and restores it after Escape", () => {
+    const actions = makeActions();
+    renderSlot(
+      { component: TaskRowWithTooltipProvider },
+      {
+        task: makeTask({
+          title: "Parent",
+          subtasks: [makeTask({ id: "child", title: "Existing child", parentId: "tsk_1" })],
+          subtaskCounts: { total: 1, done: 0 },
+        }),
+        actions,
+      },
+      {},
+    );
+    const name = 'Add another subtask to "Parent"';
+    const button = screen.getByRole("button", { name });
+    expect(screen.getByText("Existing child").compareDocumentPosition(button) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    fireEvent.click(button);
+    const input = screen.getByPlaceholderText("add subtask");
+    expect(document.activeElement).toBe(input);
+    expect(screen.queryByRole("button", { name })).toBeNull();
+    fireEvent.change(input, { target: { value: "Discard this draft" } });
+    fireEvent.keyDown(input, { key: "Escape" });
+    expect(screen.queryByPlaceholderText("add subtask")).toBeNull();
+    expect(screen.getByRole("button", { name })).toBeTruthy();
+    expect(actions.onCreateTask).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name }));
+    expect((screen.getByPlaceholderText("add subtask") as HTMLTextAreaElement).value).toBe("");
+    expect(document.activeElement).toBe(screen.getByPlaceholderText("add subtask"));
+  });
+
+  it("omits the bottom button on a parent without subtasks", () => {
+    renderSlot(
+      { component: TaskRowWithTooltipProvider },
+      { task: makeTask({ title: "Parent" }), actions: makeActions() },
+      {},
+    );
+    expect(screen.queryByRole("button", { name: 'Add another subtask to "Parent"' })).toBeNull();
   });
 
   it("the plus button is absent on subtask rows", () => {

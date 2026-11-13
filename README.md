@@ -99,6 +99,37 @@ that willpower usually has to.
   instantly with an 8-second undo toast; the Archive groups completed tasks
   by day and lets you restore any of them later.
 
+## Open Todo in a desktop window
+
+In the local macOS BB app, click **Open desktop window** in the Todo header.
+The button opens a separate BB desktop instance with Todo loaded by default.
+It keeps the selected list and theme. Both views use the same task database.
+
+The launcher uses the installed BB app and a separate temporary desktop profile.
+It does not change the main BB window or the default browser preference.
+After the Todo page closes, the launcher stops its desktop process and removes
+the temporary profile. A page reload keeps the window open. A plugin reload
+closes the Todo desktop windows. Keep the main BB app open for the task database.
+
+This launcher requires a local macOS server and BB in `/Applications` or
+`~/Applications`. The browser view keeps the **Open in browser** action.
+
+## Open Todo in a browser tab
+
+Click **Open in browser** in the Todo header. The new browser tab shows only Todo.
+The tab keeps the selected list and uses the same database as the BB view.
+Both views receive live updates. Keep BB open while you use the tab.
+
+The standalone header includes Archive, a new list action, and a theme control.
+The browser Back button returns to the previous list.
+
+This action opens the default browser. The macOS desktop action above uses
+the BB launcher because the plugin SDK has no native window command.
+
+Run `npm run build` after a source change. This command builds the independent
+browser assets before the BB plugin bundle. The generated assets stay in
+`standalone/assets.generated.ts` so `bb plugin build` also works on a source install.
+
 ## Install
 
 This isn't published to npm — it's a BB plugin, installed straight from this
@@ -127,7 +158,7 @@ Requires BB `>=0.39` and plugin SDK `>=0.4.8` (see `package.json`'s
 ```sh
 npm test         # vitest — 362 tests across 10 files
 npm run typecheck # tsc --noEmit
-npm run build     # bb plugin build
+npm run build     # standalone assets + bb plugin build
 ```
 
 CI (`.github/workflows/ci.yml`) runs `tsc --noEmit` and `vitest run` on every

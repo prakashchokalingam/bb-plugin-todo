@@ -29,6 +29,7 @@
     "*.test.ts",
     "*.test.tsx",
     "**/*.test.ts",
-    "**/*.test.tsx"
+    "**/*.test.tsx",
+    "standalone"
   ]
 }

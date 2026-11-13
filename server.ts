@@ -17,6 +17,8 @@ import { rpcContract } from "./contract.js";
 export { rpcContract } from "./contract.js";
 import * as db from "./lib/db.js";
 import { configureImageUrls, ImageStore, isImageId } from "./lib/images.js";
+import { registerStandalone } from "./lib/standalone-server.js";
+import { DesktopWindows } from "./lib/desktop-windows.js";
 
 export default async function plugin(bb: BbPluginApi) {
   const conn = bb.storage.database();
@@ -25,6 +27,13 @@ export default async function plugin(bb: BbPluginApi) {
   conn.pragma("foreign_keys = ON");
   bb.storage.migrate(conn, db.MIGRATIONS);
   db.seed(conn, new Date());
+  const desktopWindows = new DesktopWindows({
+    directory: join(dirname(conn.name), "desktop-windows"),
+    serverUrl: () => bb.server.loopbackBaseUrl,
+    pluginId: bb.pluginId,
+  });
+  bb.onDispose(() => desktopWindows.dispose());
+  const notifyStandalone = registerStandalone(bb, (id) => desktopWindows.connect(id));
 
   // Image bytes live next to data.db (the plugin's own data dir), never in
   // the plugin source. The db holds the metadata and the delete queue.
@@ -66,9 +75,17 @@ export default async function plugin(bb: BbPluginApi) {
 
   function publish(listId: string | null): void {
     bb.realtime.publish("board", { listId });
+    notifyStandalone();
   }
 
   bb.rpc.register(rpcContract, {
+    async openDesktopWindow(input) {
+      await desktopWindows.open(input);
+      return { ok: true as const };
+    },
+    getStandaloneUrl() {
+      return { url: `${bb.server.loopbackBaseUrl}/api/v1/plugins/${encodeURIComponent(bb.pluginId)}/http/app` };
+    },
     async getBoard({ listId }) {
       const now = new Date();
       return db.getBoard(conn, listId, now);

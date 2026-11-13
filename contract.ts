@@ -242,6 +242,14 @@ const projectDtoSchema = z
   .strict();
 
 export const rpcContract = defineRpcContract({
+  openDesktopWindow: {
+    input: z.object({ listId: idSchema.nullable(), theme: z.enum(["light", "dark"]) }).strict(),
+    output: z.object({ ok: z.literal(true) }).strict(),
+  },
+  getStandaloneUrl: {
+    input: z.null(),
+    output: z.object({ url: z.string().url() }).strict(),
+  },
   getBoard: {
     input: z.object({ listId: idSchema.nullable() }).strict(),
     output: z

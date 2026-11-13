@@ -33,9 +33,11 @@ export interface AddTaskRowProps {
    * autoFocus pattern TaskRow/ProjectHeader already use for their own
    * inline-edit inputs. */
   autoFocus?: boolean;
+  /** Closes an optional capture row on Escape or empty Enter. */
+  onCancel?: () => void;
 }
 
-export function AddTaskRow({ placeholder, onSubmit, autoFocus = false }: AddTaskRowProps) {
+export function AddTaskRow({ placeholder, onSubmit, autoFocus = false, onCancel }: AddTaskRowProps) {
   const [value, setValue] = useState("");
   const [busy, setBusy] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
@@ -57,6 +59,7 @@ export function AddTaskRow({ placeholder, onSubmit, autoFocus = false }: AddTask
     const title = normalizeTitle(value);
     if (title.length === 0) {
       if (pending.images.length > 0) setSubmitError("Type a task title before you add the image.");
+      else onCancel?.();
       return;
     }
 
@@ -111,7 +114,11 @@ export function AddTaskRow({ placeholder, onSubmit, autoFocus = false }: AddTask
             if (submitError) setSubmitError(null);
           }}
           onSubmit={() => void submit()}
-          onCancel={() => inputRef.current?.blur()}
+          onCancel={() => {
+            if (busyRef.current) return;
+            if (onCancel) onCancel();
+            else inputRef.current?.blur();
+          }}
           onPaste={busy ? undefined : pending.onPaste}
           readOnly={busy}
           placeholder={placeholder}

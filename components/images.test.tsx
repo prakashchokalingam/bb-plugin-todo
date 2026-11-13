@@ -465,7 +465,7 @@ describe("TaskRow images", () => {
     expect(actions.onUpdateTask).not.toHaveBeenCalled();
   });
 
-  it("adds a subtask with an image and stays open until it is accepted", async () => {
+  it("adds a subtask with an image and keeps the input focused after acceptance", async () => {
     SlowFileReader.auto = true;
     const gate = deferred();
     const onCreateTask = vi.fn().mockReturnValue(gate.promise);
@@ -484,7 +484,12 @@ describe("TaskRow images", () => {
     });
     expect(screen.getByLabelText("add subtask")).toBe(box);
     await act(async () => gate.resolve());
-    await waitFor(() => expect(screen.queryByLabelText("add subtask")).toBeNull());
+    await waitFor(() => {
+      expect(screen.getByLabelText("add subtask")).toBe(box);
+      expect((box as HTMLTextAreaElement).value).toBe("");
+      expect(document.activeElement).toBe(box);
+      expect(screen.queryByLabelText(/Preview image 1 of 1/)).toBeNull();
+    });
   });
 });
 

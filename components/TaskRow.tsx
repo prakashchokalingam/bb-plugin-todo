@@ -542,21 +542,33 @@ export function TaskRow({
           />
         ))}
 
+      {isTopLevel && task.subtasks.length > 0 && !addingSubtask && (
+        <div className="pl-8">
+          <button
+            type="button"
+            onClick={() => setAddingSubtask(true)}
+            aria-label={`Add another subtask to "${label}"`}
+            className="flex min-h-8 w-full items-center gap-2 px-2 py-1.5 text-left text-sm text-muted-foreground hover:bg-muted/50 hover:text-foreground focus-visible:bg-muted/50 focus-visible:text-foreground focus-visible:outline focus-visible:outline-2 focus-visible:outline-ring"
+          >
+            <Icon name="Plus" className="size-3.5 shrink-0" aria-hidden="true" />
+            Add subtask
+          </button>
+        </div>
+      )}
+
       {addingSubtask && (
         <div className="pl-8">
           <AddTaskRow
             placeholder="add subtask"
+            autoFocus
+            onCancel={() => setAddingSubtask(false)}
             onSubmit={(title, images) => {
               const input = { stage: task.stage, parentId: task.id, title };
               if (!images) {
                 actions.onCreateTask(input);
-                setAddingSubtask(false);
                 return;
               }
-              // With images, stay open until the server accepts them.
-              return Promise.resolve(actions.onCreateTask({ ...input, images })).then(() =>
-                setAddingSubtask(false),
-              );
+              return actions.onCreateTask({ ...input, images });
             }}
           />
         </div>
